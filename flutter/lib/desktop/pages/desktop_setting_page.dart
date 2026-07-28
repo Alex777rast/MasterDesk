@@ -2440,6 +2440,10 @@ class _AboutState extends State<_About> {
                   child: Text('${translate('Version')}: $version')
                       .marginSymmetric(vertical: 4.0)),
               SelectionArea(
+                  child: const Text(
+                          'Modified self-hosted build · 2026-07-29')
+                      .marginSymmetric(vertical: 4.0)),
+              SelectionArea(
                   child: Text('${translate('Build Date')}: $buildDate')
                       .marginSymmetric(vertical: 4.0)),
               if (!isWeb)

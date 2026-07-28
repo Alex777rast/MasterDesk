@@ -11,6 +11,7 @@ fn main() {
         eprintln!("Global initialization failed.");
         return;
     }
+    common::load_custom_client();
     common::test_rendezvous_server();
     common::test_nat_type();
     common::global_clean();
