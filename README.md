@@ -57,11 +57,14 @@ pwsh -File .\scripts\Test-CustomDefaults.ps1
 Зависимость `libs/hbb_common` публикуется отдельно как видимый fork:
 <https://github.com/Alex777rast/MasterDesk-hbb-common>.
 
-## Подписание
+## Code signing policy / Политика подписания кода
 
 После одобрения проекта SignPath Foundation workflow можно переключить на
 подписание артефакта, собранного GitHub-hosted runner. Порядок, роли и
 ограничения описаны в [SIGNING_POLICY.md](SIGNING_POLICY.md).
+
+Free code signing provided by [SignPath.io](https://signpath.io/), certificate
+by [SignPath Foundation](https://signpath.org/).
 
 ## Безопасность и допустимое использование
 
@@ -80,4 +83,3 @@ RustDesk, а не официальный релиз RustDesk и не проду�
 
 Исходный проект и его история сохранены в fork. Сведения об авторских правах и
 модификациях приведены в [NOTICE](NOTICE).
-
