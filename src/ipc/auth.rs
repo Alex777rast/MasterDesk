@@ -152,6 +152,20 @@ pub(crate) fn is_allowed_windows_session_scoped_peer(
 
 #[cfg(windows)]
 #[inline]
+fn is_allowed_windows_main_ipc_peer(
+    client_is_system: bool,
+    client_session_id: Option<u32>,
+    expected_session_id: Option<u32>,
+    client_is_elevated: bool,
+    client_is_admin: bool,
+) -> bool {
+    is_allowed_windows_session_scoped_peer(client_is_system, client_session_id, expected_session_id)
+        || client_is_elevated
+        || (crate::custom_defaults::ALLOW_RDS_ADMIN_CROSS_SESSION_IPC && client_is_admin)
+}
+
+#[cfg(windows)]
+#[inline]
 fn is_allowed_windows_portable_service_peer(
     client_is_system: Option<bool>,
     _client_session_id: Option<u32>,
@@ -608,29 +622,32 @@ pub(crate) fn log_rejected_windows_ipc_connection(
     expected_session_id: Option<u32>,
     peer_is_system: Option<bool>,
     peer_is_elevated: Option<bool>,
+    peer_is_admin: Option<bool>,
 ) {
     static LOG_THROTTLE: OnceLock<Mutex<UnauthorizedIpcLogThrottle>> = OnceLock::new();
     throttled_unauthorized_ipc_log(&LOG_THROTTLE, |suppressed| {
         if suppressed > 0 {
             log::warn!(
-                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}, peer_is_elevated={:?} (suppressed {} similar events)",
+                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}, peer_is_elevated={:?}, peer_is_admin={:?} (suppressed {} similar events)",
                 postfix,
                 peer_pid,
                 peer_session_id,
                 expected_session_id,
                 peer_is_system,
                 peer_is_elevated,
+                peer_is_admin,
                 suppressed
             );
         } else {
             log::warn!(
-                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}, peer_is_elevated={:?}",
+                "Rejected unauthorized connection on ipc channel: postfix={}, peer_pid={:?}, peer_session_id={:?}, expected_session_id={:?}, peer_is_system={:?}, peer_is_elevated={:?}, peer_is_admin={:?}",
                 postfix,
                 peer_pid,
                 peer_session_id,
                 expected_session_id,
                 peer_is_system,
-                peer_is_elevated
+                peer_is_elevated,
+                peer_is_admin
             );
         }
     });
@@ -665,6 +682,7 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
         server_session_id,
         peer_is_system,
         peer_is_elevated,
+        peer_is_admin,
     ) = stream.server_authorization_status();
     if !authorized {
         log_rejected_windows_ipc_connection(
@@ -674,6 +692,7 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
             server_session_id,
             peer_is_system,
             peer_is_elevated,
+            peer_is_admin,
         );
         return false;
     }
@@ -685,6 +704,20 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
             err
         );
         return false;
+    }
+    if peer_is_admin == Some(true)
+        && peer_is_elevated != Some(true)
+        && peer_session_id != server_session_id
+    {
+        static RDS_ADMIN_AUTH_LOGGED: OnceLock<()> = OnceLock::new();
+        if RDS_ADMIN_AUTH_LOGGED.set(()).is_ok() {
+            log::info!(
+                "Authorized local administrator GUI on cross-session RDS main IPC: peer_pid={:?}, peer_session_id={:?}, server_session_id={:?}",
+                peer_pid,
+                peer_session_id,
+                server_session_id
+            );
+        }
     }
     true
 }
@@ -793,6 +826,7 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
         Option<u32>,
         Option<bool>,
         Option<bool>,
+        Option<bool>,
     ) {
         let peer_pid = self.peer_pid();
         let server_session_id = crate::platform::windows::get_current_process_session_id();
@@ -816,6 +850,14 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
         let peer_is_elevated = peer_is_elevated_result
             .as_ref()
             .and_then(|r| r.as_ref().ok().copied());
+        let peer_is_admin_result = if session_authorized || peer_is_elevated.unwrap_or(false) {
+            None
+        } else {
+            peer_pid.map(crate::platform::windows::is_process_user_admin)
+        };
+        let peer_is_admin = peer_is_admin_result
+            .as_ref()
+            .and_then(|r| r.as_ref().ok().copied());
         if server_session_id.is_none()
             && !peer_is_system.unwrap_or(false)
             && !peer_is_elevated.unwrap_or(false)
@@ -828,9 +870,17 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
                 peer_session_id
             );
         }
-        // Main IPC trusts same-session peers, LocalSystem, and elevated administrators.
+        // Main IPC trusts same-session peers, LocalSystem, elevated processes, and (in
+        // this custom RDS build) filtered tokens belonging to local administrators.
+        // The accept path separately verifies that the peer is the exact same executable.
         // Service-scoped IPC channels keep their own stricter authorization paths.
-        let authorized = session_authorized || peer_is_elevated.unwrap_or(false);
+        let authorized = is_allowed_windows_main_ipc_peer(
+            peer_is_system.unwrap_or(false),
+            peer_session_id,
+            server_session_id,
+            peer_is_elevated.unwrap_or(false),
+            peer_is_admin.unwrap_or(false),
+        );
         if !authorized {
             if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_system_result.as_ref()) {
                 log::debug!(
@@ -846,6 +896,13 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
                     err
                 );
             }
+            if let (Some(pid), Some(Err(err))) = (peer_pid, peer_is_admin_result.as_ref()) {
+                log::debug!(
+                    "Failed to determine whether peer process belongs to Administrators, pid={}, err={}",
+                    pid,
+                    err
+                );
+            }
         }
         (
             authorized,
@@ -854,6 +911,7 @@ impl ConnectionTmpl<parity_tokio_ipc::Connection> {
             server_session_id,
             peer_is_system,
             peer_is_elevated,
+            peer_is_admin,
         )
     }
 
@@ -938,6 +996,32 @@ mod tests {
             false,
             None,
             Some(1)
+        ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_windows_main_ipc_allows_cross_session_admin_only() {
+        assert!(super::is_allowed_windows_main_ipc_peer(
+            false,
+            Some(5),
+            Some(11),
+            false,
+            true
+        ));
+        assert!(super::is_allowed_windows_main_ipc_peer(
+            false,
+            Some(5),
+            Some(11),
+            true,
+            false
+        ));
+        assert!(!super::is_allowed_windows_main_ipc_peer(
+            false,
+            Some(5),
+            Some(11),
+            false,
+            false
         ));
     }
 

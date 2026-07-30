@@ -1,0 +1,177 @@
+name: MasterDesk Windows x64
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: masterdesk-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  RUST_TOOLCHAIN: "1.75.0"
+  FLUTTER_VERSION: "3.24.5"
+  LLVM_VERSION: "15.0.6"
+  VCPKG_COMMIT_ID: "120deac3062162151622ca4860575a33844ba10b"
+  VCPKG_BINARY_SOURCES: "clear;x-gha,readwrite"
+
+jobs:
+  build:
+    name: Build, test and publish Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 120
+
+    steps:
+      - name: Export GitHub Actions cache variables
+        uses: actions/github-script@d7906e4ad0b1822421a7e6a35d5ca353c962f410
+        with:
+          script: |
+            core.exportVariable('ACTIONS_CACHE_URL', process.env.ACTIONS_CACHE_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Check out source and submodules
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        id: python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: libs/portable/requirements.txt
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: Install LLVM and Clang
+        uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0
+        with:
+          version: ${{ env.LLVM_VERSION }}
+
+      - name: Install Flutter
+        id: flutter
+        uses: subosito/flutter-action@2783a3f08e1baf891508463f8c6653c258246225
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          architecture: x64
+          cache: true
+
+      - name: Set up pinned vcpkg
+        uses: lukka/run-vcpkg@b1a0dd252f06b9e25b3c022a9a03bd7a427fb6a2
+        with:
+          vcpkgDirectory: ${{ github.workspace }}\.tools\vcpkg
+          vcpkgGitCommitId: ${{ env.VCPKG_COMMIT_ID }}
+          doNotCache: false
+
+      - name: Build MasterDesk
+        shell: pwsh
+        env:
+          MASTERDESK_PYTHON: ${{ steps.python.outputs.python-path }}
+          MASTERDESK_FLUTTER_ROOT: ${{ steps.flutter.outputs.CACHE-PATH }}
+        run: |
+          $env:MASTERDESK_LLVM_BIN = Split-Path (Get-Command clang.exe).Source
+          .\scripts\Build-CustomWindows.ps1
+
+      - name: Test MasterDesk defaults
+        shell: pwsh
+        run: |
+          $env:MASTERDESK_LLVM_BIN = Split-Path (Get-Command clang.exe).Source
+          .\scripts\Test-CustomDefaults.ps1
+
+      - name: Upload unsigned artifact for provenance and SignPath
+        id: upload-unsigned
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: MasterDesk-unsigned-${{ github.sha }}
+          path: dist/MasterDesk-1.4.9-RDS-x86_64.exe
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Submit release artifact to SignPath
+        if: ${{ github.ref_type == 'tag' && vars.SIGNPATH_ENABLED == 'true' }}
+        uses: signpath/github-action-submit-signing-request@b9d91eadd323de506c0c81cf0c7fe7438f3360fd # v2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.upload-unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/signed
+          skip-decompress: true
+          parameters: |
+            version: ${{ toJSON(github.ref_name) }}
+
+      - name: Prepare release files
+        shell: pwsh
+        run: |
+          $releaseDirectory = Join-Path $PWD 'dist\release'
+          New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+
+          $unsigned = Join-Path $PWD 'dist\MasterDesk-1.4.9-RDS-x86_64.exe'
+          $signed = Get-ChildItem -Path (Join-Path $PWD 'dist\signed') `
+            -Filter 'MasterDesk-1.4.9-RDS-x86_64.exe' `
+            -File `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+
+          $signingExpected = '${{ vars.SIGNPATH_ENABLED }}' -eq 'true' -and
+            '${{ github.ref_type }}' -eq 'tag'
+          if ($signingExpected -and -not $signed) {
+            throw 'SignPath was enabled, but no signed executable was returned.'
+          }
+
+          $source = if ($signed) { $signed.FullName } else { $unsigned }
+          $destination = Join-Path $releaseDirectory 'MasterDesk-1.4.9-RDS-x86_64.exe'
+          Copy-Item -LiteralPath $source -Destination $destination -Force
+
+          $signature = Get-AuthenticodeSignature -LiteralPath $destination
+          if ($signed -and $signature.Status -ne 'Valid') {
+            throw "Signed executable verification failed: $($signature.Status)"
+          }
+
+          $hash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+          "$hash  MasterDesk-1.4.9-RDS-x86_64.exe" |
+            Set-Content -LiteralPath (Join-Path $releaseDirectory 'SHA256.txt') -Encoding ascii
+          "${{ github.sha }}" |
+            Set-Content -LiteralPath (Join-Path $releaseDirectory 'SOURCE_COMMIT.txt') -Encoding ascii
+          @(
+            "Status: $($signature.Status)"
+            "Signer: $($signature.SignerCertificate.Subject)"
+          ) | Set-Content -LiteralPath (Join-Path $releaseDirectory 'AUTHENTICODE.txt') -Encoding utf8
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: MasterDesk-release-${{ github.sha }}
+          path: dist/release/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Publish GitHub Release
+        if: ${{ github.ref_type == 'tag' }}
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
+        with:
+          name: MasterDesk ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            dist/release/MasterDesk-1.4.9-RDS-x86_64.exe
+            dist/release/SHA256.txt
+            dist/release/SOURCE_COMMIT.txt
+            dist/release/AUTHENTICODE.txt

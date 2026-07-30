@@ -9,25 +9,69 @@ Set-StrictMode -Version Latest
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $ToolsRoot = Join-Path $ProjectRoot '.tools'
-$FlutterRoot = Join-Path $ToolsRoot 'flutter'
+$FlutterRoot = if ($env:MASTERDESK_FLUTTER_ROOT) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_FLUTTER_ROOT)
+} else {
+    Join-Path $ToolsRoot 'flutter'
+}
 $FlutterExe = Join-Path $FlutterRoot 'bin\flutter.bat'
 $VcpkgRoot = Join-Path $ToolsRoot 'vcpkg'
 $VcpkgExe = Join-Path $VcpkgRoot 'vcpkg.exe'
-$PythonExe = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+$PythonExe = if ($env:MASTERDESK_PYTHON) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_PYTHON)
+} else {
+    $localPython = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
+    if (Test-Path -LiteralPath $localPython) {
+        $localPython
+    } else {
+        $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+        if (-not $pythonCommand) {
+            throw 'Python 3.12 was not found. Set MASTERDESK_PYTHON to python.exe.'
+        }
+        $pythonCommand.Source
+    }
+}
 $CargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
 $CargoExe = Join-Path $CargoBin 'cargo.exe'
 $RustupExe = Join-Path $CargoBin 'rustup.exe'
 $CargoExpandExe = Join-Path $CargoBin 'cargo-expand.exe'
 $FlutterRustBridgeCodegen = Join-Path $CargoBin 'flutter_rust_bridge_codegen.exe'
-$LlvmBin = 'C:\Program Files\LLVM\bin'
-$VsDevCmd = 'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
+$LlvmBin = if ($env:MASTERDESK_LLVM_BIN) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_LLVM_BIN)
+} else {
+    $clangCommand = Get-Command clang.exe -ErrorAction SilentlyContinue
+    if ($clangCommand) {
+        [System.IO.Path]::GetDirectoryName($clangCommand.Source)
+    } else {
+        'C:\Program Files\LLVM\bin'
+    }
+}
+$VsDevCmd = if ($env:MASTERDESK_VSDEVCMD) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_VSDEVCMD)
+} else {
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    $detectedVsDevCmd = if (Test-Path -LiteralPath $vswhere) {
+        & $vswhere `
+            -latest `
+            -products '*' `
+            -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+            -find 'Common7\Tools\VsDevCmd.bat' |
+            Select-Object -First 1
+    }
+    if ($detectedVsDevCmd) {
+        $detectedVsDevCmd
+    } else {
+        'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat'
+    }
+}
+$ExpectedVcpkgCommit = '120deac3062162151622ca4860575a33844ba10b'
 $FlutterEngineZip = Join-Path $ToolsRoot 'windows-x64-release.zip'
 $FlutterEngineExtract = Join-Path $ToolsRoot 'custom-flutter-engine'
 $FlutterEngineUrl = 'https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip'
 $FlutterEngineTarget = Join-Path $FlutterRoot 'bin\cache\artifacts\engine\windows-x64-release'
 $ReleaseDirectory = Join-Path $ProjectRoot 'flutter\build\windows\x64\runner\Release'
 $DistDirectory = Join-Path $ProjectRoot 'dist'
-$OutputExe = Join-Path $DistDirectory 'RustDesk-Custom-1.4.9-x86_64.exe'
+$OutputExe = Join-Path $DistDirectory 'MasterDesk-1.4.9-RDS-x86_64.exe'
 
 function Invoke-Checked {
     param(
@@ -102,6 +146,11 @@ function Install-VcpkgDependencies {
         throw "vcpkg executable not found: $VcpkgExe"
     }
 
+    $actualVcpkgCommit = (& git -C $VcpkgRoot rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $actualVcpkgCommit -ne $ExpectedVcpkgCommit) {
+        throw "Expected vcpkg $ExpectedVcpkgCommit, found $actualVcpkgCommit."
+    }
+
     Invoke-Checked $VcpkgExe @(
         'install',
         '--triplet', 'x64-windows-static',
@@ -146,7 +195,10 @@ function Initialize-FlutterBridge {
         (Join-Path $ProjectRoot 'flutter\lib\generated_bridge.dart'),
         (Join-Path $ProjectRoot 'flutter\lib\generated_bridge.freezed.dart')
     )
-    if (($bridgeOutputs | Where-Object { -not (Test-Path -LiteralPath $_) }).Count -eq 0) {
+    $missingBridgeOutputs = @(
+        $bridgeOutputs | Where-Object { -not (Test-Path -LiteralPath $_) }
+    )
+    if ($missingBridgeOutputs.Count -eq 0) {
         Write-Host 'Flutter bridge files are already generated.'
         return
     }

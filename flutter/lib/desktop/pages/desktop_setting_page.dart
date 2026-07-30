@@ -2440,8 +2440,8 @@ class _AboutState extends State<_About> {
                   child: Text('${translate('Version')}: $version')
                       .marginSymmetric(vertical: 4.0)),
               SelectionArea(
-                  child: const Text(
-                          'Modified self-hosted build · 2026-07-29')
+                  child: Text(
+                          '${bind.mainGetAppNameSync()} · custom self-hosted build · based on RustDesk Community Edition')
                       .marginSymmetric(vertical: 4.0)),
               SelectionArea(
                   child: Text('${translate('Build Date')}: $buildDate')

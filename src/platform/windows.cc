@@ -240,10 +240,19 @@ extern "C"
             ZeroMemory(&si, sizeof si);
             si.cb = sizeof si;
             si.dwFlags = STARTF_USESHOWWINDOW;
+            // A service-created process does not reliably inherit the interactive
+            // desktop when it is launched into another Terminal Services session.
+            // Screen capture in an RDP session needs the process attached to that
+            // session's WinSta0 default desktop even though the process itself stays
+            // hidden.
+            si.lpDesktop = (LPWSTR)L"winsta0\\default";
             if (show)
             {
-                si.lpDesktop = (LPWSTR)L"winsta0\\default";
                 si.wShowWindow = SW_SHOW;
+            }
+            else
+            {
+                si.wShowWindow = SW_HIDE;
             }
             wchar_t buf[MAX_PATH];
             wcscpy_s(buf, MAX_PATH, cmd);

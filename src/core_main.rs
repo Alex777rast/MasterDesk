@@ -391,6 +391,12 @@ pub fn core_main() -> Option<Vec<String>> {
             return None;
         } else if args[0] == "--server" {
             log::info!("start --server with user {}", crate::username());
+            #[cfg(windows)]
+            log::info!(
+                "start --server pid {} in Windows session {:?}",
+                std::process::id(),
+                crate::platform::windows::get_current_process_session_id()
+            );
             #[cfg(target_os = "linux")]
             {
                 hbb_common::allow_err!(crate::platform::check_autostart_config());

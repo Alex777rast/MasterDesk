@@ -3755,6 +3755,7 @@ dependencies = [
  "chrono",
  "clap 4.5.53",
  "confy",
+ "default-net",
  "default_net",
  "directories-next",
  "dirs-next",

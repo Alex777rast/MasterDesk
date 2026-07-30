@@ -1,0 +1,5 @@
+# Security-sensitive release and signing configuration
+/.github/workflows/ @Alex777rast
+/.signpath/ @Alex777rast
+/CODEOWNERS @Alex777rast
+/SIGNING_POLICY.md @Alex777rast

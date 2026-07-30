@@ -46,8 +46,9 @@ use winapi::{
         },
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
-            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, OpenProcess,
-            OpenProcessToken, ProcessIdToSessionId, PROCESS_INFORMATION, STARTUPINFOW,
+            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, OpenProcess,
+            OpenProcessToken, ProcessIdToSessionId, TerminateProcess, PROCESS_INFORMATION,
+            STARTUPINFOW,
         },
         securitybaseapi::{
             AllocateAndInitializeSid, DuplicateToken, EqualSid, FreeSid, GetTokenInformation,
@@ -537,6 +538,7 @@ pub fn start_os_service() {
 }
 
 const SERVICE_TYPE: ServiceType = ServiceType::OWN_PROCESS;
+const SERVER_PROCESS_EXIT_GRACE: Duration = Duration::from_secs(5);
 
 extern "C" {
     fn get_current_session(rdp: BOOL) -> DWORD;
@@ -615,6 +617,7 @@ fn authorize_service_scoped_ipc_connection(
             expected_active_session_id,
             peer_is_system,
             None,
+            None,
         );
         return false;
     }
@@ -674,7 +677,14 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
 
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
-    let mut h_process = launch_server(session_id, true).await.unwrap_or(NULL);
+    let mut h_process = NULL;
+    if let Err(err) = replace_server_process(&mut h_process, session_id).await {
+        log::error!(
+            "Failed to launch initial --server process in session {}: {}",
+            session_id,
+            err
+        );
+    }
     let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
     loop {
@@ -689,7 +699,13 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                 // https://github.com/rustdesk/rustdesk/discussions/10039
                 let count = ipc::get_port_forward_session_count(1000).await.unwrap_or(0);
                 if count == 0 {
-                    h_process = launch_server(session_id, true).await.unwrap_or(NULL);
+                    if let Err(err) = replace_server_process(&mut h_process, session_id).await {
+                        log::error!(
+                            "Failed to switch --server process to automatically selected session {}: {}",
+                            session_id,
+                            err
+                        );
+                    }
                 }
             }
         }
@@ -726,8 +742,15 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                                         );
                                         session_id = usid;
                                         stored_usid = Some(session_id);
-                                        h_process =
-                                            launch_server(session_id, true).await.unwrap_or(NULL);
+                                        if let Err(err) =
+                                            replace_server_process(&mut h_process, session_id).await
+                                        {
+                                            log::error!(
+                                                "Failed to switch --server process to requested RDP session {}: {}",
+                                                session_id,
+                                                err
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -744,29 +767,33 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                     if tmp == 0xFFFFFFFF {
                         continue;
                     }
-                    let mut close_sent = false;
                     if tmp != session_id && stored_usid != Some(session_id) {
                         log::info!("session changed from {} to {}", session_id, tmp);
                         session_id = tmp;
                         let count = ipc::get_port_forward_session_count(1000).await.unwrap_or(0);
                         if count == 0 {
-                            send_close_async("").await.ok();
-                            close_sent = true;
+                            if let Err(err) =
+                                replace_server_process(&mut h_process, session_id).await
+                            {
+                                log::error!(
+                                    "Failed to switch --server process to active session {}: {}",
+                                    session_id,
+                                    err
+                                );
+                            }
                         }
                     }
                     let mut exit_code: DWORD = 0;
-                    if h_process.is_null()
-                        || (GetExitCodeProcess(h_process, &mut exit_code) == TRUE
-                            && exit_code != STILL_ACTIVE
-                            && CloseHandle(h_process) == TRUE)
-                    {
-                        match launch_server(session_id, !close_sent).await {
-                            Ok(ptr) => {
-                                h_process = ptr;
-                            }
-                            Err(err) => {
-                                log::error!("Failed to launch server: {}", err);
-                            }
+                    let process_stopped = h_process.is_null()
+                        || GetExitCodeProcess(h_process, &mut exit_code) != TRUE
+                        || exit_code != STILL_ACTIVE;
+                    if process_stopped {
+                        if let Err(err) = replace_server_process(&mut h_process, session_id).await {
+                            log::error!(
+                                "Failed to restart --server process in session {}: {}",
+                                session_id,
+                                err
+                            );
                         }
                     }
                 }
@@ -774,10 +801,7 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
         }
     }
 
-    if !h_process.is_null() {
-        send_close_async("").await.ok();
-        unsafe { CloseHandle(h_process) };
-    }
+    stop_server_process(&mut h_process).await;
 
     status_handle.set_service_status(ServiceStatus {
         service_type: SERVICE_TYPE,
@@ -802,6 +826,88 @@ async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDL
         std::env::current_exe()?.to_str().unwrap_or("")
     );
     launch_privileged_process(session_id, &cmd)
+}
+
+async fn stop_server_process(h_process: &mut HANDLE) {
+    if let Err(err) = send_close_async("").await {
+        log::debug!("No running --server IPC endpoint to close: {}", err);
+    }
+
+    if h_process.is_null() {
+        return;
+    }
+
+    let started = Instant::now();
+    loop {
+        let mut exit_code: DWORD = 0;
+        let status_ok = unsafe { GetExitCodeProcess(*h_process, &mut exit_code) == TRUE };
+        if !status_ok {
+            log::warn!(
+                "Failed to query old --server process status: {}",
+                io::Error::last_os_error()
+            );
+            break;
+        }
+        if exit_code != STILL_ACTIVE {
+            log::info!("Old --server process exited with code {}", exit_code);
+            break;
+        }
+        if started.elapsed() >= SERVER_PROCESS_EXIT_GRACE {
+            log::warn!(
+                "Old --server process did not exit within {:?}; terminating the service-owned child before RDP handover",
+                SERVER_PROCESS_EXIT_GRACE
+            );
+            if unsafe { TerminateProcess(*h_process, 1) } == FALSE {
+                log::error!(
+                    "Failed to terminate stale --server process: {}",
+                    io::Error::last_os_error()
+                );
+            } else {
+                sleep(0.1).await;
+            }
+            break;
+        }
+        sleep(0.05).await;
+    }
+
+    unsafe {
+        CloseHandle(*h_process);
+    }
+    *h_process = NULL;
+}
+
+async fn replace_server_process(h_process: &mut HANDLE, session_id: DWORD) -> ResultType<()> {
+    stop_server_process(h_process).await;
+
+    let new_process = launch_server(session_id, false).await?;
+    if new_process.is_null() {
+        bail!("CreateProcessAsUserW returned a null process handle");
+    }
+
+    let process_id = unsafe { GetProcessId(new_process) };
+    let mut actual_session_id = DWORD::MAX;
+    let actual_session_known = process_id != 0
+        && unsafe { ProcessIdToSessionId(process_id, &mut actual_session_id) == TRUE };
+    if !actual_session_known || actual_session_id != session_id {
+        unsafe {
+            TerminateProcess(new_process, 1);
+            CloseHandle(new_process);
+        }
+        bail!(
+            "launched --server pid {} in session {:?}, expected session {}",
+            process_id,
+            actual_session_known.then_some(actual_session_id),
+            session_id
+        );
+    }
+
+    log::info!(
+        "Started --server pid {} in Windows session {} on winsta0\\default",
+        process_id,
+        actual_session_id
+    );
+    *h_process = new_process;
+    Ok(())
 }
 
 pub fn launch_privileged_process(session_id: DWORD, cmd: &str) -> ResultType<HANDLE> {
@@ -2617,6 +2723,37 @@ pub fn is_process_running_as_system(process_id: DWORD) -> ResultType<bool> {
         }
         let _ = WinCloseHandle(process);
         result
+    }
+}
+
+/// Returns whether the process token contains the built-in Administrators SID.
+///
+/// Unlike `is_elevated`, this intentionally recognizes an administrator's
+/// filtered UAC token. It is used only as one part of the main IPC policy; the
+/// caller also verifies that the peer is the exact same RustDesk executable.
+pub fn is_process_user_admin(process_id: DWORD) -> ResultType<bool> {
+    use hbb_common::platform::windows::RAIIHandle;
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+        if process == NULL {
+            bail!(
+                "Failed to open process {}, error {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        let _process = RAIIHandle(process);
+
+        let mut token: HANDLE = mem::zeroed();
+        if OpenProcessToken(process, TOKEN_QUERY, &mut token) == FALSE {
+            bail!(
+                "Failed to open process {} token, error {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        let _token = RAIIHandle(token);
+        is_user_token_admin(token)
     }
 }
 

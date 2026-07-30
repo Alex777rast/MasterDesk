@@ -1,0 +1,14 @@
+MasterDesk
+Copyright (C) 2026 MasterDesk contributors
+
+MasterDesk is a modified version of RustDesk:
+https://github.com/rustdesk/rustdesk
+
+RustDesk copyright notices and Git history are retained in this fork.
+The combined work is distributed under the GNU Affero General Public License,
+version 3. MasterDesk releases are clearly identified as modified builds and
+are not official RustDesk releases.
+
+The complete corresponding source for every MasterDesk release, including the
+modified hbb_common submodule and build scripts, is published in the linked
+GitHub repositories and release tag.

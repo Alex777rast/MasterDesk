@@ -1,4 +1,5 @@
 fn main() {
+    println!("cargo:rerun-if-changed=../../res/icon.ico");
     #[cfg(windows)]
     {
         use std::io::Write;
