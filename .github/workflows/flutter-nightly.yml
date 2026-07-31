@@ -1,5 +1,9 @@
 name: Flutter Nightly Build
 
+permissions:
+  contents: write
+  packages: read
+
 on:
   schedule:
     # schedule build every night

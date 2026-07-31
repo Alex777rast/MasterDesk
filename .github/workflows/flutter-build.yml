@@ -419,6 +419,13 @@ jobs:
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
 
+      - name: Select the Windows x86 Rust toolchain
+        shell: bash
+        run: |
+          rustup override set "nightly-2023-10-13-${{ matrix.job.target }}"
+          rustc -Vv
+          cargo -V
+
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           prefix-key: ${{ matrix.job.os }}-sciter
@@ -762,6 +769,12 @@ jobs:
           toolchain: ${{ env.MAC_RUST_VERSION }}
           targets: ${{ matrix.job.target }}
           components: "rustfmt"
+
+      - name: Select the macOS Rust toolchain
+        run: |
+          rustup override set "${{ env.MAC_RUST_VERSION }}"
+          rustc -Vv
+          cargo -V
 
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
