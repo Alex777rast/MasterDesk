@@ -1105,7 +1105,7 @@ class _CmControlPanel extends StatelessWidget {
                 color: Colors.transparent,
                 border: Border.all(color: Colors.grey),
                 onClick: handleDisconnect,
-                text: 'Cancel',
+                text: 'Dismiss',
                 textColor: null,
               ),
             ),

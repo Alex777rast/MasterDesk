@@ -58,6 +58,35 @@ $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows-static'
 $env:VCPKG_DEFAULT_HOST_TRIPLET = 'x64-windows-static'
 $env:Path = "$CargoBin;$LlvmBin;$env:Path"
 
+$windowsInstaller = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\platform\windows.rs') -Raw
+$installStart = $windowsInstaller.IndexOf('pub fn install_me(')
+$installEnd = $windowsInstaller.IndexOf('pub fn run_after_install()', $installStart)
+if ($installStart -lt 0 -or $installEnd -le $installStart) {
+    throw 'Could not locate the initial Windows installer implementation.'
+}
+$initialInstaller = $windowsInstaller.Substring($installStart, $installEnd - $installStart)
+if ($initialInstaller -notmatch '\{copy_exe\}\s*\{rename_exe\}') {
+    throw 'Initial installation does not rename the packaged rustdesk.exe to the branded executable.'
+}
+if ($initialInstaller -notmatch 'rename_exe\s*=\s*rename_exe_cmd\(&src_exe,\s*&path\)\?') {
+    throw 'Initial installation is missing the rename_exe command binding.'
+}
+
+$serverModel = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\models\server_model.dart') -Raw
+if ($serverModel -notmatch 'showCmWindow\(forceForeground:\s*!client\.authorized\)') {
+    throw 'Unauthorized incoming connections are not configured to foreground the approval window.'
+}
+
+$serverPage = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\desktop\pages\server_page.dart') -Raw
+if ($serverPage -notmatch "text:\s*'Dismiss'") {
+    throw 'The incoming connection rejection button is not configured as Dismiss.'
+}
+
+$clientSource = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\client.rs') -Raw
+if ($clientSource -notmatch 'custom_defaults::DEFAULT_KEYBOARD_MODE') {
+    throw 'New peer sessions do not use the compiled keyboard-mode default.'
+}
+
 Push-Location $ProjectRoot
 try {
     & (Join-Path $CargoBin 'cargo.exe') test `

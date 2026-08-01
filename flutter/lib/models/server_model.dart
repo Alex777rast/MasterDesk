@@ -575,7 +575,7 @@ class ServerModel with ChangeNotifier {
         tabController.remove(index_disconnected);
       }
       if (desktopType == DesktopType.cm && !hideCm) {
-        showCmWindow();
+        showCmWindow(forceForeground: !client.authorized);
       }
       scrollToBottom();
       notifyListeners();

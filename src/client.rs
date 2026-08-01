@@ -2601,7 +2601,16 @@ impl LoginConfigHandler {
             }
         }
         if config.keyboard_mode.is_empty() {
+            let preferred_mode =
+                KeyboardMode::from_str(crate::custom_defaults::DEFAULT_KEYBOARD_MODE)
+                    .unwrap_or(KeyboardMode::Translate);
             if is_keyboard_mode_supported(
+                &preferred_mode,
+                get_version_number(&pi.version),
+                &pi.platform,
+            ) {
+                config.keyboard_mode = preferred_mode.to_string();
+            } else if is_keyboard_mode_supported(
                 &KeyboardMode::Map,
                 get_version_number(&pi.version),
                 &pi.platform,

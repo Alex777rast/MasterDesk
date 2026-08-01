@@ -308,7 +308,7 @@ void runConnectionManagerScreen() async {
 
 bool _isCmReadyToShow = false;
 
-showCmWindow({bool isStartup = false}) async {
+showCmWindow({bool isStartup = false, bool forceForeground = false}) async {
   if (isStartup) {
     WindowOptions windowOptions = getHiddenTitleBarWindowOptions(
         size: kConnectionManagerWindowSizeClosedChat, alwaysOnTop: true);
@@ -324,13 +324,17 @@ showCmWindow({bool isStartup = false}) async {
         kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
     _isCmReadyToShow = true;
   } else if (_isCmReadyToShow) {
-    if (await windowManager.getOpacity() != 1) {
+    if (forceForeground || await windowManager.getOpacity() != 1) {
       await windowManager.setOpacity(1);
       await windowManager.focus();
-      await windowManager.minimize(); //needed
+      if (forceForeground) {
+        await windowManager.restore();
+      } else {
+        await windowManager.minimize(); // needed before realigning a hidden CM
+      }
       await windowManager.setSizeAlignment(
           kConnectionManagerWindowSizeClosedChat, Alignment.topRight);
-      windowOnTop(null);
+      await windowOnTop(null);
     }
   }
 }

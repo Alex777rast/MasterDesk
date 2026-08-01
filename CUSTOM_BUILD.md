@@ -15,6 +15,9 @@ The client loads the following values before it reads a user profile:
 - Codec: `VP9`
 - Image quality: `Best`
 - View style: `Adaptive`
+- Incoming authentication: password and local `Accept` / `Dismiss` approval
+- Keyboard mode for new peers: `Translate` (`beta` in the UI)
+- Keyboard input source: `Input source 1`
 - Monitor switch on the main toolbar: enabled
 - Monitors on the session toolbar: enabled
 - Use all local displays for a remote session: enabled
@@ -31,6 +34,10 @@ The client loads the following values before it reads a user profile:
 
 The implementation is in `src/custom_defaults.rs`. The settings are defaults,
 not locked policy overrides, so an administrator can change them in the UI.
+
+An unauthorized incoming request restores and foregrounds the connection
+manager on the client machine. The local user can accept or reject the request
+while the remote operator is still at the password prompt.
 
 No API server is configured because the target is RustDesk Community Server.
 
@@ -86,6 +93,10 @@ change machine-wide settings.
 The first release target is the upstream-compatible Windows x64 Flutter
 self-extracting executable. It can run portably as one file and can install the
 RustDesk service through the normal client UI.
+
+During installation the embedded `rustdesk.exe` payload is renamed to
+`MasterDesk.exe` before service and shortcut registration. Installation errors
+are shown instead of being silently discarded.
 
 Use `scripts/Build-CustomWindows.ps1` from PowerShell to reproduce the build.
 The script pins Rust 1.75.0, Flutter 3.24.5, LLVM 15.0.6, the upstream vcpkg

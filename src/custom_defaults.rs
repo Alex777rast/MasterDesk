@@ -18,6 +18,10 @@ pub const SERVER_PUBLIC_KEY: &str = "oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4
 pub const DEFAULT_CODEC: &str = "vp9";
 pub const DEFAULT_IMAGE_QUALITY: &str = "best";
 pub const DEFAULT_VIEW_STYLE: &str = "adaptive";
+/// Offer both password authentication and the local Accept/Cancel prompt.
+pub const DEFAULT_APPROVE_MODE: &str = "password-click";
+pub const DEFAULT_KEYBOARD_MODE: &str = "translate";
+pub const DEFAULT_INPUT_SOURCE: &str = "Input source 1";
 /// Allow an unelevated member of the local Administrators group to use the
 /// installed server's main IPC channel from another Windows RDP session.
 ///
@@ -40,6 +44,10 @@ fn server_settings() -> HashMap<String, String> {
         (
             keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned(),
             "Y".to_owned(),
+        ),
+        (
+            keys::OPTION_APPROVE_MODE.to_owned(),
+            DEFAULT_APPROVE_MODE.to_owned(),
         ),
         (
             keys::OPTION_FORCE_DIRECT_SERVER.to_owned(),
@@ -84,6 +92,7 @@ fn local_settings() -> HashMap<String, String> {
     HashMap::from([
         (keys::OPTION_ENABLE_CHECK_UPDATE.to_owned(), "N".to_owned()),
         (keys::OPTION_ENABLE_UDP_PUNCH.to_owned(), "Y".to_owned()),
+        ("input-source".to_owned(), DEFAULT_INPUT_SOURCE.to_owned()),
         (
             keys::OPTION_ALLOW_MONITOR_SWITCH_MAIN_TOOLBAR.to_owned(),
             "Y".to_owned(),
@@ -201,6 +210,20 @@ mod tests {
             settings.get(keys::OPTION_ALLOW_MONITOR_SWITCH_MAIN_TOOLBAR),
             Some(&"Y".to_owned())
         );
+        assert_eq!(
+            settings.get("input-source"),
+            Some(&DEFAULT_INPUT_SOURCE.to_owned())
+        );
+    }
+
+    #[test]
+    fn bundled_interaction_defaults_match_the_deployment() {
+        let settings = server_settings();
+        assert_eq!(
+            settings.get(keys::OPTION_APPROVE_MODE),
+            Some(&DEFAULT_APPROVE_MODE.to_owned())
+        );
+        assert_eq!(DEFAULT_KEYBOARD_MODE, "translate");
     }
 
     #[test]
@@ -226,6 +249,10 @@ mod tests {
         assert_eq!(
             config::Config::get_option(keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION),
             "Y"
+        );
+        assert_eq!(
+            config::Config::get_option(keys::OPTION_APPROVE_MODE),
+            DEFAULT_APPROVE_MODE
         );
         for key in [
             keys::OPTION_ENABLE_BLOCK_INPUT,
@@ -257,5 +284,9 @@ mod tests {
                 &config::LocalConfig::get_option(key)
             ));
         }
+        assert_eq!(
+            config::LocalConfig::get_option("input-source"),
+            DEFAULT_INPUT_SOURCE
+        );
     }
 }
