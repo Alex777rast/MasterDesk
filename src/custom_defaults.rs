@@ -11,9 +11,11 @@ use std::collections::HashMap;
 pub const APP_NAME: &str = "MasterDesk";
 pub const ID_SERVER: &str = "desk.masteronline.space";
 pub const RELAY_SERVER: &str = "desk.masteronline.space";
+pub const API_SERVER: &str = "https://api.masteronline.space";
 /// Accept both the public hostname and its current IPv4 address in the
-/// socket-level VPN bypass. The visible ID/relay settings always use DNS.
-pub const DIRECT_SERVER_TARGETS: &str = "desk.masteronline.space,176.123.167.146";
+/// socket-level VPN bypass. The visible ID/relay/API settings always use DNS.
+pub const DIRECT_SERVER_TARGETS: &str =
+    "desk.masteronline.space,api.masteronline.space,176.123.167.146";
 pub const SERVER_PUBLIC_KEY: &str = "oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=";
 pub const DEFAULT_CODEC: &str = "vp9";
 pub const DEFAULT_IMAGE_QUALITY: &str = "best";
@@ -40,6 +42,7 @@ fn server_settings() -> HashMap<String, String> {
             keys::OPTION_RELAY_SERVER.to_owned(),
             RELAY_SERVER.to_owned(),
         ),
+        (keys::OPTION_API_SERVER.to_owned(), API_SERVER.to_owned()),
         (keys::OPTION_KEY.to_owned(), SERVER_PUBLIC_KEY.to_owned()),
         (
             keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION.to_owned(),
@@ -135,6 +138,10 @@ mod tests {
             Some(&RELAY_SERVER.to_owned())
         );
         assert_eq!(
+            settings.get(keys::OPTION_API_SERVER),
+            Some(&API_SERVER.to_owned())
+        );
+        assert_eq!(
             settings.get(keys::OPTION_KEY),
             Some(&SERVER_PUBLIC_KEY.to_owned())
         );
@@ -154,6 +161,9 @@ mod tests {
         assert!(hbb_common::direct_server::is_target(ID_SERVER));
         assert!(hbb_common::direct_server::is_target(
             "DESK.MASTERONLINE.SPACE:21116"
+        ));
+        assert!(hbb_common::direct_server::is_target(
+            "API.MASTERONLINE.SPACE:443"
         ));
         assert!(hbb_common::direct_server::is_target(
             "176.123.167.146:21117"
@@ -237,6 +247,10 @@ mod tests {
         assert_eq!(
             config::Config::get_option(keys::OPTION_RELAY_SERVER),
             RELAY_SERVER
+        );
+        assert_eq!(
+            config::Config::get_option(keys::OPTION_API_SERVER),
+            API_SERVER
         );
         assert_eq!(
             config::Config::get_option(keys::OPTION_KEY),

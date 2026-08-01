@@ -1,0 +1,38 @@
+services:
+  masterdesk-api:
+    image: lejianwen/rustdesk-api:v2.7
+    container_name: masterdesk-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:21114:21114"
+    environment:
+      TZ: Asia/Dubai
+      RUSTDESK_API_LANG: en
+      RUSTDESK_API_APP_WEB_CLIENT: "0"
+      RUSTDESK_API_APP_REGISTER: "false"
+      RUSTDESK_API_APP_SHOW_SWAGGER: "0"
+      RUSTDESK_API_APP_TOKEN_EXPIRE: 168h
+      RUSTDESK_API_APP_DISABLE_PWD_LOGIN: "false"
+      RUSTDESK_API_APP_REGISTER_STATUS: "2"
+      RUSTDESK_API_APP_CAPTCHA_THRESHOLD: "3"
+      RUSTDESK_API_APP_BAN_THRESHOLD: "5"
+      RUSTDESK_API_ADMIN_TITLE: MasterDesk Admin
+      RUSTDESK_API_GIN_TRUST_PROXY: 127.0.0.1,172.17.0.1
+      RUSTDESK_API_GORM_TYPE: sqlite
+      RUSTDESK_API_RUSTDESK_PERSONAL: "1"
+      RUSTDESK_API_RUSTDESK_ID_SERVER: desk.masteronline.space:21116
+      RUSTDESK_API_RUSTDESK_RELAY_SERVER: desk.masteronline.space:21117
+      RUSTDESK_API_RUSTDESK_API_SERVER: https://api.masteronline.space
+      RUSTDESK_API_RUSTDESK_KEY_FILE: /app/id_ed25519.pub
+    volumes:
+      - ./data:/app/data
+      - /opt/rustdesk/data/id_ed25519.pub:/app/id_ed25519.pub:ro
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 0.75
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

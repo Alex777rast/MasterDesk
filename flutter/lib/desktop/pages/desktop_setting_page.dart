@@ -2452,7 +2452,8 @@ class _AboutState extends State<_About> {
                         .marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com/privacy.html');
+                    launchUrlString(
+                        'https://github.com/Alex777rast/MasterDesk/blob/test/masterdesk-api-1.4.9/PRIVACY.md');
                   },
                   child: Text(
                     translate('Privacy Statement'),
@@ -2460,10 +2461,19 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com');
+                    launchUrlString('https://masteronline.space');
                   },
                   child: Text(
                     translate('Website'),
+                    style: linkStyle,
+                  ).marginSymmetric(vertical: 4.0)),
+              InkWell(
+                  onTap: () {
+                    launchUrlString(
+                        'https://github.com/Alex777rast/MasterDesk');
+                  },
+                  child: const Text(
+                    'Source code (AGPL-3.0)',
                     style: linkStyle,
                   ).marginSymmetric(vertical: 4.0)),
               Container(
@@ -2478,7 +2488,8 @@ class _AboutState extends State<_About> {
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
                           Text(
-                            'Copyright © ${DateTime.now().toString().substring(0, 4)} Purslane Tech Pte. Ltd.\n$license',
+                            'MasterDesk modifications Copyright © ${DateTime.now().toString().substring(0, 4)} MasterDesk contributors.\n'
+                            'RustDesk Copyright © Purslane Tech Pte. Ltd. and contributors.\n$license',
                             style: const TextStyle(color: Colors.white),
                           ),
                           Text(

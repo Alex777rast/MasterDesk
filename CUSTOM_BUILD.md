@@ -10,6 +10,7 @@ The client loads the following values before it reads a user profile:
 - Product name, Windows service and configuration namespace: `MasterDesk`
 - ID server: `desk.masteronline.space`
 - Relay server: `desk.masteronline.space`
+- Account/address-book API: `https://api.masteronline.space`
 - Server public key:
   `oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=`
 - Codec: `VP9`
@@ -27,8 +28,9 @@ The client loads the following values before it reads a user profile:
 - Camera: disabled
 - TCP tunnelling: disabled
 - Remote configuration modification: enabled
-- Windows socket-level direct routing to `desk.masteronline.space`
-  (with `176.123.167.146` retained as a hidden resolved-address alias)
+- Windows socket-level direct routing to `desk.masteronline.space` and
+  `api.masteronline.space` (with `176.123.167.146` retained as a hidden
+  resolved-address alias)
 - Windows RDS cross-session GUI access for local administrators
 - Official-client automatic updates: disabled
 
@@ -39,7 +41,10 @@ An unauthorized incoming request restores and foregrounds the connection
 manager on the client machine. The local user can accept or reject the request
 while the remote operator is still at the password prompt.
 
-No API server is configured because the target is RustDesk Community Server.
+The Community `hbbs`/`hbbr` deployment remains responsible only for ID and
+relay traffic. Account and address-book requests use the separate HTTPS API at
+`api.masteronline.space`; its reproducible test deployment is stored in
+`deploy/masterdesk-api/`.
 
 ## MasterDesk branding
 

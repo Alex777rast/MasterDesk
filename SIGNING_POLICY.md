@@ -60,6 +60,12 @@ service can work. That infrastructure may process the IP address, MasterDesk
 device ID, connection timestamps, and routing metadata required to establish
 and relay connections.
 
+When the user signs in to a MasterDesk account, the client also connects to
+`https://api.masteronline.space`. The API processes the account identifier,
+authentication token, device metadata and address-book content required to
+provide account and synchronization features. Passwords must be stored only as
+one-way hashes by the API; plaintext passwords are never included in logs.
+
 MasterDesk does not intentionally send analytics, advertising identifiers, or
 unrelated telemetry to third-party services. A user may replace the default
 ID/relay server in the application settings; any independently operated server
@@ -70,6 +76,8 @@ unless specifically requested by the user or the person installing or
 operating it. Running MasterDesk with the preconfigured service is such a
 request because network communication is the program's documented core
 function.
+
+The current privacy notice is published in [PRIVACY.md](PRIVACY.md).
 
 ## Review and incident response
 
