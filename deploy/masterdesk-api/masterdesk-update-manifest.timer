@@ -1,0 +1,12 @@
+[Unit]
+Description=Check for a new stable MasterDesk release every hour
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Persistent=true
+Unit=masterdesk-update-manifest.service
+
+[Install]
+WantedBy=timers.target

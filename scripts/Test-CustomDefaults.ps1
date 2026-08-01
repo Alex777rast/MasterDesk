@@ -87,6 +87,51 @@ if ($clientSource -notmatch 'custom_defaults::DEFAULT_KEYBOARD_MODE') {
     throw 'New peer sessions do not use the compiled keyboard-mode default.'
 }
 
+$customDefaults = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\custom_defaults.rs') -Raw
+foreach ($expectedValue in @(
+    'hbbs.masteronline.space',
+    'hbbr.masteronline.space',
+    'https://api.masteronline.space/masterdesk/version/latest'
+)) {
+    if ($customDefaults -notmatch [regex]::Escape($expectedValue)) {
+        throw "Compiled MasterDesk defaults are missing $expectedValue."
+    }
+}
+
+$flutterCommon = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\common.dart') -Raw
+if ($flutterCommon -notmatch 'kCheckSoftwareUpdateFinish') {
+    throw 'The Flutter main process is not registered for update notifications.'
+}
+
+$desktopHome = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\desktop\pages\desktop_home_page.dart') -Raw
+if ($desktopHome -notmatch 'if \(updateUrl\.isNotEmpty && !isCardClosed\)') {
+    throw 'The main window does not render the MasterDesk update card.'
+}
+if ($desktopHome -notmatch 'Uri\.parse\(updateUrl\)') {
+    throw 'The MasterDesk update card does not open the manifest release URL.'
+}
+
+$updateManifest = Get-Content -LiteralPath (Join-Path $ProjectRoot 'deploy\masterdesk-api\latest.json') -Raw |
+    ConvertFrom-Json
+if ($updateManifest.version -notmatch '^\d+\.\d+\.\d+-\d+$') {
+    throw 'The MasterDesk update manifest version is not in the expected numeric format.'
+}
+if ($updateManifest.url -notmatch '^https://') {
+    throw 'The MasterDesk update manifest release URL must use HTTPS.'
+}
+
+$pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
+if (-not $pythonCommand) {
+    throw 'Python is required to test the update-manifest refresh service.'
+}
+& $pythonCommand.Source -m unittest discover `
+    -s (Join-Path $ProjectRoot 'deploy\masterdesk-api') `
+    -p 'test_*.py' `
+    -v
+if ($LASTEXITCODE -ne 0) {
+    throw "Update-manifest tests failed with exit code $LASTEXITCODE."
+}
+
 Push-Location $ProjectRoot
 try {
     & (Join-Path $CargoBin 'cargo.exe') test `

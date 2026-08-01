@@ -20,8 +20,8 @@ services:
       RUSTDESK_API_GIN_TRUST_PROXY: 127.0.0.1,172.17.0.1
       RUSTDESK_API_GORM_TYPE: sqlite
       RUSTDESK_API_RUSTDESK_PERSONAL: "1"
-      RUSTDESK_API_RUSTDESK_ID_SERVER: desk.masteronline.space:21116
-      RUSTDESK_API_RUSTDESK_RELAY_SERVER: desk.masteronline.space:21117
+      RUSTDESK_API_RUSTDESK_ID_SERVER: hbbs.masteronline.space:21116
+      RUSTDESK_API_RUSTDESK_RELAY_SERVER: hbbr.masteronline.space:21117
       RUSTDESK_API_RUSTDESK_API_SERVER: https://api.masteronline.space
       RUSTDESK_API_RUSTDESK_KEY_FILE: /app/id_ed25519.pub
     volumes:

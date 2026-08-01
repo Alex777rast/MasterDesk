@@ -1,7 +1,16 @@
 api.masteronline.space {
 	encode zstd gzip
 
-	reverse_proxy 127.0.0.1:21114
+	@masterdeskUpdate path /masterdesk/version/latest
+	handle @masterdeskUpdate {
+		root * /var/lib/caddy/masterdesk-updates
+		rewrite * /latest.json
+		file_server
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:21114
+	}
 
 	header {
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"

@@ -55,16 +55,21 @@ manual approval by the signing approver.
 
 MasterDesk is remote-access software. When the user or system administrator
 starts the program, it connects to the configured ID/relay infrastructure at
-`desk.masteronline.space` so that the explicitly requested remote-access
-service can work. That infrastructure may process the IP address, MasterDesk
-device ID, connection timestamps, and routing metadata required to establish
-and relay connections.
+`hbbs.masteronline.space` and `hbbr.masteronline.space` so that the explicitly
+requested remote-access service can work. That infrastructure may process the
+IP address, MasterDesk device ID, connection timestamps, and routing metadata
+required to establish and relay connections.
 
 When the user signs in to a MasterDesk account, the client also connects to
 `https://api.masteronline.space`. The API processes the account identifier,
 authentication token, device metadata and address-book content required to
 provide account and synchronization features. Passwords must be stored only as
 one-way hashes by the API; plaintext passwords are never included in logs.
+
+The client checks
+`https://api.masteronline.space/masterdesk/version/latest` for a small release
+manifest. It contains only the latest branded version and its HTTPS release
+page. The request is not used for advertising or behavioral analytics.
 
 MasterDesk does not intentionally send analytics, advertising identifiers, or
 unrelated telemetry to third-party services. A user may replace the default

@@ -9,14 +9,27 @@ separate container and does not replace or restart the production `hbbs` and
 
 - API container: `127.0.0.1:21114` only
 - Public API: `https://api.masteronline.space`
-- ID server: `desk.masteronline.space:21116`
-- Relay server: `desk.masteronline.space:21117`
+- ID server: `hbbs.masteronline.space:21116`
+- Relay server: `hbbr.masteronline.space:21117`
 - Persistent API data: `/opt/masterdesk-api/data`
 
 The Caddy snippet terminates TLS and proxies the public API hostname to the
 loopback-only container port. Public self-registration and the bundled web
 client are disabled for the test deployment. Users are created by an
 administrator.
+
+The same HTTPS virtual host serves
+`/var/lib/caddy/masterdesk-updates/latest.json` as
+`/masterdesk/version/latest`. Publish a release and verify its downloadable
+assets before replacing this file with a higher branded version. The client
+shows the release in its main window but does not automatically execute custom
+updates until Authenticode signing is enabled.
+
+`masterdesk-update-manifest.timer` performs this promotion automatically once
+per hour. Its refresh script accepts only stable tags in the form
+`v1.4.9-masterdesk.3`, verifies that the Windows EXE and all provenance files
+are present, and atomically replaces the public manifest. A failed GitHub
+request or incomplete release leaves the previous manifest untouched.
 
 ## Upstream and license
 

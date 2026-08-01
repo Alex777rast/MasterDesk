@@ -24,6 +24,11 @@ streams are not intentionally stored by the ID, relay or account API services.
 Relay traffic may pass through the MasterDesk relay server when a direct
 peer-to-peer connection cannot be established.
 
+At startup, when update checks are enabled, the client requests a small
+version manifest from `api.masteronline.space`. The web server may record the
+source IP address, request time and standard HTTP metadata. The request does
+not include address-book contents or remote-session data.
+
 ## Purpose
 
 The data is processed only to authenticate users, synchronize address books,

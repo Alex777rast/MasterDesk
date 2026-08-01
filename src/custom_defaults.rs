@@ -9,13 +9,18 @@ use hbb_common::config::{self, keys};
 use std::collections::HashMap;
 
 pub const APP_NAME: &str = "MasterDesk";
-pub const ID_SERVER: &str = "desk.masteronline.space";
-pub const RELAY_SERVER: &str = "desk.masteronline.space";
+pub const ID_SERVER: &str = "hbbs.masteronline.space";
+pub const RELAY_SERVER: &str = "hbbr.masteronline.space";
 pub const API_SERVER: &str = "https://api.masteronline.space";
+pub const UPDATE_MANIFEST_URL: &str = "https://api.masteronline.space/masterdesk/version/latest";
+/// Branded release sequence. Keep the upstream protocol version in
+/// `src/version.rs` unchanged so peer feature negotiation remains compatible.
+pub const UPDATE_VERSION: &str = "1.4.9-3";
+pub const LEGACY_SERVER: &str = "desk.masteronline.space";
 /// Accept both the public hostname and its current IPv4 address in the
 /// socket-level VPN bypass. The visible ID/relay/API settings always use DNS.
 pub const DIRECT_SERVER_TARGETS: &str =
-    "desk.masteronline.space,api.masteronline.space,176.123.167.146";
+    "hbbs.masteronline.space,hbbr.masteronline.space,api.masteronline.space,176.123.167.146";
 pub const SERVER_PUBLIC_KEY: &str = "oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=";
 pub const DEFAULT_CODEC: &str = "vp9";
 pub const DEFAULT_IMAGE_QUALITY: &str = "best";
@@ -60,8 +65,8 @@ fn server_settings() -> HashMap<String, String> {
         (keys::OPTION_ENABLE_PRIVACY_MODE.to_owned(), "N".to_owned()),
         (keys::OPTION_ENABLE_CAMERA.to_owned(), "N".to_owned()),
         (keys::OPTION_ENABLE_TUNNEL.to_owned(), "N".to_owned()),
-        // Do not replace this fork with an official RustDesk binary.  A custom
-        // update channel can be added when branded releases are introduced.
+        // MasterDesk shows branded releases in the main window. Automatic
+        // installation remains disabled until release binaries are signed.
         (keys::OPTION_ALLOW_AUTO_UPDATE.to_owned(), "N".to_owned()),
     ])
 }
@@ -93,7 +98,7 @@ fn display_settings() -> HashMap<String, String> {
 
 fn local_settings() -> HashMap<String, String> {
     HashMap::from([
-        (keys::OPTION_ENABLE_CHECK_UPDATE.to_owned(), "N".to_owned()),
+        (keys::OPTION_ENABLE_CHECK_UPDATE.to_owned(), "Y".to_owned()),
         (keys::OPTION_ENABLE_UDP_PUNCH.to_owned(), "Y".to_owned()),
         ("input-source".to_owned(), DEFAULT_INPUT_SOURCE.to_owned()),
         (
@@ -101,6 +106,38 @@ fn local_settings() -> HashMap<String, String> {
             "Y".to_owned(),
         ),
     ])
+}
+
+fn is_legacy_server(value: &str) -> bool {
+    let host = value
+        .trim()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('.');
+    host.eq_ignore_ascii_case(LEGACY_SERVER)
+}
+
+fn migrate_legacy_server_settings() {
+    let id_server = config::Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER);
+    if is_legacy_server(&id_server) {
+        config::Config::set_option(
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
+            ID_SERVER.to_owned(),
+        );
+    }
+
+    let relay_server = config::Config::get_option(keys::OPTION_RELAY_SERVER);
+    if is_legacy_server(&relay_server) {
+        config::Config::set_option(
+            keys::OPTION_RELAY_SERVER.to_owned(),
+            RELAY_SERVER.to_owned(),
+        );
+    }
+}
+
+pub fn is_newer_update(latest: &str) -> bool {
+    hbb_common::get_version_number(latest) > hbb_common::get_version_number(UPDATE_VERSION)
 }
 
 /// Apply the fork defaults in every RustDesk process (GUI, service and
@@ -119,6 +156,7 @@ pub fn apply() {
         .write()
         .unwrap()
         .extend(local_settings());
+    migrate_legacy_server_settings();
 }
 
 #[cfg(test)]
@@ -153,6 +191,10 @@ mod tests {
             settings.get(keys::OPTION_ALLOW_REMOTE_CONFIG_MODIFICATION),
             Some(&"Y".to_owned())
         );
+        assert_eq!(
+            settings.get(keys::OPTION_ALLOW_AUTO_UPDATE),
+            Some(&"N".to_owned())
+        );
     }
 
     #[test]
@@ -160,7 +202,10 @@ mod tests {
         apply();
         assert!(hbb_common::direct_server::is_target(ID_SERVER));
         assert!(hbb_common::direct_server::is_target(
-            "DESK.MASTERONLINE.SPACE:21116"
+            "HBBS.MASTERONLINE.SPACE:21116"
+        ));
+        assert!(hbb_common::direct_server::is_target(
+            "HBBR.MASTERONLINE.SPACE:21117"
         ));
         assert!(hbb_common::direct_server::is_target(
             "API.MASTERONLINE.SPACE:443"
@@ -169,6 +214,22 @@ mod tests {
             "176.123.167.146:21117"
         ));
         assert!(!hbb_common::direct_server::is_target("example.com:21116"));
+    }
+
+    #[test]
+    fn branded_update_versions_are_compared_independently_from_upstream() {
+        assert!(!is_newer_update("1.4.9-2"));
+        assert!(!is_newer_update(UPDATE_VERSION));
+        assert!(is_newer_update("1.4.9-4"));
+        assert!(is_newer_update("1.4.10-1"));
+    }
+
+    #[test]
+    fn recognizes_only_the_previous_combined_server_for_migration() {
+        assert!(is_legacy_server("desk.masteronline.space"));
+        assert!(is_legacy_server("DESK.MASTERONLINE.SPACE.:21116"));
+        assert!(!is_legacy_server(ID_SERVER));
+        assert!(!is_legacy_server(RELAY_SERVER));
     }
 
     #[test]
@@ -212,6 +273,10 @@ mod tests {
     #[test]
     fn bundled_local_defaults_match_the_deployment() {
         let settings = local_settings();
+        assert_eq!(
+            settings.get(keys::OPTION_ENABLE_CHECK_UPDATE),
+            Some(&"Y".to_owned())
+        );
         assert_eq!(
             settings.get(keys::OPTION_ENABLE_UDP_PUNCH),
             Some(&"Y".to_owned())
@@ -268,6 +333,14 @@ mod tests {
             config::Config::get_option(keys::OPTION_APPROVE_MODE),
             DEFAULT_APPROVE_MODE
         );
+        assert!(config::option2bool(
+            keys::OPTION_ENABLE_CHECK_UPDATE,
+            &config::LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE),
+        ));
+        assert!(!config::option2bool(
+            keys::OPTION_ALLOW_AUTO_UPDATE,
+            &config::Config::get_option(keys::OPTION_ALLOW_AUTO_UPDATE),
+        ));
         for key in [
             keys::OPTION_ENABLE_BLOCK_INPUT,
             keys::OPTION_ENABLE_PRIVACY_MODE,
