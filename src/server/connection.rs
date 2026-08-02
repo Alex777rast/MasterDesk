@@ -1133,9 +1133,6 @@ impl Connection {
             conn.lr.my_id.clone(),
         );
         video_service::notify_video_frame_fetched_by_conn_id(id, None);
-        if conn.authorized {
-            password::update_temporary_password();
-        }
         if let Err(err) = conn.try_port_forward_loop(&mut rx_from_cm).await {
             conn.on_close(&err.to_string(), false).await;
             raii::AuthedConnID::check_remove_session(conn.inner.id(), conn.session_key());
