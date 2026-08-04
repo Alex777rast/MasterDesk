@@ -2856,6 +2856,12 @@ pub fn main_get_common(key: String) -> String {
         } else if key.starts_with("download-file-") {
             let _version = key.replace("download-file-", "");
             #[cfg(target_os = "windows")]
+            if crate::common::is_custom_client()
+                && crate::get_app_name() == crate::custom_defaults::APP_NAME
+            {
+                return crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME.to_owned();
+            }
+            #[cfg(target_os = "windows")]
             return match (
                 crate::platform::windows::is_msi_installed(),
                 crate::common::is_custom_client(),
@@ -2968,6 +2974,21 @@ pub fn main_set_common(_key: String, _value: String) {
                     // 1.4.0 does not support "--update"
                     // But we can assume that the new version supports it.
 
+                    #[cfg(target_os = "windows")]
+                    if crate::common::is_custom_client() {
+                        if let Err(e) =
+                            crate::platform::windows::verify_masterdesk_update_package(f, &_value)
+                        {
+                            log::error!("MasterDesk update verification failed: {}", e);
+                            fs::remove_file(f).ok();
+                            crate::platform::windows::message_box(&format!(
+                                "MasterDesk update verification failed:\n{}",
+                                e
+                            ));
+                            return;
+                        }
+                    }
+
                     #[cfg(any(target_os = "windows", target_os = "macos"))]
                     match crate::platform::update_to(f) {
                         Ok(_) => {
@@ -3030,8 +3051,7 @@ pub fn main_set_common(_key: String, _value: String) {
 
 pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        if key == "continue-insecure-connection"
-        {
+        if key == "continue-insecure-connection" {
             s.continue_insecure_connection(value == "Y");
             return;
         }

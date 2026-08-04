@@ -3775,6 +3775,78 @@ pub fn update_to(file: &str) -> ResultType<()> {
     Ok(())
 }
 
+const MASTERDESK_RELEASE_DOWNLOAD_PREFIX: &str =
+    "https://github.com/Alex777rast/MasterDesk/releases/download/";
+
+fn parse_release_sha256(contents: &str, expected_file_name: &str) -> Option<String> {
+    contents.lines().find_map(|line| {
+        let mut parts = line.split_whitespace();
+        let hash = parts.next()?;
+        let file_name = parts.next()?.trim_start_matches('*');
+        if file_name == expected_file_name
+            && hash.len() == 64
+            && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            Some(hash.to_ascii_lowercase())
+        } else {
+            None
+        }
+    })
+}
+
+/// Verify a downloaded MasterDesk release before elevating and executing it.
+///
+/// The package and SHA256.txt are fetched from the same GitHub release
+/// directory. Authenticode remains the preferred production trust
+/// mechanism once SignPath signing is enabled, while this check prevents a
+/// corrupted or mismatched download from being launched.
+pub fn verify_masterdesk_update_package(file: &str, download_url: &str) -> ResultType<()> {
+    if !download_url.starts_with(MASTERDESK_RELEASE_DOWNLOAD_PREFIX) {
+        bail!("The update URL is outside the MasterDesk release repository");
+    }
+    let Some((release_directory, file_name)) = download_url.rsplit_once('/') else {
+        bail!("The update URL is invalid");
+    };
+    if file_name != crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME {
+        bail!("Unexpected MasterDesk update file: {}", file_name);
+    }
+
+    let sha256_url = format!("{}/SHA256.txt", release_directory);
+    let response = crate::hbbs_http::create_http_client_with_url(&sha256_url)
+        .get(&sha256_url)
+        .send()?;
+    let response = response.error_for_status()?;
+    let contents = response.bytes()?;
+    if contents.len() > 16 * 1024 {
+        bail!("The release checksum file is too large");
+    }
+    let contents = std::str::from_utf8(&contents)?;
+    let Some(expected_hash) = parse_release_sha256(contents, file_name) else {
+        bail!("SHA256.txt does not contain a checksum for {}", file_name);
+    };
+
+    use sha2::{Digest, Sha256};
+    let mut input = std::fs::File::open(file)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual_hash = format!("{:x}", hasher.finalize());
+    if actual_hash != expected_hash {
+        bail!(
+            "SHA-256 mismatch: expected {}, got {}",
+            expected_hash,
+            actual_hash
+        );
+    }
+    Ok(())
+}
+
 // Don't launch tray app when running with `\qn`.
 // 1. Because `/qn` requires administrator permission and the tray app should be launched with user permission.
 //   Or launching the main window from the tray app will cause the main window to be launched with administrator permission.
@@ -4652,6 +4724,32 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_only_the_expected_release_checksum() {
+        let expected = "822a049e85156f76920c824f83a8fa9530f2f781f19ebc943ed69e94fb640607";
+        let contents = format!(
+            "{}  {}\n{}  other.exe\n",
+            expected,
+            crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME,
+            "0".repeat(64)
+        );
+        assert_eq!(
+            parse_release_sha256(&contents, crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME),
+            Some(expected.to_owned())
+        );
+        assert_eq!(parse_release_sha256(&contents, "missing.exe"), None);
+        assert_eq!(
+            parse_release_sha256(
+                &format!(
+                    "not-a-hash  {}",
+                    crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME
+                ),
+                crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME
+            ),
+            None
+        );
+    }
 
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.

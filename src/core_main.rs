@@ -124,6 +124,25 @@ pub fn core_main() -> Option<Vec<String>> {
         args.push("--install".to_owned());
         flutter_args.push("--install".to_string());
     }
+    #[cfg(windows)]
+    {
+        // The portable packer runs its extracted executable from a temporary
+        // directory and exposes the downloaded package name through this
+        // environment variable. If MasterDesk is already installed, treat an
+        // external installer launch as an in-place update instead of opening a
+        // second portable main window or reinstalling from scratch.
+        let is_packaged_setup = std::env::var(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY)
+            .map(|name| crate::common::is_setup(&name))
+            .unwrap_or(false);
+        let is_external_install = (click_setup || is_packaged_setup)
+            && args.first().map(String::as_str) == Some("--install");
+        if is_external_install && crate::platform::is_installed() {
+            if let Some(first) = args.first_mut() {
+                *first = "--update".to_owned();
+            }
+            flutter_args.retain(|arg| arg != "--install");
+        }
+    }
     if args.contains(&"--noinstall".to_string()) {
         args.clear();
     }

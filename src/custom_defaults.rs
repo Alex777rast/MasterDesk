@@ -13,9 +13,10 @@ pub const ID_SERVER: &str = "hbbs.masteronline.space";
 pub const RELAY_SERVER: &str = "hbbr.masteronline.space";
 pub const API_SERVER: &str = "https://api.masteronline.space";
 pub const UPDATE_MANIFEST_URL: &str = "https://api.masteronline.space/masterdesk/version/latest";
+pub const WINDOWS_UPDATE_ASSET_NAME: &str = "MasterDesk-1.4.9-RDS-x86_64.exe";
 /// Branded release sequence. Keep the upstream protocol version in
 /// `src/version.rs` unchanged so peer feature negotiation remains compatible.
-pub const UPDATE_VERSION: &str = "1.4.9-3";
+pub const UPDATE_VERSION: &str = "1.4.9-5";
 pub const LEGACY_SERVER: &str = "desk.masteronline.space";
 /// Accept both the public hostname and its current IPv4 address in the
 /// socket-level VPN bypass. The visible ID/relay/API settings always use DNS.
@@ -23,7 +24,7 @@ pub const DIRECT_SERVER_TARGETS: &str =
     "hbbs.masteronline.space,hbbr.masteronline.space,api.masteronline.space,176.123.167.146";
 pub const SERVER_PUBLIC_KEY: &str = "oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=";
 pub const DEFAULT_CODEC: &str = "vp9";
-pub const DEFAULT_IMAGE_QUALITY: &str = "best";
+pub const DEFAULT_IMAGE_QUALITY: &str = "balanced";
 pub const DEFAULT_VIEW_STYLE: &str = "adaptive";
 /// Offer both password authentication and the local Accept/Cancel prompt.
 pub const DEFAULT_APPROVE_MODE: &str = "password-click";
@@ -65,8 +66,8 @@ fn server_settings() -> HashMap<String, String> {
         (keys::OPTION_ENABLE_PRIVACY_MODE.to_owned(), "N".to_owned()),
         (keys::OPTION_ENABLE_CAMERA.to_owned(), "N".to_owned()),
         (keys::OPTION_ENABLE_TUNNEL.to_owned(), "N".to_owned()),
-        // MasterDesk shows branded releases in the main window. Automatic
-        // installation remains disabled until release binaries are signed.
+        // Background installation remains disabled. Interactive updates from
+        // the main window verify the published SHA-256 before execution.
         (keys::OPTION_ALLOW_AUTO_UPDATE.to_owned(), "N".to_owned()),
     ])
 }
@@ -219,8 +220,9 @@ mod tests {
     #[test]
     fn branded_update_versions_are_compared_independently_from_upstream() {
         assert!(!is_newer_update("1.4.9-2"));
+        assert!(!is_newer_update("1.4.9-4"));
         assert!(!is_newer_update(UPDATE_VERSION));
-        assert!(is_newer_update("1.4.9-4"));
+        assert!(is_newer_update("1.4.9-6"));
         assert!(is_newer_update("1.4.10-1"));
     }
 

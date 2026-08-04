@@ -91,11 +91,16 @@ $customDefaults = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\custom_d
 foreach ($expectedValue in @(
     'hbbs.masteronline.space',
     'hbbr.masteronline.space',
-    'https://api.masteronline.space/masterdesk/version/latest'
+    'https://api.masteronline.space/masterdesk/version/latest',
+    'MasterDesk-1.4.9-RDS-x86_64.exe',
+    '1.4.9-5'
 )) {
     if ($customDefaults -notmatch [regex]::Escape($expectedValue)) {
         throw "Compiled MasterDesk defaults are missing $expectedValue."
     }
+}
+if ($customDefaults -notmatch 'DEFAULT_IMAGE_QUALITY:\s*&str\s*=\s*"balanced"') {
+    throw 'Default image quality must be "balanced".'
 }
 
 $flutterCommon = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\common.dart') -Raw
@@ -109,6 +114,27 @@ if ($desktopHome -notmatch 'if \(updateUrl\.isNotEmpty && !isCardClosed\)') {
 }
 if ($desktopHome -notmatch 'Uri\.parse\(updateUrl\)') {
     throw 'The MasterDesk update card does not open the manifest release URL.'
+}
+if ($desktopHome -notmatch 'isMasterDesk\s*&&\s*isWindows') {
+    throw 'The installed MasterDesk client is not allowed to launch an interactive update.'
+}
+if ($desktopHome -notmatch 'handleUpdate\(updateUrl\)') {
+    throw 'The MasterDesk update card does not launch the integrated updater.'
+}
+
+$portablePacker = Get-Content -LiteralPath (Join-Path $ProjectRoot 'libs\portable\src\main.rs') -Raw
+if ($portablePacker -notmatch 'name\.starts_with\("masterdesk-"\)') {
+    throw 'The portable packer does not recognize a MasterDesk release as an installer.'
+}
+
+$coreMain = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\core_main.rs') -Raw
+if ($coreMain -notmatch 'is_external_install\s*&&\s*crate::platform::is_installed\(\)') {
+    throw 'An external installer is not routed to the in-place update path.'
+}
+
+$flutterFfi = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.rs') -Raw
+if ($flutterFfi -notmatch 'verify_masterdesk_update_package') {
+    throw 'The interactive updater does not verify the downloaded MasterDesk package.'
 }
 
 $updateManifest = Get-Content -LiteralPath (Join-Path $ProjectRoot 'deploy\masterdesk-api\latest.json') -Raw |
@@ -145,6 +171,24 @@ try {
         --nocapture
     if ($LASTEXITCODE -ne 0) {
         throw "Custom defaults tests failed with exit code $LASTEXITCODE."
+    }
+
+    foreach ($testName in @(
+        'masterdesk_release_name_is_a_setup_package',
+        'parses_only_the_expected_release_checksum'
+    )) {
+        & (Join-Path $CargoBin 'cargo.exe') test `
+            --locked `
+            --offline `
+            --release `
+            --features 'hwcodec,vram,flutter' `
+            $testName `
+            --lib `
+            -- `
+            --nocapture
+        if ($LASTEXITCODE -ne 0) {
+            throw "MasterDesk updater test $testName failed with exit code $LASTEXITCODE."
+        }
     }
 
 } finally {

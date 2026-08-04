@@ -1061,7 +1061,12 @@ pub fn get_full_name() -> String {
 }
 
 pub fn is_setup(name: &str) -> bool {
-    name.to_lowercase().ends_with("install.exe")
+    let name = std::path::Path::new(name)
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_lowercase();
+    name.ends_with("install.exe") || (name.starts_with("masterdesk-") && name.ends_with(".exe"))
 }
 
 pub fn get_custom_rendezvous_server(custom: String) -> String {
@@ -2670,6 +2675,16 @@ mod tests {
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn masterdesk_release_name_is_a_setup_package() {
+        assert!(is_setup(
+            r"C:\Users\User\Downloads\MasterDesk-1.4.9-RDS-x86_64.exe"
+        ));
+        assert!(is_setup("rustdesk-1.4.9-install.exe"));
+        assert!(!is_setup("MasterDesk.exe"));
+        assert!(!is_setup("rustdesk.exe"));
+    }
 
     #[inline]
     fn get_timestamp_secs() -> u128 {

@@ -22,8 +22,10 @@ The same HTTPS virtual host serves
 `/var/lib/caddy/masterdesk-updates/latest.json` as
 `/masterdesk/version/latest`. Publish a release and verify its downloadable
 assets before replacing this file with a higher branded version. The client
-shows the release in its main window but does not automatically execute custom
-updates until Authenticode signing is enabled.
+shows the release in its main window. Installed Windows clients can perform an
+interactive in-place update after verifying the EXE against the release's
+`SHA256.txt`; unattended background installation remains disabled. Release
+binaries remain unsigned until Authenticode signing is enabled.
 
 `masterdesk-update-manifest.timer` performs this promotion automatically once
 per hour. Its refresh script accepts only stable tags in the form

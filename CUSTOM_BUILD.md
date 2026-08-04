@@ -14,7 +14,7 @@ The client loads the following values before it reads a user profile:
 - Server public key:
   `oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=`
 - Codec: `VP9`
-- Image quality: `Best`
+- Image quality: `Balanced`
 - View style: `Adaptive`
 - Incoming authentication: password and local `Accept` / `Dismiss` approval
 - Keyboard mode for new peers: `Translate` (`beta` in the UI)
@@ -33,7 +33,9 @@ The client loads the following values before it reads a user profile:
   `176.123.167.146` retained as a hidden resolved-address alias)
 - Windows RDS cross-session GUI access for local administrators
 - MasterDesk release checks: enabled through the compiled HTTPS manifest
-- Automatic installation: disabled until Authenticode signing is available
+- Interactive in-place updates: enabled on Windows with release SHA-256
+  verification
+- Unattended background installation: disabled
 
 The implementation is in `src/custom_defaults.rs`. The settings are defaults,
 not locked policy overrides, so an administrator can change them in the UI.
@@ -56,12 +58,15 @@ At startup the client reads
 contains an independent branded release sequence and an HTTPS release-page
 URL. A newer sequence displays a dismissible update card in the main window.
 
-Until SignPath signing is enabled, the card opens the release page and leaves
-download and installation under user control. The background auto-installer is
-disabled for branded clients. To publish a release, first upload and verify the
-release assets, then update `deploy/masterdesk-api/latest.json` and deploy that
-file to the server. This ordering prevents clients from being directed to an
-incomplete release.
+For an installed Windows client the card downloads the exact MasterDesk release
+asset, verifies it against `SHA256.txt` from the same GitHub Release and starts
+an elevated in-place update. Launching a downloaded `MasterDesk-*.exe` also
+updates an existing installation instead of opening a portable second copy.
+The unattended background auto-installer remains disabled. Authenticode through
+SignPath is still required before describing the binaries as publisher-signed.
+To publish a release, first upload and verify the release assets, then allow the
+manifest refresh service to promote it. This ordering prevents clients from
+being directed to an incomplete release.
 
 ## MasterDesk branding
 
