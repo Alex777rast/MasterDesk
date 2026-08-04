@@ -1,4 +1,4 @@
-api.masteronline.space {
+api.masterdesk.online {
 	encode zstd gzip
 
 	@masterdeskUpdate path /masterdesk/version/latest
@@ -22,7 +22,7 @@ api.masteronline.space {
 	}
 
 	log {
-		output file /var/log/caddy/api.masteronline.space.access.log {
+		output file /var/log/caddy/api.masterdesk.online.access.log {
 			roll_size 20MiB
 			roll_keep 5
 		}

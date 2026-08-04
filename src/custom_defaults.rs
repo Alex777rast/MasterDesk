@@ -9,19 +9,18 @@ use hbb_common::config::{self, keys};
 use std::collections::HashMap;
 
 pub const APP_NAME: &str = "MasterDesk";
-pub const ID_SERVER: &str = "hbbs.masteronline.space";
-pub const RELAY_SERVER: &str = "hbbr.masteronline.space";
-pub const API_SERVER: &str = "https://api.masteronline.space";
-pub const UPDATE_MANIFEST_URL: &str = "https://api.masteronline.space/masterdesk/version/latest";
+pub const ID_SERVER: &str = "hbbs.masterdesk.online";
+pub const RELAY_SERVER: &str = "hbbr.masterdesk.online";
+pub const API_SERVER: &str = "https://api.masterdesk.online";
+pub const UPDATE_MANIFEST_URL: &str = "https://api.masterdesk.online/masterdesk/version/latest";
 pub const WINDOWS_UPDATE_ASSET_NAME: &str = "MasterDesk-1.4.9-RDS-x86_64.exe";
 /// Branded release sequence. Keep the upstream protocol version in
 /// `src/version.rs` unchanged so peer feature negotiation remains compatible.
-pub const UPDATE_VERSION: &str = "1.4.9-5";
-pub const LEGACY_SERVER: &str = "desk.masteronline.space";
+pub const UPDATE_VERSION: &str = "1.4.9-6";
 /// Accept both the public hostname and its current IPv4 address in the
 /// socket-level VPN bypass. The visible ID/relay/API settings always use DNS.
 pub const DIRECT_SERVER_TARGETS: &str =
-    "hbbs.masteronline.space,hbbr.masteronline.space,api.masteronline.space,176.123.167.146";
+    "hbbs.masterdesk.online,hbbr.masterdesk.online,api.masterdesk.online,176.123.167.146";
 pub const SERVER_PUBLIC_KEY: &str = "oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=";
 pub const DEFAULT_CODEC: &str = "vp9";
 pub const DEFAULT_IMAGE_QUALITY: &str = "balanced";
@@ -109,30 +108,95 @@ fn local_settings() -> HashMap<String, String> {
     ])
 }
 
-fn is_legacy_server(value: &str) -> bool {
-    let host = value
-        .trim()
+const PREVIOUS_ID_SERVER_HOSTS: &[&str] = &[
+    "desk.masteronline.space",
+    "hbbs.masteronline.space",
+    "176.123.167.146",
+];
+const PREVIOUS_RELAY_SERVER_HOSTS: &[&str] = &[
+    "desk.masteronline.space",
+    "hbbr.masteronline.space",
+    "176.123.167.146",
+];
+const PREVIOUS_API_SERVER_HOSTS: &[&str] = &[
+    "desk.masteronline.space",
+    "api.masteronline.space",
+    "176.123.167.146",
+];
+
+fn endpoint_host(value: &str) -> String {
+    let value = value.trim();
+    let value = value
+        .split_once("://")
+        .map(|(_, authority)| authority)
+        .unwrap_or(value);
+    value
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
         .split(':')
         .next()
         .unwrap_or_default()
-        .trim_end_matches('.');
-    host.eq_ignore_ascii_case(LEGACY_SERVER)
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
 }
 
-fn migrate_legacy_server_settings() {
-    let id_server = config::Config::get_option(keys::OPTION_CUSTOM_RENDEZVOUS_SERVER);
-    if is_legacy_server(&id_server) {
-        config::Config::set_option(
-            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER.to_owned(),
-            ID_SERVER.to_owned(),
-        );
-    }
+fn is_previous_endpoint(value: &str, previous_hosts: &[&str]) -> bool {
+    let host = endpoint_host(value);
+    previous_hosts.iter().any(|previous| host == *previous)
+}
 
-    let relay_server = config::Config::get_option(keys::OPTION_RELAY_SERVER);
-    if is_legacy_server(&relay_server) {
+fn migrate_previous_endpoint(key: &str, value: &str, previous_hosts: &[&str]) {
+    if is_previous_endpoint(&config::Config::get_option(key), previous_hosts) {
+        config::Config::set_option(key.to_owned(), value.to_owned());
+    }
+}
+
+fn is_previous_direct_server_targets(value: &str) -> bool {
+    let mut hosts = value
+        .split(',')
+        .map(endpoint_host)
+        .filter(|host| !host.is_empty())
+        .collect::<Vec<_>>();
+    hosts.sort();
+    hosts.dedup();
+
+    [
+        vec!["176.123.167.146"],
+        vec!["176.123.167.146", "desk.masteronline.space"],
+        vec![
+            "176.123.167.146",
+            "api.masteronline.space",
+            "hbbr.masteronline.space",
+            "hbbs.masteronline.space",
+        ],
+    ]
+    .into_iter()
+    .any(|previous| hosts == previous)
+}
+
+fn migrate_previous_network_settings() {
+    migrate_previous_endpoint(
+        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+        ID_SERVER,
+        PREVIOUS_ID_SERVER_HOSTS,
+    );
+    migrate_previous_endpoint(
+        keys::OPTION_RELAY_SERVER,
+        RELAY_SERVER,
+        PREVIOUS_RELAY_SERVER_HOSTS,
+    );
+    migrate_previous_endpoint(
+        keys::OPTION_API_SERVER,
+        API_SERVER,
+        PREVIOUS_API_SERVER_HOSTS,
+    );
+
+    let direct_targets = config::Config::get_option(keys::OPTION_FORCE_DIRECT_SERVER);
+    if is_previous_direct_server_targets(&direct_targets) {
         config::Config::set_option(
-            keys::OPTION_RELAY_SERVER.to_owned(),
-            RELAY_SERVER.to_owned(),
+            keys::OPTION_FORCE_DIRECT_SERVER.to_owned(),
+            DIRECT_SERVER_TARGETS.to_owned(),
         );
     }
 }
@@ -157,7 +221,7 @@ pub fn apply() {
         .write()
         .unwrap()
         .extend(local_settings());
-    migrate_legacy_server_settings();
+    migrate_previous_network_settings();
 }
 
 #[cfg(test)]
@@ -203,13 +267,13 @@ mod tests {
         apply();
         assert!(hbb_common::direct_server::is_target(ID_SERVER));
         assert!(hbb_common::direct_server::is_target(
-            "HBBS.MASTERONLINE.SPACE:21116"
+            "HBBS.MASTERDESK.ONLINE:21116"
         ));
         assert!(hbb_common::direct_server::is_target(
-            "HBBR.MASTERONLINE.SPACE:21117"
+            "HBBR.MASTERDESK.ONLINE:21117"
         ));
         assert!(hbb_common::direct_server::is_target(
-            "API.MASTERONLINE.SPACE:443"
+            "API.MASTERDESK.ONLINE:443"
         ));
         assert!(hbb_common::direct_server::is_target(
             "176.123.167.146:21117"
@@ -221,17 +285,53 @@ mod tests {
     fn branded_update_versions_are_compared_independently_from_upstream() {
         assert!(!is_newer_update("1.4.9-2"));
         assert!(!is_newer_update("1.4.9-4"));
+        assert!(!is_newer_update("1.4.9-5"));
         assert!(!is_newer_update(UPDATE_VERSION));
-        assert!(is_newer_update("1.4.9-6"));
+        assert!(is_newer_update("1.4.9-7"));
         assert!(is_newer_update("1.4.10-1"));
     }
 
     #[test]
-    fn recognizes_only_the_previous_combined_server_for_migration() {
-        assert!(is_legacy_server("desk.masteronline.space"));
-        assert!(is_legacy_server("DESK.MASTERONLINE.SPACE.:21116"));
-        assert!(!is_legacy_server(ID_SERVER));
-        assert!(!is_legacy_server(RELAY_SERVER));
+    fn recognizes_only_known_previous_network_endpoints_for_migration() {
+        assert!(is_previous_endpoint(
+            "desk.masteronline.space",
+            PREVIOUS_ID_SERVER_HOSTS
+        ));
+        assert!(is_previous_endpoint(
+            "HBBS.MASTERONLINE.SPACE.:21116",
+            PREVIOUS_ID_SERVER_HOSTS
+        ));
+        assert!(is_previous_endpoint(
+            "https://api.masteronline.space/",
+            PREVIOUS_API_SERVER_HOSTS
+        ));
+        assert!(is_previous_endpoint(
+            "176.123.167.146:21117",
+            PREVIOUS_RELAY_SERVER_HOSTS
+        ));
+        assert!(!is_previous_endpoint(ID_SERVER, PREVIOUS_ID_SERVER_HOSTS));
+        assert!(!is_previous_endpoint(
+            "hbbs.customer.example",
+            PREVIOUS_ID_SERVER_HOSTS
+        ));
+        assert!(!is_previous_endpoint(
+            "hbbs.masteronline.space.attacker.example",
+            PREVIOUS_ID_SERVER_HOSTS
+        ));
+    }
+
+    #[test]
+    fn recognizes_only_previous_direct_target_sets_for_migration() {
+        assert!(is_previous_direct_server_targets(
+            "desk.masteronline.space,176.123.167.146"
+        ));
+        assert!(is_previous_direct_server_targets(
+            "hbbs.masteronline.space,hbbr.masteronline.space,api.masteronline.space,176.123.167.146"
+        ));
+        assert!(!is_previous_direct_server_targets(DIRECT_SERVER_TARGETS));
+        assert!(!is_previous_direct_server_targets(
+            "hbbs.customer.example,176.123.167.146"
+        ));
     }
 
     #[test]

@@ -89,15 +89,18 @@ if ($clientSource -notmatch 'custom_defaults::DEFAULT_KEYBOARD_MODE') {
 
 $customDefaults = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\custom_defaults.rs') -Raw
 foreach ($expectedValue in @(
-    'hbbs.masteronline.space',
-    'hbbr.masteronline.space',
-    'https://api.masteronline.space/masterdesk/version/latest',
+    'hbbs.masterdesk.online',
+    'hbbr.masterdesk.online',
+    'https://api.masterdesk.online/masterdesk/version/latest',
     'MasterDesk-1.4.9-RDS-x86_64.exe',
-    '1.4.9-5'
+    '1.4.9-6'
 )) {
     if ($customDefaults -notmatch [regex]::Escape($expectedValue)) {
         throw "Compiled MasterDesk defaults are missing $expectedValue."
     }
+}
+if ($customDefaults -notmatch 'migrate_previous_network_settings') {
+    throw 'Previous MasterDesk network settings are not migrated to the new domain.'
 }
 if ($customDefaults -notmatch 'DEFAULT_IMAGE_QUALITY:\s*&str\s*=\s*"balanced"') {
     throw 'Default image quality must be "balanced".'
@@ -121,15 +124,22 @@ if ($desktopHome -notmatch 'isMasterDesk\s*&&\s*isWindows') {
 if ($desktopHome -notmatch 'handleUpdate\(updateUrl\)') {
     throw 'The MasterDesk update card does not launch the integrated updater.'
 }
+if ($desktopHome -notmatch '!bind\.mainIsInstalled\(\)' -or
+    $desktopHome -notmatch 'bind\.mainGotoInstall\(\)') {
+    throw 'The portable MasterDesk client does not offer installation from the main window.'
+}
 
 $portablePacker = Get-Content -LiteralPath (Join-Path $ProjectRoot 'libs\portable\src\main.rs') -Raw
-if ($portablePacker -notmatch 'name\.starts_with\("masterdesk-"\)') {
-    throw 'The portable packer does not recognize a MasterDesk release as an installer.'
+if ($portablePacker -notmatch 'masterdesk_release_runs_portable_by_default') {
+    throw 'The MasterDesk release does not have a portable-by-default regression test.'
+}
+if ($portablePacker -match 'name\.starts_with\("masterdesk-"\)') {
+    throw 'The portable packer still treats a MasterDesk release as an automatic installer.'
 }
 
 $coreMain = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\core_main.rs') -Raw
-if ($coreMain -notmatch 'is_external_install\s*&&\s*crate::platform::is_installed\(\)') {
-    throw 'An external installer is not routed to the in-place update path.'
+if ($coreMain -notmatch 'should_update_from_masterdesk_package') {
+    throw 'An installed MasterDesk client is not routed to the in-place update path.'
 }
 
 $flutterFfi = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.rs') -Raw
@@ -174,7 +184,9 @@ try {
     }
 
     foreach ($testName in @(
-        'masterdesk_release_name_is_a_setup_package',
+        'masterdesk_release_name_is_a_portable_or_update_package',
+        'clean_computer_runs_release_as_portable_client',
+        'installed_computer_routes_release_to_update',
         'parses_only_the_expected_release_checksum'
     )) {
         & (Join-Path $CargoBin 'cargo.exe') test `
@@ -189,6 +201,17 @@ try {
         if ($LASTEXITCODE -ne 0) {
             throw "MasterDesk updater test $testName failed with exit code $LASTEXITCODE."
         }
+    }
+
+    & (Join-Path $CargoBin 'cargo.exe') test `
+        --locked `
+        --offline `
+        --manifest-path (Join-Path $ProjectRoot 'libs\portable\Cargo.toml') `
+        masterdesk_release_runs_portable_by_default `
+        -- `
+        --nocapture
+    if ($LASTEXITCODE -ne 0) {
+        throw "Portable-by-default test failed with exit code $LASTEXITCODE."
     }
 
 } finally {

@@ -3,7 +3,7 @@
 Last updated: 2026-08-01
 
 This notice describes the test MasterDesk service operated through
-`masteronline.space`. The current API deployment is intended for authorized
+`masterdesk.online`. The current API deployment is intended for authorized
 testers and is not yet a production commercial service.
 
 ## Data processed
@@ -25,7 +25,7 @@ Relay traffic may pass through the MasterDesk relay server when a direct
 peer-to-peer connection cannot be established.
 
 At startup, when update checks are enabled, the client requests a small
-version manifest from `api.masteronline.space`. The web server may record the
+version manifest from `api.masterdesk.online`. The web server may record the
 source IP address, request time and standard HTTP metadata. The request does
 not include address-book contents or remote-session data.
 

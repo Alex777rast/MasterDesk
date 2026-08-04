@@ -22,6 +22,14 @@ macro_rules! my_println{
     };
 }
 
+fn should_update_from_masterdesk_package(
+    package_name: &str,
+    args: &[String],
+    is_installed: bool,
+) -> bool {
+    is_installed && args.is_empty() && crate::common::is_masterdesk_release(package_name)
+}
+
 /// shared by flutter and sciter main function
 ///
 /// [Note]
@@ -128,15 +136,19 @@ pub fn core_main() -> Option<Vec<String>> {
     {
         // The portable packer runs its extracted executable from a temporary
         // directory and exposes the downloaded package name through this
-        // environment variable. If MasterDesk is already installed, treat an
-        // external installer launch as an in-place update instead of opening a
-        // second portable main window or reinstalling from scratch.
-        let is_packaged_setup = std::env::var(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY)
-            .map(|name| crate::common::is_setup(&name))
-            .unwrap_or(false);
-        let is_external_install = (click_setup || is_packaged_setup)
-            && args.first().map(String::as_str) == Some("--install");
-        if is_external_install && crate::platform::is_installed() {
+        // environment variable. A downloaded MasterDesk release opens as a
+        // portable client on a clean computer, but becomes an in-place update
+        // when an installed copy is detected. Conventional *install.exe files
+        // retain their original installer/update behavior.
+        let package_name =
+            std::env::var(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY).unwrap_or_default();
+        let is_installed = crate::platform::is_installed();
+        if should_update_from_masterdesk_package(&package_name, &args, is_installed) {
+            args.push("--update".to_owned());
+        } else if click_setup
+            && is_installed
+            && args.first().map(String::as_str) == Some("--install")
+        {
             if let Some(first) = args.first_mut() {
                 *first = "--update".to_owned();
             }
@@ -777,6 +789,39 @@ pub fn core_main() -> Option<Vec<String>> {
     return Some(flutter_args);
     #[cfg(not(feature = "flutter"))]
     return Some(args);
+}
+
+#[cfg(test)]
+mod masterdesk_package_tests {
+    use super::should_update_from_masterdesk_package;
+
+    #[test]
+    fn clean_computer_runs_release_as_portable_client() {
+        assert!(!should_update_from_masterdesk_package(
+            "MasterDesk-1.4.9-RDS-x86_64.exe",
+            &[],
+            false
+        ));
+    }
+
+    #[test]
+    fn installed_computer_routes_release_to_update() {
+        assert!(should_update_from_masterdesk_package(
+            r"C:\Users\User\Downloads\MasterDesk-1.4.9-RDS-x86_64.exe",
+            &[],
+            true
+        ));
+        assert!(!should_update_from_masterdesk_package(
+            "MasterDesk-1.4.9-RDS-x86_64.exe",
+            &["--update".to_owned()],
+            true
+        ));
+        assert!(!should_update_from_masterdesk_package(
+            "rustdesk-1.4.9-install.exe",
+            &[],
+            true
+        ));
+    }
 }
 
 #[inline]

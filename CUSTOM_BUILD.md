@@ -8,9 +8,9 @@ This repository is based on the upstream RustDesk `1.4.9` tag
 The client loads the following values before it reads a user profile:
 
 - Product name, Windows service and configuration namespace: `MasterDesk`
-- ID server: `hbbs.masteronline.space`
-- Relay server: `hbbr.masteronline.space`
-- Account/address-book API: `https://api.masteronline.space`
+- ID server: `hbbs.masterdesk.online`
+- Relay server: `hbbr.masterdesk.online`
+- Account/address-book API: `https://api.masterdesk.online`
 - Server public key:
   `oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=`
 - Codec: `VP9`
@@ -28,8 +28,8 @@ The client loads the following values before it reads a user profile:
 - Camera: disabled
 - TCP tunnelling: disabled
 - Remote configuration modification: enabled
-- Windows socket-level direct routing to `hbbs.masteronline.space`,
-  `hbbr.masteronline.space` and `api.masteronline.space` (with
+- Windows socket-level direct routing to `hbbs.masterdesk.online`,
+  `hbbr.masterdesk.online` and `api.masterdesk.online` (with
   `176.123.167.146` retained as a hidden resolved-address alias)
 - Windows RDS cross-session GUI access for local administrators
 - MasterDesk release checks: enabled through the compiled HTTPS manifest
@@ -39,8 +39,9 @@ The client loads the following values before it reads a user profile:
 
 The implementation is in `src/custom_defaults.rs`. The settings are defaults,
 not locked policy overrides, so an administrator can change them in the UI.
-Profiles that still contain the previous combined `desk.masteronline.space`
-value are migrated once to the separate ID and relay hostnames.
+Profiles that still contain the previous `desk.masteronline.space` or split
+`*.masteronline.space` endpoints are migrated to `*.masterdesk.online` during
+an application update. Unrecognized administrator-defined servers are kept.
 
 An unauthorized incoming request restores and foregrounds the connection
 manager on the client machine. The local user can accept or reject the request
@@ -48,20 +49,21 @@ while the remote operator is still at the password prompt.
 
 The Community `hbbs`/`hbbr` deployment remains responsible only for ID and
 relay traffic. Account and address-book requests use the separate HTTPS API at
-`api.masteronline.space`; its reproducible test deployment is stored in
+`api.masterdesk.online`; its reproducible test deployment is stored in
 `deploy/masterdesk-api/`.
 
 ## MasterDesk update channel
 
 At startup the client reads
-`https://api.masteronline.space/masterdesk/version/latest`. The manifest
+`https://api.masterdesk.online/masterdesk/version/latest`. The manifest
 contains an independent branded release sequence and an HTTPS release-page
 URL. A newer sequence displays a dismissible update card in the main window.
 
 For an installed Windows client the card downloads the exact MasterDesk release
 asset, verifies it against `SHA256.txt` from the same GitHub Release and starts
-an elevated in-place update. Launching a downloaded `MasterDesk-*.exe` also
-updates an existing installation instead of opening a portable second copy.
+an elevated in-place update. A downloaded `MasterDesk-*.exe` opens portably on
+a clean computer and shows the normal Install card in the main window. The same
+file updates in place when an installed MasterDesk copy is detected.
 The unattended background auto-installer remains disabled. Authenticode through
 SignPath is still required before describing the binaries as publisher-signed.
 To publish a release, first upload and verify the release assets, then allow the

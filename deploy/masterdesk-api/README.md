@@ -8,9 +8,9 @@ separate container and does not replace or restart the production `hbbs` and
 ## Network layout
 
 - API container: `127.0.0.1:21114` only
-- Public API: `https://api.masteronline.space`
-- ID server: `hbbs.masteronline.space:21116`
-- Relay server: `hbbr.masteronline.space:21117`
+- Public API: `https://api.masterdesk.online`
+- ID server: `hbbs.masterdesk.online:21116`
+- Relay server: `hbbr.masterdesk.online:21117`
 - Persistent API data: `/opt/masterdesk-api/data`
 
 The Caddy snippet terminates TLS and proxies the public API hostname to the

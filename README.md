@@ -4,7 +4,7 @@
 
 MasterDesk — независимая модифицированная сборка
 [RustDesk](https://github.com/rustdesk/rustdesk) 1.4.9 для Windows x64.
-Клиент заранее настроен на инфраструктуру `masteronline.space`, использует
+Клиент заранее настроен на инфраструктуру `masterdesk.online`, использует
 бренд MasterDesk и сохраняет возможность изменить параметры сервера в
 интерфейсе.
 
@@ -15,16 +15,16 @@ MasterDesk — независимая модифицированная сбор�
 
 ## Скачать
 
-- Сайт проекта: <https://masteronline.space/>
+- Сайт проекта: <https://masterdesk.online/>
 - Релизы и контрольные суммы:
   <https://github.com/Alex777rast/MasterDesk/releases>
 
 ## Что изменено
 
 - название, иконки и интерфейс заменены на MasterDesk;
-- ID-сервер по умолчанию: `hbbs.masteronline.space`;
-- relay-сервер по умолчанию: `hbbr.masteronline.space`;
-- API аккаунтов и адресной книги: `https://api.masteronline.space`;
+- ID-сервер по умолчанию: `hbbs.masterdesk.online`;
+- relay-сервер по умолчанию: `hbbr.masterdesk.online`;
+- API аккаунтов и адресной книги: `https://api.masterdesk.online`;
 - добавлены настройки для российских сценариев поддержки и Windows RDS;
 - реализован прямой выбор физического Windows-интерфейса для соединения с
   сервером MasterDesk при активном VPN/TUN;

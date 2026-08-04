@@ -65,7 +65,7 @@ fn is_setup_executable(name: &str) -> bool {
         .unwrap_or_default()
         .to_string_lossy()
         .to_lowercase();
-    name.ends_with("install.exe") || (name.starts_with("masterdesk-") && name.ends_with(".exe"))
+    name.ends_with("install.exe")
 }
 
 fn setup(
@@ -224,8 +224,8 @@ mod tests {
     use super::is_setup_executable;
 
     #[test]
-    fn masterdesk_release_is_an_installer() {
-        assert!(is_setup_executable(
+    fn masterdesk_release_runs_portable_by_default() {
+        assert!(!is_setup_executable(
             r"C:\Users\User\Downloads\MasterDesk-1.4.9-RDS-x86_64.exe"
         ));
         assert!(is_setup_executable("rustdesk-1.4.9-install.exe"));
