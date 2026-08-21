@@ -281,6 +281,89 @@ pub fn set_path_permission_for_portable_service_shmem_file(path: &Path) -> Resul
     set_path_permission_for_portable_service_shmem_impl(path, false)
 }
 
+/// Protects the service-owned machine password directory/file so only LocalSystem
+/// and the built-in Administrators group have access. The DACL is replaced and
+/// protected from inheritance; ordinary interactive users never receive the verifier.
+pub fn set_path_permission_for_machine_secret(path: &Path, is_dir: bool) -> ResultType<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|e| {
+        anyhow!(
+            "Failed to inspect machine-secret ACL target '{}': {}",
+            path.display(),
+            e
+        )
+    })?;
+    if is_reparse_point(&metadata) {
+        bail!(
+            "Machine-secret ACL target is a reparse point and is rejected: '{}'",
+            path.display()
+        );
+    }
+    if metadata.file_type().is_dir() != is_dir {
+        bail!(
+            "Machine-secret ACL target type mismatch for '{}'",
+            path.display()
+        );
+    }
+
+    let local_system_sid = sid_string_to_local_alloc_guard("S-1-5-18")?;
+    let administrators_sid = sid_string_to_local_alloc_guard("S-1-5-32-544")?;
+    let inherit_flags = if is_dir {
+        ACE_FLAGS(OBJECT_INHERIT_ACE.0 | CONTAINER_INHERIT_ACE.0)
+    } else {
+        NO_INHERITANCE
+    };
+    let entries = [
+        make_sid_trustee_entry(
+            local_system_sid.as_sid_ptr(),
+            FILE_ALL_ACCESS.0,
+            inherit_flags,
+            false,
+        ),
+        make_sid_trustee_entry(
+            administrators_sid.as_sid_ptr(),
+            FILE_ALL_ACCESS.0,
+            inherit_flags,
+            true,
+        ),
+    ];
+
+    let mut new_acl: *mut ACL = std::ptr::null_mut();
+    let set_entries_result =
+        unsafe { SetEntriesInAclW(Some(entries.as_slice()), None, &mut new_acl) };
+    if set_entries_result.0 != 0 || new_acl.is_null() {
+        bail!(
+            "Failed to build machine-secret DACL for '{}': win32_error={}",
+            path.display(),
+            set_entries_result.0
+        );
+    }
+    let _acl_guard = LocalAllocGuard(new_acl as *mut std::ffi::c_void);
+    let path_utf16: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let set_named_result = unsafe {
+        SetNamedSecurityInfoW(
+            PCWSTR::from_raw(path_utf16.as_ptr()),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            None,
+            None,
+            Some(new_acl),
+            None,
+        )
+    };
+    if set_named_result.0 != 0 {
+        bail!(
+            "Failed to protect machine-secret DACL for '{}': win32_error={}",
+            path.display(),
+            set_named_result.0
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 pub(super) struct LocalAllocGuard(*mut std::ffi::c_void);
 

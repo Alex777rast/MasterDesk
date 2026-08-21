@@ -57,6 +57,8 @@ lib/generated_bridge.dart
 .vscode-server/
 .ssh
 .tools/
+.tools.partial-transfer/
+artifacts/
 dist/
 libs/portable/data.bin
 libs/portable/app_metadata.toml
@@ -68,3 +70,4 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+.local-secrets/

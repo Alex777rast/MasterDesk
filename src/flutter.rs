@@ -49,6 +49,19 @@ lazy_static::lazy_static! {
     static ref GLOBAL_EVENT_STREAM: RwLock<HashMap<String, StreamSink<String>>> = Default::default(); // rust to dart event channel
 }
 
+fn peer_features_json(pi: &PeerInfo) -> String {
+    let mut features: HashMap<&str, bool> = Default::default();
+    for ref f in pi.features.iter() {
+        features.insert("privacy_mode", f.privacy_mode);
+        features.insert("safe_mode_reboot", f.safe_mode_reboot);
+    }
+    // compatible with 1.1.9
+    if get_version_number(&pi.version) < get_version_number("1.2.0") {
+        features.insert("privacy_mode", false);
+    }
+    serde_json::ser::to_string(&features).unwrap_or("".to_owned())
+}
+
 #[cfg(target_os = "windows")]
 lazy_static::lazy_static! {
     pub static ref TEXTURE_RGBA_RENDERER_PLUGIN: Result<Library, LibError> = load_plugin_in_app_path("texture_rgba_renderer_plugin.dll");
@@ -892,15 +905,7 @@ impl InvokeUiSession for FlutterHandler {
 
     fn set_peer_info(&self, pi: &PeerInfo) {
         let displays = Self::make_displays_msg(&pi.displays);
-        let mut features: HashMap<&str, bool> = Default::default();
-        for ref f in pi.features.iter() {
-            features.insert("privacy_mode", f.privacy_mode);
-        }
-        // compatible with 1.1.9
-        if get_version_number(&pi.version) < get_version_number("1.2.0") {
-            features.insert("privacy_mode", false);
-        }
-        let features = serde_json::ser::to_string(&features).unwrap_or("".to_owned());
+        let features = peer_features_json(pi);
         let resolutions = serialize_resolutions(&pi.resolutions.resolutions);
         *self.peer_info.write().unwrap() = pi.clone();
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1182,6 +1187,28 @@ impl InvokeUiSession for FlutterHandler {
                 log::warn!("Unhandled terminal response type");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod masterdesk_peer_feature_tests {
+    use super::*;
+
+    #[test]
+    fn peer_features_json_preserves_safe_mode_reboot_capability() {
+        let pi = PeerInfo {
+            version: "1.4.9".to_owned(),
+            features: Some(Features {
+                privacy_mode: true,
+                safe_mode_reboot: true,
+                ..Default::default()
+            })
+            .into(),
+            ..Default::default()
+        };
+        let parsed: serde_json::Value = serde_json::from_str(&peer_features_json(&pi)).unwrap();
+        assert_eq!(parsed["privacy_mode"], true);
+        assert_eq!(parsed["safe_mode_reboot"], true);
     }
 }
 

@@ -537,6 +537,18 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
               showRestartRemoteDevice(pi, id, sessionId, ffi.dialogManager)),
     );
   }
+  if (isDefaultConn &&
+      perms['restart'] != false &&
+      pi.platform == kPeerPlatformWindows &&
+      pi.features.safeModeReboot) {
+    v.add(
+      TTextMenu(
+          child: Text(translate('Restart remote device in Safe Mode')),
+          onPressed: () => showRestartRemoteDevice(
+              pi, id, sessionId, ffi.dialogManager,
+              safeMode: true)),
+    );
+  }
   // insertLock
   if (isDefaultConn && !ffiModel.viewOnly && ffi.ffiModel.keyboard) {
     v.add(

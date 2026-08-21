@@ -137,14 +137,15 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           children: [
             Column(
               children: [
-                SingleChildScrollView(
-                  controller: _leftPaneScrollController,
-                  child: Column(
-                    key: _childKey,
-                    children: children,
+                Expanded(
+                  child: SingleChildScrollView(
+                    controller: _leftPaneScrollController,
+                    child: Column(
+                      key: _childKey,
+                      children: children,
+                    ),
                   ),
                 ),
-                Expanded(child: Container())
               ],
             ),
             if (isOutgoingOnly)
@@ -470,7 +471,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         });
       } else if (bind.mainIsInstalledLowerVersion()) {
         return buildInstallCard(
-            "Status", "Your installation is lower version.", "Click to upgrade",
+            "Status", "Your installation is lower version.", "Update",
             () async {
           await rustDeskWinManager.closeAllSubWindows();
           bind.mainUpdateMe();

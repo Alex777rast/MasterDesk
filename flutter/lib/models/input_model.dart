@@ -837,6 +837,10 @@ class InputModel {
         return KeyEventResult.handled;
       }
     }
+    final passModifierToWindows = shouldPassWindowsModifierToPlatform(
+      isWindows: isWindows,
+      physicalKey: e.physicalKey,
+    );
 
     if (_relativeMouse.handleKeyEvent(
       e,
@@ -921,7 +925,12 @@ class InputModel {
       legacyKeyboardMode(e);
     }
 
-    return KeyEventResult.handled;
+    // The event was already forwarded to the peer above. Let the Windows
+    // embedding process local Ctrl/Alt/Shift state and its configured layout
+    // shortcut instead of swallowing every modifier inside Flutter.
+    return passModifierToWindows
+        ? KeyEventResult.skipRemainingHandlers
+        : KeyEventResult.handled;
   }
 
   /// Send Key Event

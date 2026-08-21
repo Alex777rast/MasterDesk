@@ -575,6 +575,8 @@ pub fn session_handle_flutter_key_event(
     down_or_up: bool,
 ) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        #[cfg(target_os = "windows")]
+        crate::keyboard::schedule_windows_keyboard_layout_sync_from_flutter(usb_hid, down_or_up);
         let keyboard_mode = session.get_keyboard_mode();
         session.handle_flutter_key_event(
             &keyboard_mode,
@@ -2022,9 +2024,9 @@ pub fn session_send_mouse(session_id: SessionID, msg: String) {
     }
 }
 
-pub fn session_restart_remote_device(session_id: SessionID) {
+pub fn session_restart_remote_device(session_id: SessionID, safe_mode: bool) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.restart_remote_device();
+        session.restart_remote_device_with_mode(safe_mode);
     }
 }
 
@@ -2260,7 +2262,11 @@ pub fn cm_get_config(name: String) -> String {
 }
 
 pub fn main_get_build_date() -> String {
-    crate::BUILD_DATE.to_string()
+    if crate::common::is_custom_client() {
+        crate::custom_defaults::CUSTOM_BUILD_DATE.to_owned()
+    } else {
+        crate::BUILD_DATE.to_string()
+    }
 }
 
 pub fn translate(name: String, locale: String) -> SyncReturn<String> {

@@ -1279,7 +1279,10 @@ class RustdeskImpl {
   }
 
   Future<void> sessionRestartRemoteDevice(
-      {required UuidValue sessionId, dynamic hint}) {
+      {required UuidValue sessionId, required bool safeMode, dynamic hint}) {
+    if (safeMode) {
+      throw UnsupportedError('Safe Mode restart is not supported on web');
+    }
     return Future(() => js.context.callMethod('setByName', ['restart']));
   }
 
@@ -1915,12 +1918,15 @@ class RustdeskImpl {
   }
 
   Future<void> sessionSetCommon(
-      {required UuidValue sessionId, required String key, required String value, dynamic hint}) {
-      js.context.callMethod('setByName', [
-        'common',
-        jsonEncode({'name': key, 'value': value})
-      ]);
-      return Future.value();
+      {required UuidValue sessionId,
+      required String key,
+      required String value,
+      dynamic hint}) {
+    js.context.callMethod('setByName', [
+      'common',
+      jsonEncode({'name': key, 'value': value})
+    ]);
+    return Future.value();
   }
 
   String? sessionGetCommonSync(

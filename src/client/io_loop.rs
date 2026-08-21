@@ -1846,6 +1846,15 @@ impl<T: InvokeUiSession> Remote<T> {
                             _ => {}
                         }
                     }
+                    Some(misc::Union::KeyboardLayout(layout)) => {
+                        // Older candidates reported the peer KLID after a fixed
+                        // delay. That value can be stale and undo the local
+                        // Windows shortcut. The controller OS is authoritative.
+                        log::debug!(
+                            "Ignored peer keyboard layout {}; local platform owns modifier shortcuts",
+                            layout.klid
+                        );
+                    }
                     Some(misc::Union::SwitchDisplay(s)) => {
                         self.handler.handle_peer_switch_display(&s);
                         if let Some(thread) = self.video_threads.get_mut(&(s.display as usize)) {
@@ -1874,6 +1883,19 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.sent_close_reason = true; // The controlled end will close, no need to send close reason
                         self.handler.msgbox("error", "Connection Error", &c, "");
                         return false;
+                    }
+                    Some(misc::Union::RestartRemoteDeviceError(error)) => {
+                        self.handler
+                            .get_lch()
+                            .write()
+                            .unwrap()
+                            .clear_restarting_remote_device();
+                        self.handler.msgbox(
+                            "error",
+                            "Restart remote device",
+                            &error,
+                            "",
+                        );
                     }
                     Some(misc::Union::BackNotification(notification)) => {
                         if !self.handle_back_notification(notification).await {

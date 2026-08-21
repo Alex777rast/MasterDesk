@@ -379,23 +379,17 @@ function getAccountLabelWithHandle() {
 function open_custom_server_dialog() {
     var configOptions = handler.get_options();
     var old_relay = configOptions["relay-server"] || "";
-    var old_api = configOptions["api-server"] || "";
     var old_id = configOptions["custom-rendezvous-server"] || "";
-    var old_key = configOptions["key"] || "";
     msgbox("custom-server", "ID/Relay Server", "<div .form .set-password> \
             <div><span>" + translate("ID Server") + ": </span><input|text .outline-focus name='id' value='" + old_id + "' /></div> \
             <div><span>" + translate("Relay Server") + ": </span><input|text name='relay' value='" + old_relay + "' /></div> \
-            <div><span>" + translate("API Server") + ": </span><input|text name='api' value='" + old_api + "' /></div> \
-            <div><span>" + translate("Key") + ": </span><input|text name='key' value='" + old_key + "' /></div> \
             </div> \
             ", "", function(res=null, show_progress) {
                 if (!res) return;
                 if (typeof show_progress === 'function') show_progress();
                 var id = (res.id || "").trim();
                 var relay = (res.relay || "").trim();
-                var api = (res.api || "").trim().toLowerCase();
-                var key = (res.key || "").trim();
-                if (id == old_id && relay == old_relay && key == old_key && api == old_api) return;
+                if (id == old_id && relay == old_relay) return;
                 if (id) {
                     var err = handler.test_if_valid_server(id, true);
                     if (err) { if (typeof show_progress === 'function') show_progress(false, translate("ID Server") + ": " + err); return; }
@@ -404,16 +398,8 @@ function open_custom_server_dialog() {
                     var err = handler.test_if_valid_server(relay, true);
                     if (err) { if (typeof show_progress === 'function') show_progress(false, translate("Relay Server") + ": " + err); return; }
                 }
-                if (api) {
-                    if (0 != api.indexOf("https://") && 0 != api.indexOf("http://")) {
-                        if (typeof show_progress === 'function') show_progress(false, translate("API Server") + ": " + translate("invalid_http"));
-                        return;
-                    }
-                }
                 configOptions["custom-rendezvous-server"] = id;
                 configOptions["relay-server"] = relay;
-                configOptions["api-server"] = api;
-                configOptions["key"] = key;
                 handler.set_options(configOptions);
                 if (typeof show_progress === 'function') show_progress(-1);
             }, 260, get_msgbox_width());

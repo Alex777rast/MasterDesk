@@ -39,7 +39,7 @@ use hbb_common::{
 
 use crate::{
     hbbs_http::{create_http_client_async, get_url_for_tls},
-    ui_interface::{get_api_server as ui_get_api_server, get_option, is_installed, set_option},
+    ui_interface::{get_api_server as ui_get_api_server, get_option, set_option},
 };
 
 #[derive(Debug, Eq, PartialEq)]
@@ -939,10 +939,27 @@ pub fn is_modifier(evt: &KeyEvent) -> bool {
     }
 }
 
+fn should_check_software_update_for_runtime(
+    update_enabled: bool,
+    is_masterdesk: bool,
+    is_portable: bool,
+) -> bool {
+    update_enabled && !(is_masterdesk && is_portable)
+}
+
 pub fn check_software_update() {
     let opt = LocalConfig::get_option(keys::OPTION_ENABLE_CHECK_UPDATE);
-    if config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt) {
+    let update_enabled = config::option2bool(keys::OPTION_ENABLE_CHECK_UPDATE, &opt);
+    let is_masterdesk = is_custom_client() && get_app_name() == crate::custom_defaults::APP_NAME;
+    #[cfg(target_os = "windows")]
+    let is_portable = is_masterdesk && !crate::platform::is_cur_exe_the_installed();
+    #[cfg(not(target_os = "windows"))]
+    let is_portable = false;
+
+    if should_check_software_update_for_runtime(update_enabled, is_masterdesk, is_portable) {
         std::thread::spawn(move || allow_err!(do_check_software_update()));
+    } else if is_masterdesk && is_portable {
+        log::info!("Skipping the automatic MasterDesk update request for a portable application.");
     }
 }
 
@@ -960,7 +977,7 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let (request, official_url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
     let url = if is_masterdesk {
-        crate::custom_defaults::UPDATE_MANIFEST_URL.to_owned()
+        crate::custom_defaults::update_manifest_url()
     } else {
         official_url
     };
@@ -2695,6 +2712,16 @@ mod tests {
         assert!(!is_masterdesk_release("rustdesk-1.4.9-install.exe"));
         assert!(!is_setup("MasterDesk.exe"));
         assert!(!is_setup("rustdesk.exe"));
+    }
+
+    #[test]
+    fn portable_masterdesk_skips_automatic_update_check() {
+        assert!(!should_check_software_update_for_runtime(true, true, true));
+        assert!(should_check_software_update_for_runtime(true, true, false));
+        assert!(should_check_software_update_for_runtime(true, false, true));
+        assert!(!should_check_software_update_for_runtime(
+            false, true, false
+        ));
     }
 
     #[inline]

@@ -1322,17 +1322,22 @@ void showWaitAcceptDialog(SessionID sessionId, String type, String title,
 }
 
 void showRestartRemoteDevice(PeerInfo pi, String id, SessionID sessionId,
-    OverlayDialogManager dialogManager) async {
+    OverlayDialogManager dialogManager,
+    {bool safeMode = false}) async {
+  final title = safeMode
+      ? translate('Restart remote device in Safe Mode')
+      : translate('Restart remote device');
+  final warning = safeMode
+      ? '\n\n${translate('Safe Mode with Networking will be used. Windows account password may be required instead of PIN or biometrics. Ethernet is more reliable because Wi-Fi depends on Windows and the adapter driver. BitLocker recovery may be requested on some computers.')}'
+      : '';
   final res = await dialogManager
       .show<bool>((setState, close, context) => CustomAlertDialog(
             title: Row(children: [
               Icon(Icons.warning_rounded, color: Colors.redAccent, size: 28),
-              Flexible(
-                  child: Text(translate("Restart remote device"))
-                      .paddingOnly(left: 10)),
+              Flexible(child: Text(title).paddingOnly(left: 10)),
             ]),
             content: Text(
-                "${translate('Are you sure you want to restart')} \n${pi.username}@${pi.hostname}($id) ?"),
+                "${translate('Are you sure you want to restart')} \n${pi.username}@${pi.hostname}($id) ?$warning"),
             actions: [
               dialogButton(
                 "Cancel",
@@ -1349,7 +1354,9 @@ void showRestartRemoteDevice(PeerInfo pi, String id, SessionID sessionId,
             onCancel: close,
             onSubmit: () => close(true),
           ));
-  if (res == true) bind.sessionRestartRemoteDevice(sessionId: sessionId);
+  if (res == true) {
+    bind.sessionRestartRemoteDevice(sessionId: sessionId, safeMode: safeMode);
+  }
 }
 
 showSetOSPassword(

@@ -25,7 +25,10 @@ use hbb_common::{
     config::{self, keys::OPTION_ALLOW_WEBSOCKET, Config, Config2},
     futures::StreamExt as _,
     futures_util::sink::SinkExt,
-    log, password_security as password, timeout,
+    log, password_security as password,
+    protobuf::Message as _,
+    rendezvous_proto::RelayAuth,
+    timeout,
     tokio::{
         self,
         io::{AsyncRead, AsyncWrite},
@@ -43,7 +46,8 @@ pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
 use ipc_auth::{active_uid, authorize_service_scoped_ipc_connection};
 #[cfg(windows)]
 use ipc_auth::{
-    authorize_windows_main_ipc_connection, portable_service_listener_security_attributes,
+    authorize_windows_gui_compat_ipc_connection, authorize_windows_main_ipc_connection,
+    gui_compat_listener_security_attributes, portable_service_listener_security_attributes,
     should_allow_everyone_create_on_windows,
 };
 #[cfg(target_os = "linux")]
@@ -83,6 +87,11 @@ const IPC_TOKEN_RANDOM_BYTES: usize = IPC_TOKEN_LEN / 2;
 const _: () = assert!(IPC_TOKEN_LEN % 2 == 0);
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 
+#[cfg(windows)]
+pub const POSTFIX_GUI_COMPAT: &str = "_gui_compat";
+#[cfg(windows)]
+const GUI_COMPAT_PROTOCOL_VERSION: u32 = 1;
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 thread_local! {
     static USE_USER_MAIN_IPC: Cell<bool> = Cell::new(false);
@@ -117,6 +126,122 @@ impl Drop for UserMainIpcScope {
 #[inline]
 pub async fn connect_service(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
     connect(ms_timeout, crate::POSTFIX_SERVICE).await
+}
+
+#[cfg(windows)]
+const MACHINE_PASSWORD_STATE: &str = "machine-permanent-password-state";
+#[cfg(windows)]
+const MACHINE_PASSWORD_SET: &str = "machine-permanent-password-set";
+#[cfg(windows)]
+const MACHINE_PASSWORD_SYNC: &str = "machine-permanent-password-sync";
+const MACHINE_SESSION_NONCE: &str = "machine-session-nonce";
+
+#[cfg(windows)]
+async fn machine_password_service_request(
+    name: &str,
+    value: Option<String>,
+) -> ResultType<Option<String>> {
+    let ms_timeout = 2_000;
+    let mut connection = connect_service(ms_timeout).await?;
+    connection
+        .send(&Data::Config((name.to_owned(), value)))
+        .await?;
+    if let Some(Data::Config((response_name, response_value))) =
+        connection.next_timeout(ms_timeout).await?
+    {
+        if response_name == name {
+            return Ok(response_value);
+        }
+    }
+    bail!("Invalid machine permanent password service response")
+}
+
+#[cfg(windows)]
+async fn machine_permanent_password_is_set_async() -> ResultType<bool> {
+    match machine_password_service_request(MACHINE_PASSWORD_STATE, None).await? {
+        Some(value) if value == "Y" => Ok(true),
+        Some(value) if value == "N" => Ok(false),
+        _ => bail!("Machine permanent password state query failed"),
+    }
+}
+
+#[cfg(windows)]
+async fn sync_machine_session_nonce_for_server_async() -> ResultType<()> {
+    let encoded = machine_password_service_request(MACHINE_SESSION_NONCE, None)
+        .await?
+        .ok_or_else(|| hbb_common::anyhow::anyhow!("Machine session nonce is unavailable"))?;
+    let session_nonce = hex::decode(encoded)
+        .map_err(|_| hbb_common::anyhow::anyhow!("Invalid machine session nonce encoding"))?;
+    if !hbb_common::masterdesk_security::initialize_process_session_nonce(session_nonce) {
+        bail!("Machine session nonce was initialized too late or is invalid");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn legacy_machine_password_payload() -> Option<crate::machine_password::MachinePasswordPayload> {
+    if Config::permanent_password_is_machine_managed() {
+        return None;
+    }
+    let (storage, mut salt) = Config::get_local_permanent_password_storage_and_salt();
+    if storage.is_empty() {
+        return None;
+    }
+    let h1 = if let Some(h1) = config::decode_permanent_password_h1_from_storage(&storage) {
+        if salt.is_empty() {
+            return None;
+        }
+        h1
+    } else if config::local_permanent_password_storage_is_usable_for_auth(&storage, &salt)
+        && !storage.starts_with("01")
+    {
+        if salt.is_empty() {
+            salt = Config::get_auto_password(32);
+        }
+        config::compute_permanent_password_h1(&storage, &salt)
+    } else {
+        return None;
+    };
+    Some(crate::machine_password::MachinePasswordPayload {
+        h1_hex: hex::encode(h1),
+        salt,
+    })
+}
+
+#[cfg(windows)]
+async fn sync_machine_permanent_password_for_server_async(offer_legacy: bool) -> ResultType<()> {
+    let legacy = offer_legacy.then(legacy_machine_password_payload).flatten();
+    let request = serde_json::to_string(&legacy)?;
+    let response = machine_password_service_request(MACHINE_PASSWORD_SYNC, Some(request))
+        .await?
+        .ok_or_else(|| hbb_common::anyhow::anyhow!("Machine password sync returned no payload"))?;
+    let payload: crate::machine_password::MachinePasswordPayload = serde_json::from_str(&response)?;
+    Config::set_machine_permanent_password_runtime_from_h1(payload.h1()?, &payload.salt)
+}
+
+#[cfg(windows)]
+async fn set_machine_permanent_password_async(password: &str) -> ResultType<bool> {
+    let accepted = matches!(
+        machine_password_service_request(MACHINE_PASSWORD_SET, Some(password.to_owned())).await?,
+        Some(value) if value == "Y"
+    );
+    if !accepted {
+        return Ok(false);
+    }
+    sync_machine_permanent_password_for_server_async(false).await?;
+    Ok(true)
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn sync_machine_permanent_password_for_server() -> ResultType<()> {
+    sync_machine_permanent_password_for_server_async(true).await
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn sync_machine_session_nonce_for_server() -> ResultType<()> {
+    sync_machine_session_nonce_for_server_async().await
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -287,9 +412,19 @@ pub enum DataPortableService {
     Mouse((Vec<u8>, i32, String, u32, bool, bool)),
     Pointer((Vec<u8>, i32)),
     Key(Vec<u8>),
+    KeyboardLayout(String),
     RequestStart,
     WillClose,
     CmShowElevation(bool),
+}
+
+#[cfg(windows)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct GuiCompatHandshake {
+    pub protocol: u32,
+    pub app_name: String,
+    pub daemon_version: String,
+    pub daemon_build_date: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -331,6 +466,8 @@ pub enum Data {
     Close,
     #[cfg(windows)]
     SAS,
+    #[cfg(windows)]
+    SafeModeRestart(Option<String>),
     UserSid(Option<u32>),
     OnlineStatus(Option<(i64, bool)>),
     Config((String, Option<String>)),
@@ -362,6 +499,16 @@ pub enum Data {
     Empty,
     Disconnected,
     DataPortableService(DataPortableService),
+    #[cfg(windows)]
+    GuiCompat(Option<GuiCompatHandshake>),
+    #[cfg(windows)]
+    MasterDeskRelayAuth {
+        controlled_id: String,
+        uuid: String,
+        relay_server: String,
+        conn_type: i32,
+        response: Option<Vec<u8>>,
+    },
     #[cfg(feature = "flutter")]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     SwitchSidesRequest(String),
@@ -505,6 +652,8 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                         }
                     }
                     tokio::spawn(async move {
+                        #[cfg(windows)]
+                        let mut temporary_password_gui_lease = None;
                         loop {
                             match stream.next().await {
                                 Err(err) => {
@@ -512,6 +661,19 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                     break;
                                 }
                                 Ok(Some(data)) => {
+                                    #[cfg(windows)]
+                                    if postfix.is_empty()
+                                        && temporary_password_gui_lease.is_none()
+                                        && matches!(
+                                            &data,
+                                            Data::Config((name, None))
+                                                if name == "temporary-password-gui"
+                                        )
+                                    {
+                                        temporary_password_gui_lease = Some(
+                                            password::acquire_temporary_password_gui_lease(),
+                                        );
+                                    }
                                     // On Linux/macOS, the protected `_service` channel is used only for
                                     // syncing config between root service and the active user process.
                                     //
@@ -566,6 +728,225 @@ pub async fn start(postfix: &str) -> ResultType<()> {
     }
 }
 
+#[cfg(windows)]
+fn gui_compat_config_query_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "id" | "temporary-password"
+            | "temporary-password-gui"
+            | "permanent-password-set"
+            | "permanent-password-is-preset"
+            | "salt"
+            | "rendezvous_server"
+            | "rendezvous_servers"
+            | "fingerprint"
+            | "hide_cm"
+            | "voice-call-input"
+            | "unlock-pin"
+            | "trusted-devices"
+    )
+}
+
+#[cfg(windows)]
+fn gui_compat_config_write_allowed(name: &str) -> bool {
+    matches!(
+        name,
+        "id" | "temporary-password" | "permanent-password" | "voice-call-input" | "unlock-pin"
+    )
+}
+
+#[cfg(windows)]
+fn preserve_protected_gui_compat_options(
+    mut requested: HashMap<String, String>,
+) -> HashMap<String, String> {
+    for (key, value) in Config::get_options() {
+        if crate::custom_defaults::is_protected_network_option(&key) {
+            requested.insert(key, value);
+        }
+    }
+    requested
+}
+
+#[cfg(windows)]
+fn sanitized_gui_compat_options(mut options: HashMap<String, String>) -> HashMap<String, String> {
+    options.retain(|key, _| !crate::custom_defaults::is_protected_network_option(key));
+    options
+}
+
+#[cfg(windows)]
+fn authoritative_relay_auth(
+    controlled_id: &str,
+    uuid: &str,
+    relay_server: &str,
+    conn_type: i32,
+) -> Option<RelayAuth> {
+    let secret_key =
+        hbb_common::masterdesk_security::secret_key_from_bytes(&Config::get_key_pair().0)?;
+    Some(hbb_common::masterdesk_security::new_relay_auth(
+        controlled_id,
+        uuid,
+        relay_server,
+        conn_type,
+        &Config::get_id(),
+        hbb_common::masterdesk_security::process_session_nonce(),
+        &secret_key,
+    ))
+}
+
+#[cfg(windows)]
+async fn handle_gui_compat(data: Data, stream: &mut Connection) -> bool {
+    match data {
+        Data::MasterDeskRelayAuth {
+            controlled_id,
+            uuid,
+            relay_server,
+            conn_type,
+            response: None,
+        } => {
+            let response =
+                authoritative_relay_auth(&controlled_id, &uuid, &relay_server, conn_type)
+                    .and_then(|auth| auth.write_to_bytes().ok());
+            allow_err!(
+                stream
+                    .send(&Data::MasterDeskRelayAuth {
+                        controlled_id,
+                        uuid,
+                        relay_server,
+                        conn_type,
+                        response,
+                    })
+                    .await
+            );
+            true
+        }
+        Data::OnlineStatus(None)
+        | Data::MouseMoveTime(_)
+        | Data::ControlPermissionsRemoteModify(None)
+        | Data::FileTransferEnabledState(None)
+        | Data::NatType(None)
+        | Data::Socks(None)
+        | Data::Socks(Some(_))
+        | Data::SocksWs(None) => {
+            handle(data, stream).await;
+            true
+        }
+        #[cfg(feature = "flutter")]
+        Data::VideoConnCount(None) => {
+            handle(data, stream).await;
+            true
+        }
+        Data::Options(None) => {
+            allow_err!(
+                stream
+                    .send(&Data::Options(Some(sanitized_gui_compat_options(
+                        Config::get_options()
+                    ))))
+                    .await
+            );
+            true
+        }
+        Data::Options(Some(options)) => {
+            handle(
+                Data::Options(Some(preserve_protected_gui_compat_options(options))),
+                stream,
+            )
+            .await;
+            true
+        }
+        Data::Config((name, None)) if gui_compat_config_query_allowed(&name) => {
+            handle(Data::Config((name, None)), stream).await;
+            true
+        }
+        Data::Config((name, Some(value))) if gui_compat_config_write_allowed(&name) => {
+            handle(Data::Config((name, Some(value))), stream).await;
+            true
+        }
+        Data::RemoveTrustedDevices(_) | Data::ClearTrustedDevices => {
+            handle(data, stream).await;
+            true
+        }
+        Data::TestRendezvousServer | Data::Deployed => {
+            handle(data, stream).await;
+            true
+        }
+        #[cfg(feature = "hwcodec")]
+        Data::CheckHwcodec | Data::HwCodecConfig(_) => {
+            handle(data, stream).await;
+            true
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+#[tokio::main(flavor = "current_thread")]
+pub async fn start_gui_compat() -> ResultType<()> {
+    let mut incoming = new_listener(POSTFIX_GUI_COMPAT).await?;
+    loop {
+        if let Some(result) = incoming.next().await {
+            match result {
+                Ok(stream) => {
+                    let mut stream = Connection::new(stream);
+                    if !authorize_windows_gui_compat_ipc_connection(&stream, POSTFIX_GUI_COMPAT) {
+                        continue;
+                    }
+                    tokio::spawn(async move {
+                        let mut temporary_password_gui_lease = None;
+                        let hello = match stream.next_timeout(1_000).await {
+                            Ok(Some(Data::GuiCompat(None))) => GuiCompatHandshake {
+                                protocol: GUI_COMPAT_PROTOCOL_VERSION,
+                                app_name: crate::get_app_name(),
+                                daemon_version: crate::custom_defaults::build_display_version(),
+                                daemon_build_date: crate::custom_defaults::CUSTOM_BUILD_DATE
+                                    .to_owned(),
+                            },
+                            _ => {
+                                log::warn!(
+                                    "Rejected GUI compatibility IPC without a valid handshake"
+                                );
+                                return;
+                            }
+                        };
+                        if stream.send(&Data::GuiCompat(Some(hello))).await.is_err() {
+                            return;
+                        }
+                        // A completed protected GUI compatibility handshake is
+                        // already sufficient proof that this is an attached
+                        // MasterDesk GUI. Acquire the lease before its first
+                        // periodic config query so incoming authentication
+                        // cannot race GUI startup.
+                        temporary_password_gui_lease =
+                            Some(password::acquire_temporary_password_gui_lease());
+                        loop {
+                            match stream.next().await {
+                                Ok(Some(data)) => {
+                                    if temporary_password_gui_lease.is_none()
+                                        && matches!(
+                                            &data,
+                                            Data::Config((name, None))
+                                                if name == "temporary-password-gui"
+                                        )
+                                    {
+                                        temporary_password_gui_lease = Some(
+                                            password::acquire_temporary_password_gui_lease(),
+                                        );
+                                    }
+                                    if !handle_gui_compat(data, &mut stream).await {
+                                        log::warn!("Rejected command outside the GUI compatibility IPC allowlist");
+                                        break;
+                                    }
+                                }
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                    });
+                }
+                Err(err) => log::error!("Couldn't get GUI compatibility IPC client: {err:?}"),
+            }
+        }
+    }
+}
+
 pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
     let path = Config::ipc_path(postfix);
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -585,6 +966,8 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
         {
             if postfix == "_portable_service" {
                 portable_service_listener_security_attributes()
+            } else if postfix == POSTFIX_GUI_COMPAT {
+                gui_compat_listener_security_attributes()
             } else if should_allow_everyone_create_on_windows(postfix) {
                 SecurityAttributes::allow_everyone_create()
             } else {
@@ -601,9 +984,9 @@ pub async fn new_listener(postfix: &str) -> ResultType<Incoming> {
         Err(err) => {
             log::error!("Failed to set ipc{} security: {}", postfix, err);
             #[cfg(windows)]
-            if postfix == "_portable_service" {
+            if postfix == "_portable_service" || postfix == POSTFIX_GUI_COMPAT {
                 // Fail closed for `_portable_service` when SDDL construction fails.
-                // This endpoint is security-critical and must not start with default ACLs.
+                // These endpoints are security-critical and must not start with default ACLs.
                 return Err(err.into());
             }
         }
@@ -827,17 +1210,50 @@ async fn handle(data: Data, stream: &mut Connection) {
                 let value;
                 if name == "id" {
                     value = Some(Config::get_id());
+                } else if name == MACHINE_SESSION_NONCE {
+                    #[cfg(windows)]
+                    {
+                        value = crate::machine_password::runtime_session_nonce()
+                            .ok()
+                            .map(hex::encode);
+                    }
+                    #[cfg(not(windows))]
+                    {
+                        value = Some(hex::encode(
+                            hbb_common::masterdesk_security::process_session_nonce(),
+                        ));
+                    }
+                } else if name == "temporary-password-gui" {
+                    value = Some(password::temporary_password());
                 } else if name == "temporary-password" {
                     value = Some(password::temporary_password());
                 } else if name == "permanent-password-storage-and-salt" {
-                    let (storage, salt) = Config::get_local_permanent_password_storage_and_salt();
-                    value = Some(storage + "\n" + &salt);
-                } else if name == "permanent-password-set" {
-                    value = Some(if Config::has_permanent_password() {
-                        "Y".to_owned()
+                    // Installed Windows GUI processes must never receive or persist the
+                    // service-owned verifier. Retain the legacy response only for portable
+                    // and non-Windows runtimes.
+                    #[cfg(windows)]
+                    let installed = crate::platform::is_installed();
+                    #[cfg(not(windows))]
+                    let installed = false;
+                    if installed {
+                        value = None;
                     } else {
-                        "N".to_owned()
-                    });
+                        let (storage, salt) =
+                            Config::get_local_permanent_password_storage_and_salt();
+                        value = Some(storage + "\n" + &salt);
+                    }
+                } else if name == "permanent-password-set" {
+                    #[cfg(windows)]
+                    let is_set = if crate::platform::is_installed() {
+                        machine_permanent_password_is_set_async()
+                            .await
+                            .unwrap_or(false)
+                    } else {
+                        Config::has_permanent_password()
+                    };
+                    #[cfg(not(windows))]
+                    let is_set = Config::has_permanent_password();
+                    value = Some(if is_set { "Y" } else { "N" }.to_owned());
                 } else if name == "permanent-password-is-preset" {
                     value = Some(if Config::is_using_preset_password() {
                         "Y".to_owned()
@@ -890,7 +1306,20 @@ async fn handle(data: Data, stream: &mut Connection) {
                         log::warn!("Changing permanent password is disabled");
                         updated = false;
                     } else {
-                        updated = Config::set_permanent_password(&value);
+                        #[cfg(windows)]
+                        {
+                            updated = if crate::platform::is_installed() {
+                                set_machine_permanent_password_async(value.as_str())
+                                    .await
+                                    .unwrap_or(false)
+                            } else {
+                                Config::set_permanent_password(&value)
+                            };
+                        }
+                        #[cfg(not(windows))]
+                        {
+                            updated = Config::set_permanent_password(&value);
+                        }
                     }
                     // Explicitly ACK/NACK permanent-password writes. This allows UIs/FFI to
                     // distinguish "accepted by daemon" vs "IPC send succeeded" without
@@ -1329,8 +1758,113 @@ pub async fn connect(ms_timeout: u64, postfix: &str) -> ResultType<ConnectionTmp
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
+        #[cfg(windows)]
+        if should_use_installed_gui_compat(postfix) {
+            return connect_installed_gui_compat(ms_timeout).await;
+        }
         let path = Config::ipc_path(postfix);
         connect_with_path(ms_timeout, &path).await
+    }
+}
+
+#[cfg(windows)]
+fn should_route_main_ipc_to_gui_compat(
+    postfix: &str,
+    is_custom_client: bool,
+    installed_exists: bool,
+    current_executable_is_installed: bool,
+    is_main_process: bool,
+) -> bool {
+    postfix.is_empty()
+        && is_custom_client
+        && installed_exists
+        && !current_executable_is_installed
+        && is_main_process
+}
+
+#[cfg(windows)]
+fn should_use_installed_server_identity_for_process(
+    is_custom_client: bool,
+    installed_exists: bool,
+    is_server_process: bool,
+) -> bool {
+    is_custom_client && installed_exists && !is_server_process
+}
+
+#[cfg(windows)]
+pub fn should_use_installed_server_identity() -> bool {
+    should_use_installed_server_identity_for_process(
+        crate::common::is_custom_client(),
+        crate::platform::is_installed(),
+        crate::common::is_server(),
+    )
+}
+
+#[cfg(windows)]
+pub fn should_use_installed_gui_compat(postfix: &str) -> bool {
+    should_route_main_ipc_to_gui_compat(
+        postfix,
+        crate::common::is_custom_client(),
+        crate::platform::is_installed(),
+        crate::platform::is_cur_exe_the_installed(),
+        crate::is_main(),
+    )
+}
+
+#[cfg(windows)]
+async fn connect_installed_gui_compat(ms_timeout: u64) -> ResultType<ConnectionTmpl<ConnClient>> {
+    let path = Config::ipc_path(POSTFIX_GUI_COMPAT);
+    let mut connection = connect_with_path(ms_timeout, &path).await?;
+    connection.send(&Data::GuiCompat(None)).await?;
+    match connection.next_timeout(ms_timeout).await? {
+        Some(Data::GuiCompat(Some(hello)))
+            if hello.protocol == GUI_COMPAT_PROTOCOL_VERSION
+                && hello.app_name == crate::get_app_name() =>
+        {
+            Ok(connection)
+        }
+        Some(Data::GuiCompat(Some(hello))) => bail!(
+            "Incompatible installed GUI IPC: protocol={}, app_name={}",
+            hello.protocol,
+            hello.app_name
+        ),
+        _ => bail!("Installed GUI IPC handshake failed"),
+    }
+}
+
+#[cfg(windows)]
+pub async fn request_installed_relay_auth(
+    controlled_id: &str,
+    uuid: &str,
+    relay_server: &str,
+    conn_type: i32,
+) -> ResultType<RelayAuth> {
+    let ms_timeout = 2_000;
+    let mut connection = connect_installed_gui_compat(ms_timeout).await?;
+    connection
+        .send(&Data::MasterDeskRelayAuth {
+            controlled_id: controlled_id.to_owned(),
+            uuid: uuid.to_owned(),
+            relay_server: relay_server.to_owned(),
+            conn_type,
+            response: None,
+        })
+        .await?;
+    match connection.next_timeout(ms_timeout).await? {
+        Some(Data::MasterDeskRelayAuth {
+            controlled_id: response_id,
+            uuid: response_uuid,
+            relay_server: response_relay,
+            conn_type: response_conn_type,
+            response: Some(response),
+        }) if response_id == controlled_id
+            && response_uuid == uuid
+            && response_relay == relay_server
+            && response_conn_type == conn_type =>
+        {
+            Ok(RelayAuth::parse_from_bytes(&response)?)
+        }
+        _ => bail!("Installed server did not sign the relay request"),
     }
 }
 
@@ -1605,7 +2139,11 @@ pub async fn set_permanent_password_with_ack(v: String) -> ResultType<bool> {
 }
 
 async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
-    // The daemon ACK/NACK is expected quickly since it applies the config in-process.
+    // Installed Windows writes are committed by the service and then synchronized
+    // back into the active server before ACK. Allow both protected IPC round trips.
+    #[cfg(windows)]
+    let ms_timeout = if crate::platform::is_installed() { 8_000 } else { 1_000 };
+    #[cfg(not(windows))]
     let ms_timeout = 1_000;
     let mut c = connect(ms_timeout, "").await?;
     c.send_config("permanent-password", v).await?;
@@ -1616,8 +2154,14 @@ async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
             if ok {
                 // Ensure the hashed permanent password storage is written to the user config file.
                 // This sync must not affect the daemon ACK outcome.
-                if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {
-                    log::warn!("Failed to sync permanent password storage from daemon: {err}");
+                #[cfg(windows)]
+                let machine_managed = crate::platform::is_installed();
+                #[cfg(not(windows))]
+                let machine_managed = false;
+                if !machine_managed {
+                    if let Err(err) = sync_permanent_password_storage_from_daemon_async().await {
+                        log::warn!("Failed to sync permanent password storage from daemon: {err}");
+                    }
                 }
             }
             return Ok(ok);
@@ -1690,13 +2234,25 @@ pub fn clear_trusted_devices() {
 
 pub fn get_id() -> String {
     if let Ok(Some(v)) = get_config("id") {
-        // update salt also, so that next time reinstallation not causing first-time auto-login failure
-        if let Ok(Some(v2)) = get_config("salt") {
-            Config::set_salt(&v2);
+        #[cfg(windows)]
+        let uses_installed_identity = should_use_installed_server_identity();
+        #[cfg(not(windows))]
+        let uses_installed_identity = false;
+        // A standalone profile owns its ID/salt pair. An installed GUI only
+        // borrows the machine ID at runtime; persisting it beside a different
+        // per-user key pair creates an invalid cryptographic identity.
+        if !uses_installed_identity {
+            if let Ok(Some(v2)) = get_config("salt") {
+                Config::set_salt(&v2);
+            }
         }
         if v != Config::get_id() {
-            Config::set_key_confirmed(false);
-            Config::set_id(&v);
+            if uses_installed_identity {
+                Config::set_id_runtime(&v);
+            } else {
+                Config::set_key_confirmed(false);
+                Config::set_id(&v);
+            }
         }
         v
     } else {
@@ -1722,7 +2278,15 @@ async fn get_options_(ms_timeout: u64) -> ResultType<HashMap<String, String>> {
     let mut c = connect(ms_timeout, "").await?;
     c.send(&Data::Options(None)).await?;
     if let Some(Data::Options(Some(value))) = c.next_timeout(ms_timeout).await? {
-        Config::set_options(value.clone());
+        #[cfg(windows)]
+        let stored_value = if should_use_installed_gui_compat("") {
+            preserve_protected_gui_compat_options(value.clone())
+        } else {
+            value.clone()
+        };
+        #[cfg(not(windows))]
+        let stored_value = value.clone();
+        Config::set_options(stored_value);
         Ok(value)
     } else {
         Ok(Config::get_options())
@@ -1759,6 +2323,12 @@ pub fn set_option(key: &str, value: &str) {
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
     let _nat = CheckTestNatType::new();
+    #[cfg(windows)]
+    let value = if should_use_installed_gui_compat("") {
+        preserve_protected_gui_compat_options(value)
+    } else {
+        value
+    };
     if let Ok(mut c) = connect(1000, "").await {
         c.send(&Data::Options(Some(value.clone()))).await?;
         // do not put below before connect, because we need to check should_exit
@@ -2120,6 +2690,77 @@ mod test {
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gui_compat_portable_main_routes_only_to_installed_server() {
+        assert!(should_route_main_ipc_to_gui_compat(
+            "", true, true, false, true
+        ));
+        assert!(!should_route_main_ipc_to_gui_compat(
+            "_service", true, true, false, true
+        ));
+        assert!(!should_route_main_ipc_to_gui_compat(
+            "", false, true, false, true
+        ));
+        assert!(!should_route_main_ipc_to_gui_compat(
+            "", true, false, false, true
+        ));
+        assert!(!should_route_main_ipc_to_gui_compat(
+            "", true, true, true, true
+        ));
+        assert!(!should_route_main_ipc_to_gui_compat(
+            "", true, true, false, false
+        ));
+
+        assert!(should_use_installed_server_identity_for_process(
+            true, true, false
+        ));
+        assert!(!should_use_installed_server_identity_for_process(
+            true, true, true
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn gui_compat_does_not_expose_machine_password_verifier() {
+        assert!(!should_allow_everyone_create_on_windows(POSTFIX_GUI_COMPAT));
+        assert!(gui_compat_config_query_allowed("id"));
+        assert!(gui_compat_config_query_allowed("permanent-password-set"));
+        assert!(!gui_compat_config_query_allowed(
+            "permanent-password-storage-and-salt"
+        ));
+        assert!(gui_compat_config_write_allowed("id"));
+        assert!(!gui_compat_config_write_allowed("salt"));
+
+        let protected_key = hbb_common::config::keys::OPTION_KEY.to_owned();
+        let visible_key = "enable-audio".to_owned();
+        let sanitized = sanitized_gui_compat_options(HashMap::from([
+            (protected_key.clone(), "secret".to_owned()),
+            (visible_key.clone(), "Y".to_owned()),
+        ]));
+        assert!(!sanitized.contains_key(&protected_key));
+        assert_eq!(sanitized.get(&visible_key).map(String::as_str), Some("Y"));
+
+        let encoded = serde_json::to_string(&Data::GuiCompat(None)).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Data>(&encoded).unwrap(),
+            Data::GuiCompat(None)
+        ));
+
+        let relay_auth = Data::MasterDeskRelayAuth {
+            controlled_id: "123456789".to_owned(),
+            uuid: "test-uuid".to_owned(),
+            relay_server: "relay.example".to_owned(),
+            conn_type: 0,
+            response: None,
+        };
+        let encoded = serde_json::to_string(&relay_auth).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<Data>(&encoded).unwrap(),
+            Data::MasterDeskRelayAuth { response: None, .. }
+        ));
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

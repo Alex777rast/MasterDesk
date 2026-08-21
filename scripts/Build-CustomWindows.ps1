@@ -1,21 +1,45 @@
 [CmdletBinding()]
 param(
     [switch]$SkipVcpkg,
-    [switch]$SkipFlutterSetup
+    [switch]$SkipFlutterSetup,
+    [switch]$IncrementalRustOnly,
+    [switch]$DiagnosticRustLibraryOnly,
+    [switch]$RefreshFlutterAot,
+    [ValidateRange(0, 999999)]
+    [int]$BetaNumber = 0,
+    [string]$OutputFileName = ''
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'Initialize-MasterDeskBuildEnvironment.ps1')
+
+if ($RefreshFlutterAot -and -not $IncrementalRustOnly) {
+    throw '-RefreshFlutterAot is supported only with -IncrementalRustOnly.'
+}
+if ($DiagnosticRustLibraryOnly -and -not $IncrementalRustOnly) {
+    throw '-DiagnosticRustLibraryOnly is supported only with -IncrementalRustOnly.'
+}
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $ToolsRoot = Join-Path $ProjectRoot '.tools'
+$AppDataRoot = Join-Path $ToolsRoot 'appdata'
+$PubCacheRoot = if ($env:MASTERDESK_PUB_CACHE) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_PUB_CACHE)
+} else {
+    Join-Path $ToolsRoot 'pub-cache'
+}
 $FlutterRoot = if ($env:MASTERDESK_FLUTTER_ROOT) {
     [System.IO.Path]::GetFullPath($env:MASTERDESK_FLUTTER_ROOT)
 } else {
     Join-Path $ToolsRoot 'flutter'
 }
 $FlutterExe = Join-Path $FlutterRoot 'bin\flutter.bat'
-$VcpkgRoot = Join-Path $ToolsRoot 'vcpkg'
+$VcpkgRoot = if ($env:MASTERDESK_VCPKG_ROOT) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_VCPKG_ROOT)
+} else {
+    Join-Path $ToolsRoot 'vcpkg'
+}
 $VcpkgExe = Join-Path $VcpkgRoot 'vcpkg.exe'
 $PythonExe = if ($env:MASTERDESK_PYTHON) {
     [System.IO.Path]::GetFullPath($env:MASTERDESK_PYTHON)
@@ -36,6 +60,11 @@ $CargoExe = Join-Path $CargoBin 'cargo.exe'
 $RustupExe = Join-Path $CargoBin 'rustup.exe'
 $CargoExpandExe = Join-Path $CargoBin 'cargo-expand.exe'
 $FlutterRustBridgeCodegen = Join-Path $CargoBin 'flutter_rust_bridge_codegen.exe'
+$GitCommand = Get-Command git.exe -ErrorAction SilentlyContinue
+if (-not $GitCommand) {
+    throw 'Git for Windows was not found.'
+}
+$GitBin = [System.IO.Path]::GetDirectoryName($GitCommand.Source)
 $LlvmBin = if ($env:MASTERDESK_LLVM_BIN) {
     [System.IO.Path]::GetFullPath($env:MASTERDESK_LLVM_BIN)
 } else {
@@ -71,7 +100,32 @@ $FlutterEngineUrl = 'https://github.com/rustdesk/engine/releases/download/main/w
 $FlutterEngineTarget = Join-Path $FlutterRoot 'bin\cache\artifacts\engine\windows-x64-release'
 $ReleaseDirectory = Join-Path $ProjectRoot 'flutter\build\windows\x64\runner\Release'
 $DistDirectory = Join-Path $ProjectRoot 'dist'
-$OutputExe = Join-Path $DistDirectory 'MasterDesk-1.4.9-RDS-x86_64.exe'
+$BuildBaseVersion = '1.4.9-10'
+$BuildDate = Get-Date -Format 'yyyy-MM-dd HH:mm'
+$BuildDateForFileName = Get-Date -Format 'yyyy-MM-dd'
+if ($BetaNumber -eq 0) {
+    $existingBetaNumbers = @()
+    if (Test-Path -LiteralPath $DistDirectory) {
+        $existingBetaNumbers = @(Get-ChildItem -LiteralPath $DistDirectory -File -Filter 'MasterDesk-*-beta-*-*-RDS-x86_64.exe' |
+            ForEach-Object {
+                if ($_.Name -match '-beta-(\d+)-\d{4}-\d{2}-\d{2}-RDS-x86_64\.exe$') {
+                    [int]$matches[1]
+                }
+            })
+    }
+    $BetaNumber = if ($existingBetaNumbers.Count -eq 0) {
+        1
+    } else {
+        1 + ($existingBetaNumbers | Measure-Object -Maximum).Maximum
+    }
+}
+$expectedOutputFileName = "MasterDesk-$BuildBaseVersion-beta-$BetaNumber-$BuildDateForFileName-RDS-x86_64.exe"
+if ([string]::IsNullOrWhiteSpace($OutputFileName)) {
+    $OutputFileName = $expectedOutputFileName
+} elseif ($OutputFileName -cne $expectedOutputFileName) {
+    throw "OutputFileName must follow the build identity rule: $expectedOutputFileName"
+}
+$OutputExe = Join-Path $DistDirectory $OutputFileName
 
 function Invoke-Checked {
     param(
@@ -80,9 +134,19 @@ function Invoke-Checked {
     )
 
     Write-Host "`n> $FilePath $($Arguments -join ' ')"
-    & $FilePath @Arguments
-    if ($LASTEXITCODE -ne 0) {
-        throw "Command failed with exit code $LASTEXITCODE`: $FilePath"
+    # Native tools legitimately write progress and warnings to stderr. When
+    # this script's output is redirected to an artifact, Windows PowerShell can
+    # turn those records into terminating errors under Stop preference.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @Arguments
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($nativeExitCode -ne 0) {
+        throw "Command failed with exit code $nativeExitCode`: $FilePath"
     }
 }
 
@@ -299,39 +363,235 @@ function Build-PortableExecutable {
     }
 }
 
+function Invoke-IncrementalFlutterAotBuild {
+    param(
+        [Parameter(Mandatory)] [string]$FlutterBackend,
+        [Parameter(Mandatory)] [string]$FlutterProject
+    )
+
+    $logDirectory = Join-Path $ProjectRoot '.tools\logs'
+    New-Item -ItemType Directory -Path $logDirectory -Force | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $stdoutLog = Join-Path $logDirectory "flutter-aot-$stamp.stdout.log"
+    $stderrLog = Join-Path $logDirectory "flutter-aot-$stamp.stderr.log"
+    $startedUtc = [DateTime]::UtcNow
+    $commandLine = "/d /s /c `"`"$FlutterBackend`" windows-x64 Release`""
+    $process = Start-Process `
+        -FilePath $env:ComSpec `
+        -ArgumentList $commandLine `
+        -WorkingDirectory $FlutterProject `
+        -WindowStyle Hidden `
+        -RedirectStandardOutput $stdoutLog `
+        -RedirectStandardError $stderrLog `
+        -PassThru
+
+    $deadline = [DateTime]::UtcNow.AddMinutes(10)
+    $lastSignature = $null
+    $stableSince = $null
+    $latestAot = $null
+    while ([DateTime]::UtcNow -lt $deadline) {
+        $process.Refresh()
+        $latestAot = Get-ChildItem `
+            -LiteralPath (Join-Path $FlutterProject '.dart_tool\flutter_build') `
+            -Recurse -File -Filter 'app.so' -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTimeUtc -Descending |
+            Select-Object -First 1
+
+        if ($latestAot -and $latestAot.LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2)) {
+            $signature = "$($latestAot.Length):$($latestAot.LastWriteTimeUtc.Ticks)"
+            if ($signature -ne $lastSignature) {
+                $lastSignature = $signature
+                $stableSince = [DateTime]::UtcNow
+            } elseif ($stableSince -and
+                [DateTime]::UtcNow.Subtract($stableSince).TotalSeconds -ge 15) {
+                if (-not $process.HasExited) {
+                    # Flutter 3.24 can leave tool_backend.bat waiting after the
+                    # final app.so is complete. Stop only that exact hidden
+                    # wrapper after the artifact has remained stable.
+                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    $process.WaitForExit(5000) | Out-Null
+                    Write-Host "Flutter AOT wrapper stopped after stable output: $($latestAot.FullName)"
+                }
+                return $latestAot
+            }
+        }
+
+        if ($process.HasExited) {
+            if ($process.ExitCode -ne 0) {
+                Write-Host "Flutter AOT stderr log: $stderrLog"
+                if (Test-Path -LiteralPath $stderrLog) {
+                    Get-Content -LiteralPath $stderrLog -Tail 25
+                }
+                throw "Flutter AOT backend failed with exit code $($process.ExitCode)."
+            }
+            if (-not $latestAot) {
+                throw 'Flutter AOT backend completed without producing app.so.'
+            }
+            return $latestAot
+        }
+        Start-Sleep -Seconds 1
+    }
+
+    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    throw "Flutter AOT backend timed out. Logs: $stdoutLog ; $stderrLog"
+}
+
+function Build-IncrementalRustPortableExecutable {
+    Push-Location $ProjectRoot
+    try {
+        $runnerExe = Join-Path $ReleaseDirectory 'rustdesk.exe'
+        if (-not (Test-Path -LiteralPath $runnerExe)) {
+            throw "Existing Flutter runner not found: $runnerExe"
+        }
+
+        if ($RefreshFlutterAot) {
+            Push-Location (Join-Path $ProjectRoot 'flutter')
+            try {
+                # Call Flutter's cached AOT backend directly. The outer
+                # `flutter build windows` CMake wrapper can wait indefinitely
+                # after app.so is already complete on this workspace.
+                $flutterProject = Join-Path $ProjectRoot 'flutter'
+                $env:FLUTTER_ROOT = $FlutterRoot
+                $env:PROJECT_DIR = $flutterProject
+                $env:FLUTTER_EPHEMERAL_DIR = Join-Path $flutterProject 'windows\flutter\ephemeral'
+                $env:FLUTTER_TARGET = 'lib\main.dart'
+                $env:DART_OBFUSCATION = 'false'
+                $env:TRACK_WIDGET_CREATION = 'true'
+                $env:TREE_SHAKE_ICONS = 'true'
+                $env:PACKAGE_CONFIG = Join-Path $flutterProject '.dart_tool\package_config.json'
+                $flutterBackend = Join-Path $FlutterRoot 'packages\flutter_tools\bin\tool_backend.bat'
+                $aotOutput = Invoke-IncrementalFlutterAotBuild `
+                    -FlutterBackend $flutterBackend `
+                    -FlutterProject $flutterProject
+                $releaseAot = Join-Path $ReleaseDirectory 'data\app.so'
+                Copy-Item -LiteralPath $aotOutput.FullName -Destination $releaseAot -Force
+                Write-Host "Flutter AOT refreshed: $($aotOutput.FullName)"
+            } finally {
+                Pop-Location
+            }
+        }
+
+        # Recompile only the Rust library. The existing Flutter runner, AOT
+        # bundle, plugins, vcpkg artifacts, and CMake output stay untouched.
+        Invoke-Checked $CargoExe @(
+            'build',
+            '--locked',
+            '--offline',
+            '--release',
+            '--features', 'hwcodec,vram,flutter',
+            '--lib'
+        )
+
+        $rustLibrary = Join-Path $ProjectRoot 'target\release\librustdesk.dll'
+        if (-not (Test-Path -LiteralPath $rustLibrary)) {
+            throw "Incremental Rust library was not produced: $rustLibrary"
+        }
+        if ($DiagnosticRustLibraryOnly) {
+            $diagnosticDirectory = Join-Path $ProjectRoot (
+                'artifacts\diagnostic-rust\' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+            )
+            New-Item -ItemType Directory -Path $diagnosticDirectory -Force | Out-Null
+            $diagnosticLibrary = Join-Path $diagnosticDirectory 'librustdesk.dll'
+            Copy-Item -LiteralPath $rustLibrary -Destination $diagnosticLibrary -Force
+            $diagnosticHash = (Get-FileHash -LiteralPath $diagnosticLibrary -Algorithm SHA256).Hash
+            Write-Host "`nBUILD_SUCCESS"
+            Write-Host 'MODE=DiagnosticRustLibraryOnly'
+            Write-Host "OUTPUT=$diagnosticLibrary"
+            Write-Host "SHA256=$diagnosticHash"
+            return
+        }
+        Copy-Item -LiteralPath $rustLibrary -Destination $ReleaseDirectory -Force
+        Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENCE') -Destination $ReleaseDirectory -Force
+        Copy-Item -LiteralPath (Join-Path $ProjectRoot 'CUSTOM_BUILD.md') -Destination $ReleaseDirectory -Force
+
+        Push-Location (Join-Path $ProjectRoot 'libs\portable')
+        try {
+            Invoke-Checked $PythonExe @(
+                '.\generate.py',
+                '-f', '..\..\flutter\build\windows\x64\runner\Release',
+                '-o', '.',
+                '-e', '..\..\flutter\build\windows\x64\runner\Release\rustdesk.exe'
+            )
+        } finally {
+            Pop-Location
+        }
+
+        $packedExe = Join-Path $ProjectRoot 'target\release\rustdesk-portable-packer.exe'
+        if (-not (Test-Path -LiteralPath $packedExe)) {
+            throw "Portable packer output not found: $packedExe"
+        }
+        New-Item -ItemType Directory -Path $DistDirectory -Force | Out-Null
+        Move-Item -LiteralPath $packedExe -Destination $OutputExe -Force
+
+        $hash = (Get-FileHash -LiteralPath $OutputExe -Algorithm SHA256).Hash
+        $hashLine = "$hash  $([System.IO.Path]::GetFileName($OutputExe))"
+        Set-Content -LiteralPath (Join-Path $DistDirectory 'SHA256.txt') -Value $hashLine -Encoding ascii
+
+        Write-Host "`nBUILD_SUCCESS"
+        if ($RefreshFlutterAot) {
+            Write-Host 'MODE=IncrementalRustWithFlutterAot'
+        } else {
+            Write-Host 'MODE=IncrementalRustOnly'
+        }
+        Write-Host "OUTPUT=$OutputExe"
+        Write-Host "SHA256=$hash"
+    } finally {
+        Pop-Location
+    }
+}
+
 foreach ($requiredFile in @($PythonExe, $CargoExe, $RustupExe, (Join-Path $LlvmBin 'clang.exe'))) {
     if (-not (Test-Path -LiteralPath $requiredFile)) {
         throw "Required build tool not found: $requiredFile"
     }
 }
 
-New-Item -ItemType Directory -Path (Join-Path $ToolsRoot 'appdata') -Force | Out-Null
-New-Item -ItemType Directory -Path (Join-Path $ToolsRoot 'pub-cache') -Force | Out-Null
+New-Item -ItemType Directory -Path $AppDataRoot -Force | Out-Null
+New-Item -ItemType Directory -Path $PubCacheRoot -Force | Out-Null
 
-$env:APPDATA = Join-Path $ToolsRoot 'appdata'
-$env:PUB_CACHE = Join-Path $ToolsRoot 'pub-cache'
+$env:APPDATA = $AppDataRoot
+$env:PUB_CACHE = $PubCacheRoot
 $env:CI = 'true'
 $env:FLUTTER_SUPPRESS_ANALYTICS = 'true'
+$env:FLUTTER_ALREADY_LOCKED = 'true'
 $env:CARGO_NET_GIT_FETCH_WITH_CLI = 'true'
 $env:CARGO_NET_RETRY = '5'
 $env:CARGO_HTTP_TIMEOUT = '120'
-$env:GIT_CONFIG_COUNT = '1'
+$env:GIT_CONFIG_COUNT = '3'
 $env:GIT_CONFIG_KEY_0 = 'http.version'
 $env:GIT_CONFIG_VALUE_0 = 'HTTP/1.1'
-$env:Path = "$FlutterRoot\bin;$CargoBin;$LlvmBin;$([System.IO.Path]::GetDirectoryName($PythonExe));$env:Path"
+$env:GIT_CONFIG_KEY_1 = 'safe.directory'
+$env:GIT_CONFIG_VALUE_1 = $FlutterRoot
+$env:GIT_CONFIG_KEY_2 = 'safe.directory'
+$env:GIT_CONFIG_VALUE_2 = $VcpkgRoot
+$env:Path = "$FlutterRoot\bin;$GitBin;$CargoBin;$LlvmBin;$([System.IO.Path]::GetDirectoryName($PythonExe));$env:Path"
 
 Import-VisualStudioEnvironment
 
 # VsDevCmd defines VCPKG_ROOT for Visual Studio's bundled copy. RustDesk must
 # use the pinned standalone vcpkg checkout prepared for this repository.
+$env:APPDATA = $AppDataRoot
+$env:PUB_CACHE = $PubCacheRoot
+$env:FLUTTER_ALREADY_LOCKED = 'true'
 $env:LIBCLANG_PATH = $LlvmBin
 $env:VCPKG_ROOT = $VcpkgRoot
 $env:VCPKG_INSTALLED_ROOT = Join-Path $VcpkgRoot 'installed'
 $env:VCPKG_DEFAULT_TRIPLET = 'x64-windows-static'
 $env:VCPKG_DEFAULT_HOST_TRIPLET = 'x64-windows-static'
-$env:Path = "$FlutterRoot\bin;$CargoBin;$LlvmBin;$([System.IO.Path]::GetDirectoryName($PythonExe));$env:Path"
+$env:MASTERDESK_BUILD_BETA_NUMBER = $BetaNumber.ToString([System.Globalization.CultureInfo]::InvariantCulture)
+$env:MASTERDESK_BUILD_DATE = $BuildDate
+$env:Path = "$FlutterRoot\bin;$GitBin;$CargoBin;$LlvmBin;$([System.IO.Path]::GetDirectoryName($PythonExe));$env:Path"
+$localPythonPackages = Join-Path $ToolsRoot 'python-packages'
+if (Test-Path -LiteralPath $localPythonPackages) {
+    $env:PYTHONPATH = if ($env:PYTHONPATH) {
+        "$localPythonPackages;$env:PYTHONPATH"
+    } else {
+        $localPythonPackages
+    }
+}
 
 Write-Host 'Pinned toolchain:'
+Write-Host "MasterDesk build: $BuildBaseVersion beta $BetaNumber ($BuildDate)"
 Invoke-Checked $RustupExe @('run', '1.75.0', 'cargo', '--version')
 Invoke-Checked (Join-Path $LlvmBin 'clang.exe') @('--version')
 Invoke-Checked $PythonExe @('--version')
@@ -343,4 +603,8 @@ if (-not $SkipFlutterSetup) {
 if (-not $SkipVcpkg) {
     Install-VcpkgDependencies
 }
-Build-PortableExecutable
+if ($IncrementalRustOnly) {
+    Build-IncrementalRustPortableExecutable
+} else {
+    Build-PortableExecutable
+}

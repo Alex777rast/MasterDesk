@@ -22,19 +22,22 @@ const APPNAME_RUNTIME_ENV_KEY: &str = "RUSTDESK_APPNAME";
 #[cfg(windows)]
 const SET_FOREGROUND_WINDOW_ENV_KEY: &str = "SET_FOREGROUND_WINDOW";
 
-fn is_timestamp_matches(dir: &Path, ts: &mut u64) -> bool {
+fn embedded_timestamp() -> u64 {
     let Ok(app_metadata) = std::str::from_utf8(APP_METADATA) else {
-        return true;
+        return 0;
     };
     for line in app_metadata.lines() {
         if line.starts_with(META_LINE_PREFIX_TIMESTAMP) {
             if let Ok(stored_ts) = line.replace(META_LINE_PREFIX_TIMESTAMP, "").parse::<u64>() {
-                *ts = stored_ts;
-                break;
+                return stored_ts;
             }
         }
     }
-    if *ts == 0 {
+    0
+}
+
+fn is_timestamp_matches(dir: &Path, ts: u64) -> bool {
+    if ts == 0 {
         return true;
     }
 
@@ -42,7 +45,7 @@ fn is_timestamp_matches(dir: &Path, ts: &mut u64) -> bool {
         for line in content.lines() {
             if line.starts_with(META_LINE_PREFIX_TIMESTAMP) {
                 if let Ok(stored_ts) = line.replace(META_LINE_PREFIX_TIMESTAMP, "").parse::<u64>() {
-                    return *ts == stored_ts;
+                    return ts == stored_ts;
                 }
             }
         }
@@ -75,20 +78,29 @@ fn setup(
     _args: &Vec<String>,
     _ui: &mut bool,
 ) -> Option<PathBuf> {
+    let ts = embedded_timestamp();
     let dir = if let Some(dir) = dir {
         dir
     } else {
         // home dir
         if let Some(dir) = dirs::data_local_dir() {
-            dir.join(APP_PREFIX)
+            let root = dir.join(APP_PREFIX);
+            if ts == 0 {
+                root
+            } else {
+                // A shared extraction directory can retain an older DLL when
+                // that DLL is still mapped by another portable process.
+                // Isolate every generated package by its embedded timestamp
+                // so a new beta can never launch an old cached payload.
+                root.join(format!("build-{ts}"))
+            }
         } else {
             eprintln!("not found data local dir");
             return None;
         }
     };
 
-    let mut ts = 0;
-    if clear || !is_timestamp_matches(&dir, &mut ts) {
+    if clear || !is_timestamp_matches(&dir, ts) {
         #[cfg(windows)]
         if _args.is_empty() {
             *_ui = true;
@@ -221,7 +233,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::is_setup_executable;
+    use super::{embedded_timestamp, is_setup_executable};
 
     #[test]
     fn masterdesk_release_runs_portable_by_default() {
@@ -231,6 +243,11 @@ mod tests {
         assert!(is_setup_executable("rustdesk-1.4.9-install.exe"));
         assert!(!is_setup_executable("MasterDesk.exe"));
         assert!(!is_setup_executable("rustdesk.exe"));
+    }
+
+    #[test]
+    fn generated_package_has_versioned_extraction_timestamp() {
+        assert!(embedded_timestamp() > 0);
     }
 }
 

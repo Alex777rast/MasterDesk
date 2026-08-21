@@ -112,7 +112,7 @@ class AllPeersLoader {
 
   final String _listenerKey = 'AllPeersLoader';
   static const String _cbQueryOnlines = 'callback_query_onlines';
-  static const Duration _queryOnlineInterval = Duration(seconds: 5);
+  static const Duration _queryOnlineInterval = Duration(seconds: 1);
   static const Duration _defaultQueryOnlineDebounce =
       Duration(milliseconds: 300);
   static const int _maxQueryOnlineOptions = 20;

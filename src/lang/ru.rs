@@ -313,6 +313,18 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Set permanent password", "Установить постоянный пароль"),
         ("Enable remote restart", "Разрешить удалённую перезагрузку"),
         ("Restart remote device", "Перезапустить удалённое устройство"),
+        (
+            "Restart remote device in Safe Mode",
+            "Перезагрузить удалённое устройство в безопасном режиме",
+        ),
+        (
+            "Safe Mode with Networking will be used. Windows account password may be required instead of PIN or biometrics. Ethernet is more reliable because Wi-Fi depends on Windows and the adapter driver. BitLocker recovery may be requested on some computers.",
+            "Будет использован безопасный режим с поддержкой сети. Для входа может потребоваться пароль учётной записи Windows вместо PIN-кода или биометрии. Ethernet надёжнее, поскольку работа Wi-Fi зависит от Windows и драйвера адаптера. На некоторых компьютерах BitLocker может запросить ключ восстановления.",
+        ),
+        (
+            "Safe Mode restart requires the installed MasterDesk service",
+            "Для перезагрузки в безопасном режиме необходима установленная служба MasterDesk",
+        ),
         ("Are you sure you want to restart", "Вы уверены, что хотите выполнить перезагрузку?"),
         ("Restarting remote device", "Перезагрузка удалённого устройства"),
         ("remote_restarting_tip", "Удалённое устройство перезапускается. Закройте это сообщение и через некоторое время переподключитесь, используя постоянный пароль."),

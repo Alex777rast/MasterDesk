@@ -144,6 +144,9 @@ pub fn show_run_without_install() -> bool {
 
 #[inline]
 pub fn get_license() -> String {
+    if crate::common::get_app_name() == crate::custom_defaults::APP_NAME {
+        return String::new();
+    }
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
         #[cfg(feature = "flutter")]
@@ -331,6 +334,10 @@ pub fn set_peer_flutter_option(id: String, name: String, value: String) {
 
 #[inline]
 pub fn set_peer_option(id: String, name: String, value: String) {
+    if name == "alias" {
+        PeerConfig::set_alias(&id, &value);
+        return;
+    }
     let mut c = PeerConfig::load(&id);
     if value.is_empty() {
         c.options.remove(&name);
@@ -353,7 +360,10 @@ pub fn get_options() -> String {
         }
     };
     let mut m = serde_json::Map::new();
-    for (k, v) in options.iter() {
+    for (k, v) in options
+        .iter()
+        .filter(|(key, _)| !crate::custom_defaults::is_protected_network_option(key))
+    {
         m.insert(k.into(), v.to_owned().into());
     }
     serde_json::to_string(&m).unwrap_or_default()
@@ -415,7 +425,8 @@ pub fn get_sound_inputs() -> Vec<String> {
 }
 
 #[inline]
-pub fn set_options(m: HashMap<String, String>) {
+pub fn set_options(mut m: HashMap<String, String>) {
+    m.retain(|key, _| !crate::custom_defaults::is_protected_network_option(key));
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         *OPTIONS.lock().unwrap() = m.clone();
@@ -427,6 +438,10 @@ pub fn set_options(m: HashMap<String, String>) {
 
 #[inline]
 pub fn set_option(key: String, value: String) {
+    if crate::custom_defaults::is_protected_network_option(&key) {
+        log::warn!("Ignoring an attempt to change protected MasterDesk option {key}.");
+        return;
+    }
     if &key == "stop-service" {
         #[cfg(target_os = "macos")]
         {
@@ -573,8 +588,19 @@ pub fn is_installed_lower_version() -> bool {
     return false;
     #[cfg(windows)]
     {
-        let b = crate::platform::windows::get_reg("BuildDate");
-        return crate::BUILD_DATE.cmp(&b).is_gt();
+        let installed_version = crate::platform::windows::get_reg("DisplayVersion");
+        let installed_date = crate::platform::windows::get_reg("BuildDate");
+        let offer_update =
+            crate::custom_defaults::installed_build_is_older(&installed_version, &installed_date);
+        log::info!(
+            "MasterDesk local GUI update comparison: current_version={}, current_date={}, installed_version={}, installed_date={}, offer={}",
+            crate::custom_defaults::build_display_version(),
+            crate::custom_defaults::CUSTOM_BUILD_DATE,
+            installed_version,
+            installed_date,
+            offer_update
+        );
+        return offer_update;
     }
 }
 
@@ -621,6 +647,10 @@ pub fn is_permanent_password_set() -> bool {
     return Config::has_permanent_password();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        #[cfg(windows)]
+        if crate::platform::is_installed() {
+            return ipc::is_permanent_password_set();
+        }
         let daemon_is_set = ipc::is_permanent_password_set();
         // `daemon_is_set` is authoritative for the return value. Local storage is only used to
         // decide whether we should attempt a sync to clear stale user-side state.
@@ -643,6 +673,10 @@ pub fn is_local_permanent_password_set() -> bool {
     return Config::has_local_permanent_password();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        #[cfg(windows)]
+        if crate::platform::is_installed() {
+            return ipc::is_permanent_password_set();
+        }
         allow_err!(ipc::sync_permanent_password_storage_from_daemon());
         Config::has_local_permanent_password()
     }
@@ -759,7 +793,11 @@ pub fn get_new_version() -> String {
 
 #[inline]
 pub fn get_version() -> String {
-    crate::VERSION.to_owned()
+    if crate::common::is_custom_client() {
+        crate::custom_defaults::build_display_version()
+    } else {
+        crate::VERSION.to_owned()
+    }
 }
 
 #[cfg(any(target_os = "android", target_os = "ios", feature = "flutter"))]
@@ -1321,9 +1359,28 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
     #[cfg(not(feature = "flutter"))]
     let mut id = "".to_owned();
     let is_cm = crate::common::is_cm();
+    #[cfg(target_os = "windows")]
+    let exposes_temporary_password = crate::is_main() && !is_cm;
+    #[cfg(not(target_os = "windows"))]
+    let exposes_temporary_password = true;
 
     loop {
         if let Ok(mut c) = ipc::connect(1000, "").await {
+            // Establish the GUI-owned temporary-password lease immediately.
+            // Waiting for the first one-second status tick leaves a startup
+            // race where an incoming connection is incorrectly routed to the
+            // local Accept/Cancel flow even though the GUI already shows a
+            // temporary password.
+            if exposes_temporary_password
+                && c.send(&ipc::Data::Config((
+                    "temporary-password-gui".to_owned(),
+                    None,
+                )))
+                .await
+                .is_err()
+            {
+                continue;
+            }
             let mut timer = crate::rustdesk_interval(time::interval(time::Duration::from_secs(1)));
             loop {
                 tokio::select! {
@@ -1351,7 +1408,9 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                     {
                                         id = value;
                                     }
-                                } else if name == "temporary-password" {
+                                } else if name == "temporary-password"
+                                    || name == "temporary-password-gui"
+                                {
                                     *TEMPORARY_PASSWD.lock().unwrap() = value;
                                 }
                             }
@@ -1402,7 +1461,12 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                         c.send(&ipc::Data::OnlineStatus(None)).await.ok();
                         c.send(&ipc::Data::Options(None)).await.ok();
                         c.send(&ipc::Data::Config(("id".to_owned(), None))).await.ok();
-                        c.send(&ipc::Data::Config(("temporary-password".to_owned(), None))).await.ok();
+                        let temporary_password_query = if exposes_temporary_password {
+                            "temporary-password-gui"
+                        } else {
+                            "temporary-password"
+                        };
+                        c.send(&ipc::Data::Config((temporary_password_query.to_owned(), None))).await.ok();
                         #[cfg(feature = "flutter")]
                         c.send(&ipc::Data::VideoConnCount(None)).await.ok();
                         c.send(&ipc::Data::ControlPermissionsRemoteModify(None)).await.ok();
@@ -1411,6 +1475,9 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                     }
                 }
             }
+        }
+        if exposes_temporary_password {
+            TEMPORARY_PASSWD.lock().unwrap().clear();
         }
         if !reconnect {
             OPTIONS
@@ -1705,4 +1772,31 @@ pub fn is_remote_modify_enabled_by_control_permissions() -> Option<bool> {
     *IS_REMOTE_MODIFY_ENABLED_BY_CONTROL_PERMISSIONS
         .lock()
         .unwrap()
+}
+
+#[cfg(all(test, windows))]
+mod masterdesk_peer_alias_tests {
+    use hbb_common::config::PeerConfig;
+
+    #[test]
+    fn peer_alias_sidecar_survives_a_stale_peer_config_write() {
+        let _ = hbb_common::env_logger::Builder::new()
+            .filter_level(hbb_common::log::LevelFilter::Info)
+            .is_test(true)
+            .try_init();
+        let id = format!("masterdesk-alias-test-{}", std::process::id());
+        PeerConfig::remove(&id);
+
+        assert!(PeerConfig::set_alias(&id, "Persisted test alias"));
+        let mut stale = PeerConfig::load(&id);
+        stale.options.remove("alias");
+        stale.store(&id);
+
+        let reloaded = PeerConfig::load(&id);
+        assert_eq!(
+            reloaded.options.get("alias").map(String::as_str),
+            Some("Persisted test alias")
+        );
+        PeerConfig::remove(&id);
+    }
 }

@@ -1,5 +1,25 @@
 import 'package:flutter/services.dart';
 
+/// Returns true for Windows modifier events which must reach the native
+/// platform after MasterDesk has forwarded them to the remote peer.
+///
+/// Flutter otherwise marks every remote-view key event as handled. Passing
+/// Ctrl/Alt/Shift back to Windows lets the configured Alt+Shift or Ctrl+Shift
+/// language shortcut run locally without releasing ordinary remote shortcuts
+/// such as Alt+F4 or Ctrl+C to the controller OS.
+bool shouldPassWindowsModifierToPlatform({
+  required bool isWindows,
+  required PhysicalKeyboardKey physicalKey,
+}) {
+  if (!isWindows) return false;
+  return physicalKey == PhysicalKeyboardKey.altLeft ||
+      physicalKey == PhysicalKeyboardKey.altRight ||
+      physicalKey == PhysicalKeyboardKey.controlLeft ||
+      physicalKey == PhysicalKeyboardKey.controlRight ||
+      physicalKey == PhysicalKeyboardKey.shiftLeft ||
+      physicalKey == PhysicalKeyboardKey.shiftRight;
+}
+
 /// Returns true when a stale mobile one-shot Shift state should be released
 /// by replaying a tracked Shift key-down as a synthesized key-up.
 ///

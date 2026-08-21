@@ -3,6 +3,47 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/models/input_modifier_utils.dart';
 
 void main() {
+  group('shouldPassWindowsModifierToPlatform', () {
+    test('passes both sides of ctrl alt and shift on Windows', () {
+      for (final key in [
+        PhysicalKeyboardKey.controlLeft,
+        PhysicalKeyboardKey.controlRight,
+        PhysicalKeyboardKey.altLeft,
+        PhysicalKeyboardKey.altRight,
+        PhysicalKeyboardKey.shiftLeft,
+        PhysicalKeyboardKey.shiftRight,
+      ]) {
+        expect(
+          shouldPassWindowsModifierToPlatform(
+            isWindows: true,
+            physicalKey: key,
+          ),
+          isTrue,
+        );
+      }
+    });
+
+    test('keeps ordinary keys inside the remote view', () {
+      expect(
+        shouldPassWindowsModifierToPlatform(
+          isWindows: true,
+          physicalKey: PhysicalKeyboardKey.keyA,
+        ),
+        isFalse,
+      );
+    });
+
+    test('does not change modifier routing on other platforms', () {
+      expect(
+        shouldPassWindowsModifierToPlatform(
+          isWindows: false,
+          physicalKey: PhysicalKeyboardKey.shiftLeft,
+        ),
+        isFalse,
+      );
+    });
+  });
+
   group('shouldReleaseStaleMobileShift', () {
     test('does not release when cached shift is already false', () {
       expect(

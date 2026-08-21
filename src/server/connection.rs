@@ -56,6 +56,8 @@ use serde_derive::Serialize;
 use serde_json::{json, value::Value};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use std::sync::atomic::Ordering;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::AtomicU64;
 use std::{
     collections::HashSet,
     net::Ipv6Addr,
@@ -72,6 +74,9 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 #[cfg(windows)]
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
+
+#[cfg(target_os = "windows")]
+static WINDOWS_LAYOUT_INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 lazy_static::lazy_static! {
     static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
@@ -196,7 +201,9 @@ enum MessageInput {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Mouse(InputMouse),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    Key((KeyEvent, bool)),
+    Key((KeyEvent, bool, u64)),
+    #[cfg(target_os = "windows")]
+    KeyboardLayout((String, u64)),
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Pointer((PointerDeviceEvent, i32)),
     BlockOn,
@@ -207,6 +214,37 @@ enum MessageInput {
     #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     BlockOffPlugin(String),
+}
+
+#[cfg(target_os = "windows")]
+fn windows_layout_modifier_label(event: &KeyEvent) -> Option<&'static str> {
+    let key = match &event.union {
+        Some(key_event::Union::ControlKey(key)) => match key.enum_value_or(ControlKey::Unknown) {
+            ControlKey::Alt => rdev::Key::Alt,
+            ControlKey::RAlt => rdev::Key::AltGr,
+            ControlKey::Control => rdev::Key::ControlLeft,
+            ControlKey::RControl => rdev::Key::ControlRight,
+            ControlKey::Shift => rdev::Key::ShiftLeft,
+            ControlKey::RShift => rdev::Key::ShiftRight,
+            _ => return None,
+        },
+        Some(key_event::Union::Chr(code)) => crate::keyboard::keycode_to_rdev_key(*code),
+        _ => return None,
+    };
+    match key {
+        rdev::Key::Alt => Some("alt-left"),
+        rdev::Key::AltGr => Some("alt-right"),
+        rdev::Key::ControlLeft => Some("control-left"),
+        rdev::Key::ControlRight => Some("control-right"),
+        rdev::Key::ShiftLeft => Some("shift-left"),
+        rdev::Key::ShiftRight => Some("shift-right"),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn next_windows_layout_input_sequence() -> u64 {
+    WINDOWS_LAYOUT_INPUT_SEQUENCE.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
@@ -1174,7 +1212,21 @@ impl Connection {
                             mouse_input.show_cursor,
                         );
                     }
-                    MessageInput::Key((mut msg, press)) => {
+                    MessageInput::Key((mut msg, press, layout_sequence)) => {
+                        #[cfg(target_os = "windows")]
+                        if layout_sequence != 0 {
+                            log::info!(
+                                "MD_LAYOUT stage=target-input-dequeue kind=modifier sequence={layout_sequence} key={} action={}",
+                                windows_layout_modifier_label(&msg).unwrap_or("unknown"),
+                                if press {
+                                    "press"
+                                } else if msg.down {
+                                    "down"
+                                } else {
+                                    "up"
+                                }
+                            );
+                        }
                         // Set the press state to false, use `down` only in `handle_key()`.
                         msg.press = false;
                         if press {
@@ -1185,6 +1237,13 @@ impl Connection {
                             msg.down = false;
                             handle_key(&msg);
                         }
+                    }
+                    #[cfg(target_os = "windows")]
+                    MessageInput::KeyboardLayout((klid, layout_sequence)) => {
+                        log::info!(
+                            "MD_LAYOUT stage=target-input-dequeue kind=layout sequence={layout_sequence} klid={klid}"
+                        );
+                        let _ = crate::portable_service::client::apply_keyboard_layout(&klid);
                     }
                     MessageInput::Pointer((msg, id)) => {
                         handle_pointer(&msg, id);
@@ -1833,10 +1892,15 @@ impl Connection {
         }
         pi.username = username;
         pi.sas_enabled = sas_enabled;
+        #[cfg(target_os = "windows")]
+        let safe_mode_reboot = crate::platform::is_cur_exe_the_installed();
+        #[cfg(not(target_os = "windows"))]
+        let safe_mode_reboot = false;
         pi.features = Some(Features {
             privacy_mode: privacy_mode::is_privacy_mode_supported(),
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
+            safe_mode_reboot,
             ..Default::default()
         })
         .into();
@@ -2187,7 +2251,28 @@ impl Connection {
     fn input_key(&self, msg: KeyEvent, press: bool) {
         // to-do: if is the legacy mode, and the key is function key "LockScreen".
         // Switch to the primary display.
-        self.tx_input.send(MessageInput::Key((msg, press))).ok();
+        #[cfg(target_os = "windows")]
+        let layout_sequence = if let Some(key) = windows_layout_modifier_label(&msg) {
+            let sequence = next_windows_layout_input_sequence();
+            log::info!(
+                "MD_LAYOUT stage=target-input-enqueue kind=modifier sequence={sequence} key={key} action={}",
+                if press {
+                    "press"
+                } else if msg.down {
+                    "down"
+                } else {
+                    "up"
+                }
+            );
+            sequence
+        } else {
+            0
+        };
+        #[cfg(not(target_os = "windows"))]
+        let layout_sequence = 0;
+        self.tx_input
+            .send(MessageInput::Key((msg, press, layout_sequence)))
+            .ok();
     }
 
     fn verify_h1(&self, h1: &[u8]) -> bool {
@@ -2291,7 +2376,7 @@ impl Connection {
     }
 
     fn validate_password(&mut self, allow_permanent_password: bool) -> bool {
-        if password::temporary_enabled() {
+        if password::temporary_enabled() && password::temporary_password_available_for_auth() {
             let password = password::temporary_password();
             if self.validate_password_plain(&password) {
                 self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::TemporaryPassword);
@@ -2310,11 +2395,19 @@ impl Connection {
                     log::info!("Permanent password accepted via logon-screen fallback");
                 }
             };
+            if let Some(machine_h1) = Config::machine_permanent_password_h1() {
+                if self.verify_h1(&machine_h1) {
+                    self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::PermanentPassword);
+                    print_fallback();
+                    return true;
+                }
+            }
             // Strictly check storage usability before auth so malformed encrypted/hash storage
-            // cannot fall back to being accepted as legacy plaintext.
+            // cannot fall back to being accepted as legacy plaintext. Machine-managed
+            // processes already checked their service-owned in-memory verifier above.
             let (local_storage, local_salt) =
                 Config::get_local_permanent_password_storage_and_salt();
-            if !local_storage.is_empty() {
+            if !Config::permanent_password_is_machine_managed() && !local_storage.is_empty() {
                 if local_permanent_password_storage_is_usable_for_auth(&local_storage, &local_salt)
                     && self.validate_password_storage(&local_storage)
                 {
@@ -2322,7 +2415,7 @@ impl Connection {
                     print_fallback();
                     return true;
                 }
-            } else {
+            } else if !Config::permanent_password_is_machine_managed() {
                 let (hard, salt) = Config::get_preset_password_storage_and_salt();
                 if preset_permanent_password_storage_is_usable_for_auth(&hard, &salt)
                     && self.validate_preset_password_storage(&hard, &salt)
@@ -3461,6 +3554,43 @@ impl Connection {
                         self.chat_unanswered = true;
                         self.update_auto_disconnect_timer();
                     }
+                    #[cfg(windows)]
+                    Some(misc::Union::KeyboardLayout(layout)) => {
+                        if self.keyboard && !self.disable_keyboard {
+                            // Key events are processed by tx_input. Put the exact
+                            // target in that same queue so it cannot overtake the
+                            // Alt/Ctrl/Shift releases which caused beta 11/12 to
+                            // flicker to the requested layout and immediately back.
+                            let klid = layout.klid;
+                            let layout_sequence = next_windows_layout_input_sequence();
+                            log::info!(
+                                "MD_LAYOUT stage=target-message-received sequence={layout_sequence} klid={klid} keyboard=true disable_keyboard=false"
+                            );
+                            if self
+                                .tx_input
+                                .send(MessageInput::KeyboardLayout((
+                                    klid.clone(),
+                                    layout_sequence,
+                                )))
+                                .is_ok()
+                            {
+                                log::info!(
+                                    "MD_LAYOUT stage=target-input-enqueue kind=layout sequence={layout_sequence} klid={klid}"
+                                );
+                            } else {
+                                log::warn!(
+                                    "MD_LAYOUT stage=target-input-enqueue-failed kind=layout klid={klid}"
+                                );
+                            }
+                        } else {
+                            log::warn!(
+                                "MD_LAYOUT stage=target-message-blocked klid={} keyboard={} disable_keyboard={}",
+                                layout.klid,
+                                self.keyboard,
+                                self.disable_keyboard
+                            );
+                        }
+                    }
                     Some(misc::Union::Option(o)) => {
                         if self.authed_conn_type() == Some(AuthConnType::Remote) {
                             self.update_options(&o).await;
@@ -3503,6 +3633,21 @@ impl Connection {
                             match system_shutdown::reboot() {
                                 Ok(_) => log::info!("Restart by the peer"),
                                 Err(e) => log::error!("Failed to restart: {}", e),
+                            }
+                        }
+                    }
+                    #[cfg(windows)]
+                    Some(misc::Union::RestartRemoteDeviceSafeMode(_)) => {
+                        if self.restart {
+                            if let Err(err) =
+                                crate::platform::windows::request_restart_in_safe_mode().await
+                            {
+                                log::error!("Failed to restart in Safe Mode: {err}");
+                                let mut response = Misc::new();
+                                response.set_restart_remote_device_error(err.to_string());
+                                let mut message = Message::new();
+                                message.set_misc(response);
+                                self.send(message).await;
                             }
                         }
                     }

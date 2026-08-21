@@ -240,6 +240,20 @@ async fn start_query_session_count(sender: std::sync::mpsc::Sender<Data>) {
     let mut last_count = 0;
     loop {
         if let Ok(mut c) = crate::ipc::connect(1000, "").await {
+            // The installed tray is the durable interactive-user presence
+            // across console/RDP transitions and reboots. Keep temporary
+            // password authentication available for exactly this IPC
+            // connection lifetime, even when the main window is closed and
+            // later reopened from the tray.
+            if c.send(&Data::Config((
+                "temporary-password-gui".to_owned(),
+                None,
+            )))
+            .await
+            .is_err()
+            {
+                continue;
+            }
             let mut timer = crate::rustdesk_interval(tokio::time::interval(Duration::from_secs(1)));
             loop {
                 tokio::select! {

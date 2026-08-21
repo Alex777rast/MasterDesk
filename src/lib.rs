@@ -1,4 +1,6 @@
 mod keyboard;
+#[cfg(target_os = "windows")]
+mod machine_password;
 /// cbindgen:ignore
 pub mod platform;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]

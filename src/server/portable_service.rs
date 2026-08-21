@@ -796,6 +796,11 @@ pub mod server {
                                             crate::input_service::handle_key_(&evt);
                                         }
                                     }
+                                    KeyboardLayout(klid) => {
+                                        if let Err(err) = crate::platform::windows::apply_keyboard_layout_klid(&klid) {
+                                            log::warn!("Failed to synchronize Windows keyboard layout in portable service: {err}");
+                                        }
+                                    }
                                     _ => {}
                                 },
                                 _ => {}
@@ -1509,6 +1514,12 @@ pub mod client {
         ipc_send(Data::DataPortableService(DataPortableService::Key(v)))
     }
 
+    fn apply_keyboard_layout_(klid: &str) -> ResultType<()> {
+        ipc_send(Data::DataPortableService(
+            DataPortableService::KeyboardLayout(klid.to_owned()),
+        ))
+    }
+
     pub fn create_capturer(
         current_display: usize,
         display: scrap::Display,
@@ -1570,6 +1581,24 @@ pub mod client {
         } else {
             crate::input_service::handle_key_(evt);
         }
+    }
+
+    pub fn apply_keyboard_layout(klid: &str) -> ResultType<()> {
+        let result = if RUNNING.lock().unwrap().clone() {
+            log::info!(
+                "MD_LAYOUT stage=target-apply-route klid={klid} route=portable-service-ipc"
+            );
+            apply_keyboard_layout_(klid)
+        } else {
+            log::info!("MD_LAYOUT stage=target-apply-route klid={klid} route=interactive-server");
+            crate::platform::windows::apply_keyboard_layout_klid(klid)
+        };
+        if let Err(err) = result.as_ref() {
+            log::warn!("MD_LAYOUT stage=target-apply-failed klid={klid} error={err}");
+        } else {
+            log::info!("MD_LAYOUT stage=target-apply-complete klid={klid}");
+        }
+        result
     }
 
     pub fn running() -> bool {

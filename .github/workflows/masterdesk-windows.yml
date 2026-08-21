@@ -23,6 +23,9 @@ env:
 
 jobs:
   build:
+    # Tested beta packages are published manually with their original filename
+    # and checksum. Do not rebuild and overwrite them when their tag appears.
+    if: ${{ !contains(github.ref_name, '-beta.') }}
     name: Build, test and publish Windows x64
     runs-on: windows-2022
     timeout-minutes: 120

@@ -25,7 +25,10 @@ use std::{
     mem,
     os::{
         raw::c_ulong,
-        windows::{ffi::OsStringExt, process::CommandExt},
+        windows::{
+            ffi::{OsStrExt, OsStringExt},
+            process::CommandExt,
+        },
     },
     path::*,
     ptr::null_mut,
@@ -46,14 +49,15 @@ use winapi::{
         },
         minwinbase::STILL_ACTIVE,
         processthreadsapi::{
-            GetCurrentProcess, GetCurrentProcessId, GetExitCodeProcess, GetProcessId, OpenProcess,
-            OpenProcessToken, ProcessIdToSessionId, TerminateProcess, PROCESS_INFORMATION,
-            STARTUPINFOW,
+            GetCurrentProcess, GetCurrentProcessId, GetCurrentThreadId, GetExitCodeProcess,
+            GetProcessId, OpenProcess, OpenProcessToken, ProcessIdToSessionId, TerminateProcess,
+            PROCESS_INFORMATION, STARTUPINFOW,
         },
         securitybaseapi::{
             AllocateAndInitializeSid, DuplicateToken, EqualSid, FreeSid, GetTokenInformation,
         },
         shellapi::ShellExecuteW,
+        synchapi::{CreateEventW, OpenEventW, SetEvent, WaitForSingleObject},
         sysinfoapi::{GetNativeSystemInfo, SYSTEM_INFO},
         winbase::*,
         wingdi::*,
@@ -62,7 +66,8 @@ use winapi::{
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
             ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
             PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
-            TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
+            EVENT_MODIFY_STATE, SYNCHRONIZE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY,
+            TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -101,7 +106,8 @@ use winreg::{enums::*, RegKey};
 mod acl;
 pub(crate) use acl::current_process_user_sid_string;
 pub use acl::{
-    set_path_permission, set_path_permission_for_portable_service_shmem_dir,
+    set_path_permission, set_path_permission_for_machine_secret,
+    set_path_permission_for_portable_service_shmem_dir,
     set_path_permission_for_portable_service_shmem_file,
     validate_path_for_portable_service_shmem_dir,
 };
@@ -113,6 +119,14 @@ pub const SET_FOREGROUND_WINDOW: &'static str = "SET_FOREGROUND_WINDOW";
 const REG_NAME_INSTALL_DESKTOPSHORTCUTS: &str = "DESKTOPSHORTCUTS";
 const REG_NAME_INSTALL_STARTMENUSHORTCUTS: &str = "STARTMENUSHORTCUTS";
 pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
+const SERVER_HANDOFF_ARG: &str = "--handoff-events";
+const SERVER_HANDOFF_READY_TIMEOUT_MS: DWORD = 5_000;
+const SERVER_HANDOFF_GO_TIMEOUT_MS: DWORD = 10_000;
+const SAFE_MODE_NETWORK_REG_PATH: &str =
+    r"SYSTEM\CurrentControlSet\Control\SafeBoot\Network";
+const SAFE_MODE_REBOOT_MARKER_PATH: &str = r"SOFTWARE\MasterDesk\SafeModeReboot";
+const SAFE_MODE_REBOOT_PHASE_ARMED: u32 = 1;
+const SAFE_MODE_REBOOT_PHASE_STARTED: u32 = 2;
 
 pub fn get_focused_display(displays: Vec<DisplayInfo>) -> Option<usize> {
     unsafe {
@@ -675,8 +689,19 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     // Tell the system that the service is running now
     status_handle.set_service_status(next_status)?;
 
+    // A Safe Mode reboot is one-shot. As soon as the service is alive in the
+    // Safe Mode with Networking boot, remove the BCD flag so the next reboot
+    // returns to normal Windows. Custom SafeBoot entries are removed after
+    // that following normal startup, not while this service still needs them.
+    if let Err(err) = reconcile_safe_mode_reboot_state() {
+        log::error!("Failed to reconcile Safe Mode reboot state: {err}");
+    }
+
     let mut session_id = unsafe { get_current_session(share_rdp()) };
     log::info!("session id {}", session_id);
+    // Bind the protected service endpoint before launching `--server`; beta 7
+    // synchronizes the machine password verifier during server startup.
+    let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut h_process = NULL;
     if let Err(err) = replace_server_process(&mut h_process, session_id).await {
         log::error!(
@@ -685,7 +710,6 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
             err
         );
     }
-    let mut incoming = ipc::new_listener(crate::POSTFIX_SERVICE).await?;
     let mut stored_usid = None;
     loop {
         let sids: Vec<_> = get_available_sessions(false)
@@ -732,6 +756,20 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                             ipc::Data::SAS => {
                                 send_sas();
                             }
+                            ipc::Data::SafeModeRestart(None) => {
+                                let error = match restart_in_safe_mode() {
+                                    Ok(()) => String::new(),
+                                    Err(err) => {
+                                        log::error!(
+                                            "Failed to restart in Safe Mode from the service: {err}"
+                                        );
+                                        err.to_string()
+                                    }
+                                };
+                                allow_err!(
+                                    stream.send(&ipc::Data::SafeModeRestart(Some(error))).await
+                                );
+                            }
                             ipc::Data::UserSid(usid) => {
                                 if let Some(usid) = usid {
                                     if session_id != usid {
@@ -751,6 +789,84 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
                                                 err
                                             );
                                         }
+                                    }
+                                }
+                            }
+                            ipc::Data::Config((name, value))
+                                if name == "machine-permanent-password-state" =>
+                            {
+                                let state = match crate::machine_password::load() {
+                                    Ok(Some(payload)) => match payload.h1() {
+                                        Ok(Some(_)) => "Y",
+                                        Ok(None) => "N",
+                                        Err(err) => {
+                                            log::error!(
+                                                "Failed to validate machine permanent password state: {err}"
+                                            );
+                                            "E"
+                                        }
+                                    },
+                                    Ok(None) => "N",
+                                    Err(err) => {
+                                        log::error!(
+                                            "Failed to load machine permanent password state: {err}"
+                                        );
+                                        "E"
+                                    }
+                                };
+                                allow_err!(
+                                    stream
+                                        .send(&ipc::Data::Config((name, Some(state.to_owned()))))
+                                        .await
+                                );
+                            }
+                            ipc::Data::Config((name, Some(password)))
+                                if name == "machine-permanent-password-set" =>
+                            {
+                                let accepted = match crate::machine_password::set_plain(&password) {
+                                    Ok(_) => true,
+                                    Err(err) => {
+                                        log::error!(
+                                            "Failed to update machine permanent password store: {err}"
+                                        );
+                                        false
+                                    }
+                                };
+                                allow_err!(
+                                    stream
+                                        .send(&ipc::Data::Config((
+                                            name,
+                                            Some(if accepted { "Y" } else { "N" }.to_owned())
+                                        )))
+                                        .await
+                                );
+                            }
+                            ipc::Data::Config((name, Some(request)))
+                                if name == "machine-permanent-password-sync" =>
+                            {
+                                let response = (|| -> ResultType<String> {
+                                    let legacy: Option<
+                                        crate::machine_password::MachinePasswordPayload,
+                                    > = serde_json::from_str(&request)?;
+                                    let payload =
+                                        crate::machine_password::initialize_if_missing(legacy)?;
+                                    Ok(serde_json::to_string(&payload)?)
+                                })();
+                                match response {
+                                    Ok(response) => {
+                                        allow_err!(
+                                            stream
+                                                .send(&ipc::Data::Config((name, Some(response))))
+                                                .await
+                                        );
+                                    }
+                                    Err(err) => {
+                                        log::error!(
+                                            "Failed to synchronize machine permanent password: {err}"
+                                        );
+                                        allow_err!(
+                                            stream.send(&ipc::Data::Config((name, None))).await
+                                        );
                                     }
                                 }
                             }
@@ -816,15 +932,29 @@ async fn run_service(_arguments: Vec<OsString>) -> ResultType<()> {
     Ok(())
 }
 
-async fn launch_server(session_id: DWORD, close_first: bool) -> ResultType<HANDLE> {
+async fn launch_server(
+    session_id: DWORD,
+    close_first: bool,
+    handoff_events: Option<(&str, &str)>,
+) -> ResultType<HANDLE> {
     if close_first {
         // in case started some elsewhere
         send_close_async("").await.ok();
     }
-    let cmd = format!(
-        "\"{}\" --server",
-        std::env::current_exe()?.to_str().unwrap_or("")
-    );
+    let cmd = if let Some((ready_event, go_event)) = handoff_events {
+        format!(
+            "\"{}\" --server {} \"{}\" \"{}\"",
+            std::env::current_exe()?.to_str().unwrap_or(""),
+            SERVER_HANDOFF_ARG,
+            ready_event,
+            go_event
+        )
+    } else {
+        format!(
+            "\"{}\" --server",
+            std::env::current_exe()?.to_str().unwrap_or("")
+        )
+    };
     launch_privileged_process(session_id, &cmd)
 }
 
@@ -877,10 +1007,62 @@ async fn stop_server_process(h_process: &mut HANDLE) {
 }
 
 async fn replace_server_process(h_process: &mut HANDLE, session_id: DWORD) -> ResultType<()> {
-    stop_server_process(h_process).await;
+    let old_process_running = if h_process.is_null() {
+        false
+    } else {
+        let mut exit_code: DWORD = 0;
+        unsafe { GetExitCodeProcess(*h_process, &mut exit_code) == TRUE && exit_code == STILL_ACTIVE }
+    };
+    if !old_process_running {
+        stop_server_process(h_process).await;
+    }
+    let event_suffix = format!(
+        "{}-{:08x}",
+        std::process::id(),
+        hbb_common::rand::random::<u32>()
+    );
+    let ready_event_name = format!("Global\\MasterDeskServerReady-{event_suffix}");
+    let go_event_name = format!("Global\\MasterDeskServerGo-{event_suffix}");
+    let (ready_event, go_event) = if old_process_running {
+        let ready_name = wide_string(&ready_event_name);
+        let go_name = wide_string(&go_event_name);
+        let ready = unsafe { CreateEventW(null_mut(), TRUE, FALSE, ready_name.as_ptr()) };
+        let go = unsafe { CreateEventW(null_mut(), TRUE, FALSE, go_name.as_ptr()) };
+        if ready.is_null() || go.is_null() {
+            if !ready.is_null() {
+                unsafe { CloseHandle(ready) };
+            }
+            if !go.is_null() {
+                unsafe { CloseHandle(go) };
+            }
+            bail!("Failed to create protected --server handoff events");
+        }
+        (ready, go)
+    } else {
+        (NULL, NULL)
+    };
 
-    let new_process = launch_server(session_id, false).await?;
+    let handoff_names = old_process_running
+        .then_some((ready_event_name.as_str(), go_event_name.as_str()));
+    let new_process = match launch_server(session_id, false, handoff_names).await {
+        Ok(process) => process,
+        Err(err) => {
+            if !ready_event.is_null() {
+                unsafe { CloseHandle(ready_event) };
+            }
+            if !go_event.is_null() {
+                unsafe { CloseHandle(go_event) };
+            }
+            return Err(err);
+        }
+    };
     if new_process.is_null() {
+        if !ready_event.is_null() {
+            unsafe { CloseHandle(ready_event) };
+        }
+        if !go_event.is_null() {
+            unsafe { CloseHandle(go_event) };
+        }
         bail!("CreateProcessAsUserW returned a null process handle");
     }
 
@@ -892,6 +1074,12 @@ async fn replace_server_process(h_process: &mut HANDLE, session_id: DWORD) -> Re
         unsafe {
             TerminateProcess(new_process, 1);
             CloseHandle(new_process);
+            if !ready_event.is_null() {
+                CloseHandle(ready_event);
+            }
+            if !go_event.is_null() {
+                CloseHandle(go_event);
+            }
         }
         bail!(
             "launched --server pid {} in session {:?}, expected session {}",
@@ -901,12 +1089,83 @@ async fn replace_server_process(h_process: &mut HANDLE, session_id: DWORD) -> Re
         );
     }
 
+    if old_process_running {
+        let ready = unsafe { WaitForSingleObject(ready_event, SERVER_HANDOFF_READY_TIMEOUT_MS) };
+        if ready != WAIT_OBJECT_0 {
+            unsafe {
+                TerminateProcess(new_process, 1);
+                CloseHandle(new_process);
+                CloseHandle(ready_event);
+                CloseHandle(go_event);
+            }
+            bail!(
+                "replacement --server did not reach handoff standby in {} ms",
+                SERVER_HANDOFF_READY_TIMEOUT_MS
+            );
+        }
+        stop_server_process(h_process).await;
+        if unsafe { SetEvent(go_event) } == FALSE {
+            unsafe {
+                TerminateProcess(new_process, 1);
+                CloseHandle(new_process);
+                CloseHandle(ready_event);
+                CloseHandle(go_event);
+            }
+            bail!("Failed to release replacement --server from handoff standby");
+        }
+        unsafe {
+            CloseHandle(ready_event);
+            CloseHandle(go_event);
+        }
+    }
+
     log::info!(
         "Started --server pid {} in Windows session {} on winsta0\\default",
         process_id,
         actual_session_id
     );
     *h_process = new_process;
+    Ok(())
+}
+
+/// Called by a prelaunched replacement `--server` before it opens the main IPC
+/// listener. It proves that the process reached the correct executable branch,
+/// then waits until the service has retired the previous desktop server.
+pub fn wait_for_server_handoff_if_requested(args: &[String]) -> ResultType<()> {
+    if args.len() < 4 || args[1] != SERVER_HANDOFF_ARG {
+        return Ok(());
+    }
+    let ready_name = wide_string(&args[2]);
+    let go_name = wide_string(&args[3]);
+    let ready = unsafe { OpenEventW(EVENT_MODIFY_STATE, FALSE, ready_name.as_ptr()) };
+    let go = unsafe { OpenEventW(SYNCHRONIZE, FALSE, go_name.as_ptr()) };
+    if ready.is_null() || go.is_null() {
+        if !ready.is_null() {
+            unsafe { CloseHandle(ready) };
+        }
+        if !go.is_null() {
+            unsafe { CloseHandle(go) };
+        }
+        bail!("Failed to open service-created --server handoff events");
+    }
+    if unsafe { SetEvent(ready) } == FALSE {
+        unsafe {
+            CloseHandle(ready);
+            CloseHandle(go);
+        }
+        bail!("Failed to signal --server handoff readiness");
+    }
+    let released = unsafe { WaitForSingleObject(go, SERVER_HANDOFF_GO_TIMEOUT_MS) };
+    unsafe {
+        CloseHandle(ready);
+        CloseHandle(go);
+    }
+    if released != WAIT_OBJECT_0 {
+        bail!(
+            "Service did not release --server handoff within {} ms",
+            SERVER_HANDOFF_GO_TIMEOUT_MS
+        );
+    }
     Ok(())
 }
 
@@ -1460,6 +1719,14 @@ pub fn get_install_info() -> (String, String, String, String) {
     get_install_info_with_subkey(get_valid_subkey())
 }
 
+fn application_display_version() -> String {
+    if crate::common::is_custom_client() {
+        crate::custom_defaults::build_display_version()
+    } else {
+        crate::VERSION.replace("-", ".")
+    }
+}
+
 fn get_default_install_info() -> (String, String, String, String) {
     get_install_info_with_subkey(get_subkey(&crate::get_app_name(), false))
 }
@@ -1541,14 +1808,30 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
 }
 
 pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String> {
+    let source_dir = PathBuf::from(src_raw)
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {src_raw}"))?
+        .to_string_lossy()
+        .to_string();
+    let runtime_checks = |root: &str| {
+        if cfg!(feature = "flutter") {
+            format!(
+                r#"if not exist "{root}\flutter_windows.dll" exit /b 1
+if not exist "{root}\data\app.so" exit /b 1
+if not exist "{root}\data\icudtl.dat" exit /b 1
+if not exist "{root}\data\flutter_assets\AssetManifest.bin" exit /b 1"#
+            )
+        } else {
+            String::new()
+        }
+    };
     let main_raw = format!(
-        "XCOPY \"{}\" \"{}\" /Y /E /H /C /I /K /R /Z",
-        PathBuf::from(src_raw)
-            .parent()
-            .ok_or(anyhow!("Can't get parent directory of {src_raw}"))?
-            .to_string_lossy()
-            .to_string(),
-        _path
+        r#"{source_checks}
+XCOPY "{source_dir}" "{_path}" /Y /E /H /I /K /R /Z
+if errorlevel 1 exit /b 1
+{destination_checks}"#,
+        source_checks = runtime_checks(&source_dir),
+        destination_checks = runtime_checks(_path),
     );
     return Ok(main_raw);
 }
@@ -1659,6 +1942,7 @@ fn get_after_install(
 }
 
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
+    clear_stale_stop_service_for_portable();
     let uninstall_str = get_uninstall(false, false);
     let mut path = path.trim_end_matches('\\').to_owned();
     let (subkey, _path, start_menu, exe) = get_default_install_info();
@@ -1838,8 +2122,8 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
 {sleep}
     ",
         display_icon = get_custom_icon(&path, &cur_exe).unwrap_or(exe.to_string()),
-        version = crate::VERSION.replace("-", "."),
-        build_date = crate::BUILD_DATE,
+        version = application_display_version(),
+        build_date = crate::custom_defaults::CUSTOM_BUILD_DATE,
         after_install = get_after_install(
             &exe,
             Some(reg_value_start_menu_shortcuts),
@@ -1853,7 +2137,18 @@ copy /Y \"{tmp_path}\\Uninstall {app_name}.lnk\" \"{path}\\\"
         import_config = get_import_config(&exe),
     );
     run_cmds(cmds, debug, "install")?;
-    run_after_run_cmds(silent);
+    let exit_portable_after_install = !is_cur_exe_the_installed();
+    run_after_run_cmds(silent, exit_portable_after_install);
+    if exit_portable_after_install {
+        // The portable GUI owns the main IPC pipe while installation is in
+        // progress. Keeping it alive makes the newly installed service and GUI
+        // fail the executable-identity check, leaving only background
+        // processes and no usable window. The delayed installed-app launch is
+        // already scheduled by `run_after_run_cmds`, so release the portable
+        // IPC owner before that launch occurs.
+        log::info!("Installation completed; exiting the portable IPC owner.");
+        std::process::exit(0);
+    }
     Ok(())
 }
 
@@ -1867,6 +2162,7 @@ pub fn run_after_install() -> ResultType<()> {
 }
 
 pub fn run_before_uninstall() -> ResultType<()> {
+    Config::set_option("stop-service".into(), "".into());
     run_cmds(get_before_uninstall(true), true, "before_install")
 }
 
@@ -1941,6 +2237,7 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
 }
 
 pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
+    Config::set_option("stop-service".into(), "".into());
     run_cmds(get_uninstall(kill_self, true), true, "uninstall")
 }
 
@@ -2057,6 +2354,292 @@ pub fn add_recent_document(path: &str) {
 pub fn is_installed() -> bool {
     let (_, _, _, exe) = get_install_info();
     std::fs::metadata(exe).is_ok()
+}
+
+#[inline]
+fn should_clear_stale_stop_service(installed: bool, stop_service: &str) -> bool {
+    !installed && stop_service == "Y"
+}
+
+/// A full uninstall removes the Windows service, so a later no-argument
+/// portable launch must not inherit the old per-user "service stopped" state.
+pub fn clear_stale_stop_service_for_portable() {
+    let stop_service = Config::get_option("stop-service");
+    if should_clear_stale_stop_service(is_installed(), &stop_service) {
+        log::info!("Clearing stale stop-service state for standalone portable mode");
+        Config::set_option("stop-service".into(), "".into());
+    }
+}
+
+fn safe_mode_network_entries(app_name: &str) -> Vec<(String, &'static str)> {
+    vec![
+        (app_name.to_owned(), "Service"),
+        // Windows Safe Mode with Networking normally contains these entries.
+        // Ensure they exist because WlanSvc is the supported Wi-Fi manager and
+        // depends on the other three services/drivers on current Windows 10/11.
+        ("WlanSvc".to_owned(), "Service"),
+        ("Wcmsvc".to_owned(), "Service"),
+        ("Ndisuio".to_owned(), "Service"),
+        ("nativewifip".to_owned(), "Service"),
+    ]
+}
+
+fn bcdedit_path() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+        .join("bcdedit.exe")
+}
+
+fn run_bcdedit(arguments: &[&str]) -> ResultType<()> {
+    let output = std::process::Command::new(bcdedit_path())
+        .args(arguments)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| anyhow!("Failed to start bcdedit: {err}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let details = String::from_utf8_lossy(&output.stderr)
+        .trim()
+        .chars()
+        .take(400)
+        .collect::<String>();
+    bail!(
+        "bcdedit failed with exit code {}{}{}",
+        output.status.code().unwrap_or(-1),
+        if details.is_empty() { "" } else { ": " },
+        details
+    )
+}
+
+fn bcd_output_has_safeboot(output: &str) -> bool {
+    output.lines().any(|line| {
+        line.split_whitespace()
+            .next()
+            .map(|name| name.eq_ignore_ascii_case("safeboot"))
+            .unwrap_or(false)
+    })
+}
+
+fn current_bcd_has_safeboot() -> ResultType<bool> {
+    let output = std::process::Command::new(bcdedit_path())
+        .args(["/enum", "{current}"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|err| anyhow!("Failed to query bcdedit: {err}"))?;
+    if !output.status.success() {
+        bail!(
+            "bcdedit query failed with exit code {}",
+            output.status.code().unwrap_or(-1)
+        );
+    }
+    Ok(bcd_output_has_safeboot(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn ensure_safe_mode_network_entries() -> ResultType<Vec<String>> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let planned = safe_mode_network_entries(&crate::get_app_name());
+    let mut missing = Vec::new();
+    for (name, kind) in &planned {
+        let path = format!(r"{}\{}", SAFE_MODE_NETWORK_REG_PATH, name);
+        // Existing SafeBoot entries only need validation. Requesting write access
+        // to every built-in child can fail even for LocalSystem on hardened hosts.
+        match hklm.open_subkey_with_flags(&path, KEY_READ) {
+            Ok(key) => {
+                let value = key.get_value::<String, _>("").unwrap_or_default();
+                if !value.eq_ignore_ascii_case(kind) {
+                    bail!("Unexpected SafeBoot value for {name}");
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                missing.push((name.clone(), *kind));
+            }
+            Err(err) => bail!("Failed to inspect SafeBoot entry {name}: {err}"),
+        }
+    }
+
+    let mut created = Vec::new();
+    for (name, kind) in missing {
+        let path = format!(r"{}\{}", SAFE_MODE_NETWORK_REG_PATH, name);
+        let create_result = hklm.create_subkey(&path).and_then(|(key, disposition)| {
+            key.set_value("", &kind)?;
+            Ok(disposition)
+        });
+        if let Err(err) = create_result {
+            remove_created_safe_mode_entries(&created).ok();
+            bail!("Failed to create SafeBoot entry {name}: {err}");
+        }
+        created.push(name);
+    }
+    Ok(created)
+}
+
+fn write_safe_mode_marker(phase: u32, created_entries: &[String]) -> ResultType<()> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let (marker, _) = hklm
+        .create_subkey(SAFE_MODE_REBOOT_MARKER_PATH)
+        .map_err(|err| anyhow!("Failed to create Safe Mode reboot marker: {err}"))?;
+    marker
+        .set_value("Phase", &phase)
+        .map_err(|err| anyhow!("Failed to write Safe Mode reboot phase: {err}"))?;
+    marker
+        .set_value("CreatedEntries", &created_entries.join("|"))
+        .map_err(|err| anyhow!("Failed to write Safe Mode reboot entries: {err}"))?;
+    Ok(())
+}
+
+fn read_safe_mode_marker() -> ResultType<Option<(u32, Vec<String>)>> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    let marker = match hklm.open_subkey_with_flags(SAFE_MODE_REBOOT_MARKER_PATH, KEY_READ) {
+        Ok(marker) => marker,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let phase = marker.get_value::<u32, _>("Phase")?;
+    let created = marker
+        .get_value::<String, _>("CreatedEntries")
+        .unwrap_or_default()
+        .split('|')
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect();
+    Ok(Some((phase, created)))
+}
+
+fn remove_safe_mode_marker() -> ResultType<()> {
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    match hklm.delete_subkey_all(SAFE_MODE_REBOOT_MARKER_PATH) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn remove_created_safe_mode_entries(created_entries: &[String]) -> ResultType<()> {
+    let allowed = safe_mode_network_entries(&crate::get_app_name())
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect::<Vec<_>>();
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    for name in created_entries {
+        if !allowed.iter().any(|allowed_name| allowed_name == name) {
+            log::warn!("Ignoring unexpected SafeBoot cleanup entry: {name}");
+            continue;
+        }
+        let path = format!(r"{}\{}", SAFE_MODE_NETWORK_REG_PATH, name);
+        match hklm.delete_subkey_all(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+    }
+    Ok(())
+}
+
+fn rollback_safe_mode_reboot(created_entries: &[String]) {
+    if let Err(err) = run_bcdedit(&["/deletevalue", "{current}", "safeboot"]) {
+        log::warn!("Failed to clear Safe Mode BCD during rollback: {err}");
+    }
+    if let Err(err) = remove_created_safe_mode_entries(created_entries) {
+        log::warn!("Failed to remove SafeBoot entries during rollback: {err}");
+    }
+    if let Err(err) = remove_safe_mode_marker() {
+        log::warn!("Failed to remove Safe Mode reboot marker during rollback: {err}");
+    }
+}
+
+fn validate_safe_mode_reboot_service() -> ResultType<()> {
+    if !is_cur_exe_the_installed() {
+        bail!("Safe Mode restart requires the installed MasterDesk service");
+    }
+    let services = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
+        r"SYSTEM\CurrentControlSet\Services",
+        KEY_READ,
+    )?;
+    let service = services.open_subkey_with_flags(crate::get_app_name(), KEY_READ)?;
+    let image_path = service.get_value::<String, _>("ImagePath")?;
+    let (_, _, _, installed_executable) = get_install_info();
+    let image_path = image_path.to_ascii_lowercase();
+    if !image_path.contains("--service")
+        || !image_path.contains(&installed_executable.to_ascii_lowercase())
+    {
+        bail!("MasterDesk service command line is invalid");
+    }
+    Ok(())
+}
+
+/// Prepares a one-shot Safe Mode with Networking boot and restarts Windows.
+/// This is intentionally available only from an installed MasterDesk service.
+pub fn restart_in_safe_mode() -> ResultType<()> {
+    validate_safe_mode_reboot_service()?;
+    if current_bcd_has_safeboot()? {
+        bail!("Windows boot is already configured for Safe Mode");
+    }
+    let created_entries = ensure_safe_mode_network_entries()?;
+    if let Err(err) = write_safe_mode_marker(SAFE_MODE_REBOOT_PHASE_ARMED, &created_entries) {
+        remove_created_safe_mode_entries(&created_entries).ok();
+        return Err(err);
+    }
+    if let Err(err) = run_bcdedit(&["/set", "{current}", "safeboot", "network"]) {
+        rollback_safe_mode_reboot(&created_entries);
+        return Err(err);
+    }
+    if let Err(err) = system_shutdown::force_reboot() {
+        rollback_safe_mode_reboot(&created_entries);
+        bail!("Failed to restart Windows: {err}");
+    }
+    Ok(())
+}
+
+pub async fn request_restart_in_safe_mode() -> ResultType<()> {
+    let mut service = ipc::connect_service(2_000)
+        .await
+        .map_err(|err| anyhow!("MasterDesk service is unavailable: {err}"))?;
+    service.send(&ipc::Data::SafeModeRestart(None)).await?;
+    match service.next_timeout(10_000).await? {
+        Some(ipc::Data::SafeModeRestart(Some(error))) if error.is_empty() => Ok(()),
+        Some(ipc::Data::SafeModeRestart(Some(error))) => bail!(error),
+        _ => bail!("MasterDesk service returned an invalid Safe Mode restart response"),
+    }
+}
+
+#[inline]
+fn is_windows_safe_mode(clean_boot_metric: i32) -> bool {
+    clean_boot_metric != 0
+}
+
+fn reconcile_safe_mode_reboot_state() -> ResultType<()> {
+    let Some((phase, created_entries)) = read_safe_mode_marker()? else {
+        return Ok(());
+    };
+    let safe_mode = is_windows_safe_mode(unsafe { GetSystemMetrics(SM_CLEANBOOT) });
+    match (phase, safe_mode) {
+        (SAFE_MODE_REBOOT_PHASE_ARMED, true) => {
+            run_bcdedit(&["/deletevalue", "{current}", "safeboot"])?;
+            write_safe_mode_marker(SAFE_MODE_REBOOT_PHASE_STARTED, &created_entries)?;
+            log::info!("Safe Mode boot is active; next restart restored to normal boot");
+        }
+        (SAFE_MODE_REBOOT_PHASE_ARMED, false) => {
+            // The service restarted before Windows entered Safe Mode. Treat the
+            // plan as abandoned so a later unrelated reboot cannot enter it.
+            rollback_safe_mode_reboot(&created_entries);
+        }
+        (SAFE_MODE_REBOOT_PHASE_STARTED, false) => {
+            remove_created_safe_mode_entries(&created_entries)?;
+            remove_safe_mode_marker()?;
+            log::info!("Safe Mode reboot cleanup completed after normal startup");
+        }
+        (SAFE_MODE_REBOOT_PHASE_STARTED, true) => {}
+        _ => {
+            rollback_safe_mode_reboot(&created_entries);
+            bail!("Invalid Safe Mode reboot marker phase");
+        }
+    }
+    Ok(())
 }
 
 pub fn get_reg(name: &str) -> String {
@@ -3207,6 +3790,263 @@ pub fn get_char_from_vk(vk: u32) -> Option<char> {
     get_char_from_unicode(get_unicode_from_vk(vk)?)
 }
 
+/// Returns the KLID selected by the foreground Windows thread (for example
+/// `00000409`). This is sampled after Windows has processed Alt+Shift/Ctrl+Shift.
+pub fn foreground_keyboard_layout_klid() -> ResultType<String> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        bail!("No foreground window while reading keyboard layout");
+    }
+    keyboard_layout_klid_for_window(foreground as usize)
+}
+
+/// Captures the current foreground window together with its thread layout.
+/// The handle lets the caller keep observing the same viewer window while the
+/// Windows language flyout or another transient window briefly takes focus.
+pub fn foreground_keyboard_layout_context() -> ResultType<(usize, String)> {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        bail!("No foreground window while reading keyboard layout");
+    }
+    let handle = foreground as usize;
+    Ok((handle, keyboard_layout_klid_for_window(handle)?))
+}
+
+pub fn keyboard_layout_klid_for_window(window_handle: usize) -> ResultType<String> {
+    if window_handle == 0 {
+        bail!("Invalid window while reading keyboard layout");
+    }
+    let thread_id = unsafe { GetWindowThreadProcessId(window_handle as HWND, null_mut()) };
+    if thread_id == 0 {
+        bail!("Failed to resolve window thread while reading keyboard layout");
+    }
+    let layout = unsafe { GetKeyboardLayout(thread_id) };
+    if layout.is_null() {
+        bail!("Window thread has no keyboard layout");
+    }
+    Ok(canonical_keyboard_layout_klid_from_runtime_hkl(
+        layout as usize,
+    ))
+}
+
+#[inline]
+pub fn current_process_owns_foreground_window() -> bool {
+    let foreground = unsafe { GetForegroundWindow() };
+    if foreground.is_null() {
+        return false;
+    }
+    let mut process_id = 0;
+    unsafe { GetWindowThreadProcessId(foreground, &mut process_id) };
+    process_id == unsafe { GetCurrentProcessId() }
+}
+
+fn canonical_keyboard_layout_klid_from_runtime_hkl(layout: usize) -> String {
+    format!("{:08X}", layout & 0xFFFF)
+}
+
+fn normalized_keyboard_layout_klid(klid: &str) -> ResultType<String> {
+    let normalized = klid.trim().to_ascii_uppercase();
+    if normalized.len() != 8 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Invalid Windows keyboard layout KLID");
+    }
+    let value = u32::from_str_radix(&normalized, 16)?;
+    let language_id = value & 0xFFFF;
+    // Beta 18 sent a runtime HKL such as 04190419 instead of the loadable
+    // KLID 00000419. Preserve real variant KLIDs (for example 00010409), but
+    // normalize the common repeated-language runtime form for compatibility.
+    if value >> 16 == language_id {
+        Ok(format!("{language_id:08X}"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+#[inline]
+fn keyboard_layout_requires_input_desktop(locked: bool, logon_ui: bool) -> bool {
+    locked || logon_ui
+}
+
+fn current_thread_desktop_name() -> String {
+    unsafe {
+        let desktop = GetThreadDesktop(GetCurrentThreadId());
+        if desktop.is_null() {
+            return "unavailable".to_owned();
+        }
+        let mut required = 0;
+        let _ = GetUserObjectInformationW(
+            desktop as *mut c_void,
+            UOI_NAME as i32,
+            null_mut(),
+            0,
+            &mut required,
+        );
+        if required == 0 {
+            return "unknown".to_owned();
+        }
+        let mut buffer = vec![0_u16; (required as usize + 1) / 2];
+        if GetUserObjectInformationW(
+            desktop as *mut c_void,
+            UOI_NAME as i32,
+            buffer.as_mut_ptr() as *mut c_void,
+            required,
+            &mut required,
+        ) == FALSE
+        {
+            return "unknown".to_owned();
+        }
+        let length = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+        OsString::from_wide(&buffer[..length])
+            .to_string_lossy()
+            .into_owned()
+    }
+}
+
+fn log_keyboard_layout_apply_context(stage: &str, requested_klid: &str) {
+    let foreground = unsafe { GetForegroundWindow() };
+    let mut foreground_process_id = 0;
+    let foreground_thread_id = if foreground.is_null() {
+        0
+    } else {
+        unsafe { GetWindowThreadProcessId(foreground, &mut foreground_process_id) }
+    };
+    let current_klid = if foreground_thread_id == 0 {
+        "unavailable".to_owned()
+    } else {
+        let layout = unsafe { GetKeyboardLayout(foreground_thread_id) };
+        if layout.is_null() {
+            "unavailable".to_owned()
+        } else {
+            format!("{:08X}", (layout as usize & 0xFFFF_FFFF) as u32)
+        }
+    };
+    log::info!(
+        "MD_LAYOUT stage={stage} requested_klid={requested_klid} process_id={} session_id={} desktop={} foreground_hwnd={} foreground_thread_id={foreground_thread_id} foreground_process_id={foreground_process_id} foreground_klid={current_klid}",
+        unsafe { GetCurrentProcessId() },
+        get_current_process_session_id()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_owned()),
+        current_thread_desktop_name(),
+        foreground as usize,
+    );
+}
+
+fn apply_keyboard_layout_klid_on_current_desktop(klid: &str) -> ResultType<()> {
+    log_keyboard_layout_apply_context("target-apply-before-load", klid);
+    let wide: Vec<u16> = std::ffi::OsStr::new(klid)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let layout = unsafe { LoadKeyboardLayoutW(wide.as_ptr(), KLF_ACTIVATE) };
+    if layout.is_null() {
+        bail!(
+            "Windows keyboard layout {} is unavailable: {}",
+            klid,
+            io::Error::last_os_error()
+        );
+    }
+    let target = layout as usize & 0xFFFF_FFFF;
+    log::info!(
+        "MD_LAYOUT stage=target-layout-loaded requested_klid={klid} loaded_hkl={target:08X}"
+    );
+    for attempt in 1..=3 {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.is_null() {
+            log::warn!(
+                "MD_LAYOUT stage=target-apply-attempt requested_klid={klid} attempt={attempt} result=no-foreground"
+            );
+            std::thread::sleep(Duration::from_millis(40));
+            continue;
+        }
+        let foreground_thread = unsafe { GetWindowThreadProcessId(foreground, null_mut()) };
+        let matches = || {
+            if foreground_thread == 0 {
+                return false;
+            }
+            let current = unsafe { GetKeyboardLayout(foreground_thread) };
+            !current.is_null() && (current as usize & 0xFFFF_FFFF) == target
+        };
+        if !matches() {
+            let mut result: usize = 0;
+            let send_result = unsafe {
+                SendMessageTimeoutW(
+                    foreground,
+                    WM_INPUTLANGCHANGEREQUEST,
+                    0,
+                    layout as LPARAM,
+                    SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                    500,
+                    &mut result,
+                )
+            };
+            if send_result == 0 {
+                log::warn!(
+                    "MD_LAYOUT stage=target-language-request requested_klid={klid} attempt={attempt} result=send-failed error={}",
+                    io::Error::last_os_error()
+                );
+                continue;
+            }
+            log::info!(
+                "MD_LAYOUT stage=target-language-request requested_klid={klid} attempt={attempt} result=sent message_result={result}"
+            );
+        } else {
+            log::info!(
+                "MD_LAYOUT stage=target-language-request requested_klid={klid} attempt={attempt} result=already-current"
+            );
+        }
+        for _ in 0..10 {
+            std::thread::sleep(Duration::from_millis(20));
+            if matches() {
+                // Require a short stable period. This catches the beta 11/12
+                // failure where the indicator changed and a delayed modifier
+                // event immediately switched it back.
+                std::thread::sleep(Duration::from_millis(80));
+                if matches() {
+                    log_keyboard_layout_apply_context("target-apply-stable", klid);
+                    return Ok(());
+                }
+                log::warn!(
+                    "MD_LAYOUT stage=target-apply-stability requested_klid={klid} attempt={attempt} result=reverted"
+                );
+                break;
+            }
+        }
+    }
+    bail!("Windows did not retain keyboard layout {klid}")
+}
+
+/// Applies an exact controller-selected KLID to the controlled foreground window.
+/// Reapplying the current layout is intentionally a no-op, so one physical shortcut
+/// can first toggle both machines and then deterministically converge them.
+pub fn apply_keyboard_layout_klid(klid: &str) -> ResultType<()> {
+    let klid = normalized_keyboard_layout_klid(klid)?;
+    let locked = is_locked();
+    let logon_ui = is_logon_ui().unwrap_or(false);
+    let use_input_desktop = keyboard_layout_requires_input_desktop(locked, logon_ui);
+    log::info!(
+        "MD_LAYOUT stage=target-apply-dispatch requested_klid={klid} locked={locked} logon_ui={logon_ui} route={}",
+        if use_input_desktop {
+            "input-desktop-worker"
+        } else {
+            "current-interactive-desktop"
+        }
+    );
+    if use_input_desktop {
+        return std::thread::spawn(move || {
+            if unsafe { selectInputDesktop() } == FALSE {
+                bail!(
+                    "Failed to select Windows input desktop for keyboard layout: {}",
+                    io::Error::last_os_error()
+                );
+            }
+            log_keyboard_layout_apply_context("target-input-desktop-selected", &klid);
+            apply_keyboard_layout_klid_on_current_desktop(&klid)
+        })
+        .join()
+        .map_err(|_| anyhow!("Windows input-desktop keyboard worker panicked"))?;
+    }
+    apply_keyboard_layout_klid_on_current_desktop(&klid)
+}
+
 pub fn get_char_from_unicode(unicode: u16) -> Option<char> {
     let buff = [unicode];
     if let Some(chr) = String::from_utf16(&buff[..1]).ok()?.chars().next() {
@@ -3318,7 +4158,7 @@ pub fn uninstall_service(show_new_window: bool, _: bool) -> bool {
         log::debug!("{err}");
         return true;
     }
-    run_after_run_cmds(!show_new_window);
+    run_after_run_cmds(!show_new_window, false);
     std::process::exit(0);
 }
 
@@ -3351,7 +4191,7 @@ if exist \"{tray_shortcut}\" del /f /q \"{tray_shortcut}\"
         log::debug!("{err}");
         return true;
     }
-    run_after_run_cmds(false);
+    run_after_run_cmds(false, false);
     std::process::exit(0);
 }
 
@@ -3405,18 +4245,22 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     let app_exe_name = &format!("{}.exe", &app_name);
     let main_window_pids =
         crate::platform::get_pids_of_process_with_args::<_, &str>(&app_exe_name, &[]);
-    let main_window_sessions = main_window_pids
+    let mut main_window_sessions = main_window_pids
         .iter()
         .map(|pid| get_session_id_of_process(pid.as_u32()))
         .flatten()
         .collect::<Vec<_>>();
+    main_window_sessions.sort_unstable();
+    main_window_sessions.dedup();
     kill_process_by_pids(&app_exe_name, main_window_pids)?;
     let tray_pids = crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
-    let tray_sessions = tray_pids
+    let mut tray_sessions = tray_pids
         .iter()
         .map(|pid| get_session_id_of_process(pid.as_u32()))
         .flatten()
         .collect::<Vec<_>>();
+    tray_sessions.sort_unstable();
+    tray_sessions.dedup();
     kill_process_by_pids(&app_exe_name, tray_pids)?;
     let is_service_running = is_self_service_running();
 
@@ -3433,9 +4277,9 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     if versions.len() > 2 {
         version_build = versions[2];
     }
-    let version = crate::VERSION.replace("-", ".");
+    let version = application_display_version();
     let size = get_directory_size_kb(&path);
-    let build_date = crate::BUILD_DATE;
+    let build_date = crate::custom_defaults::CUSTOM_BUILD_DATE;
     // Use the icon in the previous installation directory if possible.
     let display_icon = get_custom_icon("", &exe).unwrap_or(exe.to_string());
 
@@ -3590,20 +4434,35 @@ taskkill /F /IM {app_name}.exe{filter}
                 }
             }
             if main_window_sessions.is_empty() {
-                log::info!("No main window process found.");
+                log::info!("No previous main window found; opening the updated application.");
+                let updater_pid = get_current_pid().to_string();
+                allow_err!(run_exe_in_cur_session(
+                    &exe,
+                    vec!["--wait-for-portable", &updater_pid],
+                    true
+                ));
             } else {
                 log::info!("Try to restore the main window process...");
-                std::thread::sleep(std::time::Duration::from_millis(2000));
                 // When not running as root, only spawn once since run_exe_direct
                 // doesn't target specific sessions.
                 let mut spawned_non_root_main = false;
+                let updater_pid = get_current_pid().to_string();
                 for s in main_window_sessions.clone().into_iter() {
                     if s != 0 {
                         if is_root {
-                            allow_err!(run_exe_in_session(&exe, vec![], s, true));
+                            allow_err!(run_exe_in_session(
+                                &exe,
+                                vec!["--wait-for-portable", &updater_pid],
+                                s,
+                                true
+                            ));
                         } else if !spawned_non_root_main {
                             // Only spawn once for non-root since run_exe_direct doesn't take session parameter
-                            allow_err!(run_exe_direct(&exe, vec![], false));
+                            allow_err!(run_exe_direct(
+                                &exe,
+                                vec!["--wait-for-portable", &updater_pid],
+                                false
+                            ));
                             spawned_non_root_main = true;
                         }
                     }
@@ -3929,19 +4788,47 @@ sc start {app_name}
     }
 }
 
-fn run_after_run_cmds(silent: bool) {
+fn run_after_run_cmds(silent: bool, wait_for_current_process: bool) {
     let (_, _, _, exe) = get_install_info();
     if !silent {
         log::debug!("Spawn new window");
-        allow_err!(std::process::Command::new("cmd")
-            .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
-            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
-            .spawn());
+        if wait_for_current_process {
+            let pid = get_current_pid().to_string();
+            allow_err!(run_exe_direct(
+                &exe,
+                vec!["--wait-for-portable", &pid],
+                true
+            ));
+        } else {
+            allow_err!(std::process::Command::new("cmd")
+                .args(&["/c", "timeout", "/t", "2", "&", &format!("{exe}")])
+                .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+                .spawn());
+        }
     }
     if Config::get_option("stop-service") != "Y" {
         allow_err!(std::process::Command::new(&exe).arg("--tray").spawn());
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
+}
+
+pub fn wait_for_process_exit(process_id: u32, timeout_ms: u32) {
+    unsafe {
+        let process = OpenProcess(SYNCHRONIZE, FALSE, process_id);
+        if process.is_null() {
+            log::info!("Portable process {process_id} has already exited.");
+            return;
+        }
+        let result = WaitForSingleObject(process, timeout_ms);
+        CloseHandle(process);
+        if result == WAIT_TIMEOUT {
+            log::warn!(
+                "Timed out waiting {timeout_ms} ms for portable process {process_id} to exit."
+            );
+        } else {
+            log::info!("Portable process {process_id} exited; continuing installed GUI startup.");
+        }
+    }
 }
 
 #[inline]
@@ -4842,6 +5729,122 @@ mod tests {
         assert_eq!(chr, Some('a'));
         let chr = get_char_from_vk(VK_ESCAPE as u32); // VK_ESC
         assert_eq!(chr, None)
+    }
+
+    #[test]
+    fn test_normalized_keyboard_layout_klid() {
+        assert_eq!(
+            normalized_keyboard_layout_klid("00000409").unwrap(),
+            "00000409"
+        );
+        assert_eq!(
+            normalized_keyboard_layout_klid(" 00000419 ").unwrap(),
+            "00000419"
+        );
+        assert_eq!(
+            normalized_keyboard_layout_klid("04190419").unwrap(),
+            "00000419"
+        );
+        assert_eq!(
+            normalized_keyboard_layout_klid("04090409").unwrap(),
+            "00000409"
+        );
+        assert_eq!(
+            normalized_keyboard_layout_klid("00010409").unwrap(),
+            "00010409"
+        );
+        for invalid in ["409", "0000040Z", "000000000409", ""] {
+            assert!(normalized_keyboard_layout_klid(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn test_runtime_hkl_is_converted_to_loadable_klid() {
+        // This is the exact beta 18 failure: GetKeyboardLayout returned the
+        // repeated-language runtime HKL, which LoadKeyboardLayoutW interpreted
+        // as a different request and fell back to English on the test VM.
+        assert_eq!(
+            canonical_keyboard_layout_klid_from_runtime_hkl(0x0419_0419),
+            "00000419"
+        );
+        assert_eq!(
+            canonical_keyboard_layout_klid_from_runtime_hkl(0x0409_0409),
+            "00000409"
+        );
+    }
+
+    #[test]
+    fn test_keyboard_layout_uses_secure_input_desktop_when_needed() {
+        assert!(!keyboard_layout_requires_input_desktop(false, false));
+        assert!(keyboard_layout_requires_input_desktop(true, false));
+        assert!(keyboard_layout_requires_input_desktop(false, true));
+        assert!(keyboard_layout_requires_input_desktop(true, true));
+    }
+
+    #[test]
+    fn test_safe_mode_network_plan_contains_service_and_wifi_chain() {
+        let entries = safe_mode_network_entries("MasterDesk");
+        let names = entries
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(entries.len(), names.len());
+        for required in ["MasterDesk", "WlanSvc", "Wcmsvc", "Ndisuio", "nativewifip"] {
+            assert!(names.contains(required));
+        }
+    }
+
+    #[test]
+    fn test_windows_safe_mode_metric() {
+        assert!(!is_windows_safe_mode(0));
+        assert!(is_windows_safe_mode(1));
+        assert!(is_windows_safe_mode(2));
+    }
+
+    #[test]
+    fn test_bcd_safeboot_detection_is_exact() {
+        assert!(bcd_output_has_safeboot(
+            "identifier {current}\r\nsafeboot Network\r\n"
+        ));
+        assert!(bcd_output_has_safeboot("  SAFEBOOT Minimal\n"));
+        assert!(!bcd_output_has_safeboot(
+            "identifier {current}\r\ndescription Windows 10\r\n"
+        ));
+        assert!(!bcd_output_has_safeboot("safebootalternateshell Yes\n"));
+    }
+
+    #[test]
+    fn test_stale_stop_service_is_cleared_only_without_an_installation() {
+        assert!(should_clear_stale_stop_service(false, "Y"));
+        assert!(!should_clear_stale_stop_service(true, "Y"));
+        assert!(!should_clear_stale_stop_service(false, ""));
+        assert!(!should_clear_stale_stop_service(false, "N"));
+    }
+
+    #[cfg(feature = "flutter")]
+    #[test]
+    fn test_flutter_install_copy_requires_complete_runtime_payload() {
+        let command = copy_raw_cmd(
+            r"C:\portable\rustdesk.exe",
+            r"C:\Program Files\MasterDesk\MasterDesk.exe",
+            r"C:\Program Files\MasterDesk",
+        )
+        .unwrap();
+        for required in [
+            r"C:\portable\data\app.so",
+            r"C:\portable\data\icudtl.dat",
+            r"C:\portable\data\flutter_assets\AssetManifest.bin",
+            r"C:\Program Files\MasterDesk\data\app.so",
+            r"C:\Program Files\MasterDesk\data\icudtl.dat",
+            r"C:\Program Files\MasterDesk\data\flutter_assets\AssetManifest.bin",
+        ] {
+            assert!(
+                command.contains(required),
+                "missing payload check: {required}"
+            );
+        }
+        assert!(command.contains("if errorlevel 1 exit /b 1"));
+        assert!(!command.contains(" /C "));
     }
 
     #[cfg(not(target_pointer_width = "64"))]

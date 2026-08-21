@@ -14,7 +14,7 @@ use hbb_common::message_proto::*;
 use rdev::KeyCode;
 use rdev::{Event, EventType, Key};
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex},
@@ -35,22 +35,105 @@ const OS_LOWER_ANDROID: &str = "android";
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 static KEYBOARD_HOOKED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "windows")]
+static WINDOWS_LAYOUT_TRACE_ID: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "windows")]
+const WINDOWS_LAYOUT_SYNC_POLL_INTERVAL: std::time::Duration =
+    std::time::Duration::from_millis(20);
+#[cfg(target_os = "windows")]
+const WINDOWS_LAYOUT_SYNC_SETTLE_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(60);
+#[cfg(target_os = "windows")]
+const WINDOWS_LAYOUT_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
+
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsLayoutHotkeyTransition {
+    None,
+    Started,
+    Ended,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct WindowsLayoutHotkeyState {
+    alt_left: bool,
+    control_left: bool,
+    control_right: bool,
+    shift_left: bool,
+    shift_right: bool,
+    chord_active: bool,
+    sync_pending: bool,
+}
+
+#[cfg(target_os = "windows")]
+struct WindowsLayoutSyncTarget {
+    trace_id: u64,
+    window_handle: usize,
+    initial_layout: String,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsLayoutHotkeyState {
+    fn update(
+        &mut self,
+        key: Key,
+        is_press: bool,
+        position_code: u32,
+    ) -> WindowsLayoutHotkeyTransition {
+        match key {
+            Key::Alt => self.alt_left = is_press,
+            // 0x021D is the synthetic control event generated for AltGr.
+            Key::ControlLeft if position_code != 0x021D => self.control_left = is_press,
+            Key::ControlRight => self.control_right = is_press,
+            Key::ShiftLeft => self.shift_left = is_press,
+            Key::ShiftRight => self.shift_right = is_press,
+            _ => {}
+        }
+        let shift = self.shift_left || self.shift_right;
+        let chord = shift && (self.alt_left || self.control_left || self.control_right);
+        let any_layout_modifier =
+            shift || self.alt_left || self.control_left || self.control_right;
+        let transition = if chord && !self.chord_active && !self.sync_pending {
+            self.sync_pending = true;
+            WindowsLayoutHotkeyTransition::Started
+        } else if !any_layout_modifier && self.sync_pending {
+            self.sync_pending = false;
+            WindowsLayoutHotkeyTransition::Ended
+        } else {
+            WindowsLayoutHotkeyTransition::None
+        };
+        self.chord_active = chord;
+        transition
+    }
+}
+
 // Track key down state for relative mouse mode exit shortcut.
 // macOS: Cmd+G (track G key)
 // Windows/Linux: Ctrl+Alt (track whichever modifier was pressed last)
 // This prevents the exit from retriggering on OS key-repeat.
-#[cfg(all(feature = "flutter", any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 static EXIT_SHORTCUT_KEY_DOWN: AtomicBool = AtomicBool::new(false);
 
 // Track whether relative mouse mode is currently active.
 // This is set by Flutter via set_relative_mouse_mode_state() and checked
 // by the rdev grab loop to determine if exit shortcuts should be processed.
-#[cfg(all(feature = "flutter", any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 static RELATIVE_MOUSE_MODE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Set the relative mouse mode state from Flutter.
 /// This is called when entering or exiting relative mouse mode.
-#[cfg(all(feature = "flutter", any(target_os = "windows", target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    feature = "flutter",
+    any(target_os = "windows", target_os = "macos", target_os = "linux")
+))]
 pub fn set_relative_mouse_mode_state(active: bool) {
     RELATIVE_MOUSE_MODE_ACTIVE.store(active, Ordering::SeqCst);
     // Reset exit shortcut state when mode changes to avoid stale state
@@ -77,6 +160,225 @@ lazy_static::lazy_static! {
         m.insert(Key::MetaRight, false);
         Mutex::new(m)
     };
+    #[cfg(target_os = "windows")]
+    static ref WINDOWS_LAYOUT_HOTKEY_STATE: Mutex<WindowsLayoutHotkeyState> =
+        Mutex::new(WindowsLayoutHotkeyState::default());
+}
+
+#[cfg(target_os = "windows")]
+fn send_windows_keyboard_layout_target(trace_id: u64, klid: String) {
+    #[cfg(not(feature = "flutter"))]
+    if let Some(session) = CUR_SESSION.lock().unwrap().as_ref() {
+        log::info!(
+            "MD_LAYOUT trace={trace_id} stage=controller-session-resolved source=legacy klid={klid}"
+        );
+        session.send_keyboard_layout_target(klid);
+        return;
+    }
+    #[cfg(feature = "flutter")]
+    if let Some(session) = flutter::get_cur_session() {
+        log::info!(
+            "MD_LAYOUT trace={trace_id} stage=controller-session-resolved source=flutter klid={klid}"
+        );
+        session.send_keyboard_layout_target(klid);
+        return;
+    }
+    log::warn!("MD_LAYOUT trace={trace_id} stage=controller-session-missing klid={klid}");
+}
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn windows_keyboard_layout_changed(initial: Option<&str>, current: &str) -> bool {
+    initial.map(|value| value != current).unwrap_or(true)
+}
+
+#[cfg(target_os = "windows")]
+#[inline]
+fn windows_layout_sync_source_matches_selection(
+    event_source: &str,
+    selected_input_source: &str,
+) -> bool {
+    matches!(
+        (event_source, selected_input_source),
+        (
+            "input-source-1-rdev",
+            input_source::CONFIG_INPUT_SOURCE_1
+        ) | (
+            "input-source-2-flutter",
+            input_source::CONFIG_INPUT_SOURCE_1
+        ) | (
+            "input-source-2-flutter",
+            input_source::CONFIG_INPUT_SOURCE_2
+        )
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn schedule_windows_keyboard_layout_sync(
+    key: Key,
+    is_press: bool,
+    position_code: u32,
+    input_source: &'static str,
+    event_origin: &'static str,
+) {
+    static SYNC_TARGET: Mutex<Option<WindowsLayoutSyncTarget>> = Mutex::new(None);
+
+    if !matches!(
+        key,
+        Key::Alt
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::AltGr
+    ) {
+        return;
+    }
+    let selected_input_source = input_source::get_cur_session_input_source();
+    if !windows_layout_sync_source_matches_selection(input_source, &selected_input_source) {
+        log::debug!(
+            "MD_LAYOUT stage=controller-modifier-ignored source={input_source} selected={selected_input_source}"
+        );
+        return;
+    }
+    let (transition, modifier_state) = {
+        let mut state = WINDOWS_LAYOUT_HOTKEY_STATE.lock().unwrap();
+        let transition = state.update(key, is_press, position_code);
+        let modifier_state = format!(
+            "alt={} ctrl_left={} ctrl_right={} shift_left={} shift_right={} pending={}",
+            state.alt_left,
+            state.control_left,
+            state.control_right,
+            state.shift_left,
+            state.shift_right,
+            state.sync_pending
+        );
+        (transition, modifier_state)
+    };
+    log::info!(
+        "MD_LAYOUT stage=controller-modifier source={input_source} origin={event_origin} key={key:?} action={} scan=0x{position_code:X} transition={transition:?} {modifier_state}",
+        if is_press { "down" } else { "up" }
+    );
+    if transition == WindowsLayoutHotkeyTransition::Started {
+        let trace_id = WINDOWS_LAYOUT_TRACE_ID.fetch_add(1, Ordering::SeqCst) + 1;
+        let foreground_owned = crate::platform::windows::current_process_owns_foreground_window();
+        *SYNC_TARGET.lock().unwrap() = if foreground_owned {
+            match crate::platform::windows::foreground_keyboard_layout_context() {
+                Ok((window_handle, initial_layout)) => {
+                    log::info!(
+                        "MD_LAYOUT trace={trace_id} stage=controller-chord-start source={input_source} foreground_owned=true hwnd={window_handle} pre_klid={initial_layout}"
+                    );
+                    Some(WindowsLayoutSyncTarget {
+                        trace_id,
+                        window_handle,
+                        initial_layout,
+                    })
+                }
+                Err(err) => {
+                    log::warn!(
+                        "MD_LAYOUT trace={trace_id} stage=controller-context-failed source={input_source} error={err}"
+                    );
+                    None
+                }
+            }
+        } else {
+            log::warn!(
+                "MD_LAYOUT trace={trace_id} stage=controller-context-rejected source={input_source} foreground_owned=false"
+            );
+            None
+        };
+        return;
+    }
+    if transition != WindowsLayoutHotkeyTransition::Ended {
+        return;
+    }
+    // Do not send the authoritative KLID while the physical chord is still
+    // active. Windows can commit a layout on key-up, and a later forwarded
+    // release would otherwise toggle the controlled desktop back again.
+    let Some(target) = SYNC_TARGET.lock().unwrap().take() else {
+        log::warn!(
+            "MD_LAYOUT stage=controller-chord-end source={input_source} target_context=missing"
+        );
+        return;
+    };
+    log::info!(
+        "MD_LAYOUT trace={} stage=controller-all-modifiers-released source={input_source}",
+        target.trace_id
+    );
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        loop {
+            std::thread::sleep(WINDOWS_LAYOUT_SYNC_POLL_INTERVAL);
+            let Ok(current_layout) =
+                crate::platform::windows::keyboard_layout_klid_for_window(target.window_handle)
+            else {
+                if started.elapsed() >= WINDOWS_LAYOUT_SYNC_TIMEOUT {
+                    log::warn!(
+                        "MD_LAYOUT trace={} stage=controller-post-klid-timeout hwnd={}",
+                        target.trace_id,
+                        target.window_handle
+                    );
+                    return;
+                }
+                continue;
+            };
+            if windows_keyboard_layout_changed(
+                Some(target.initial_layout.as_str()),
+                &current_layout,
+            ) {
+                log::info!(
+                    "MD_LAYOUT trace={} stage=controller-post-klid pre_klid={} post_klid={current_layout}",
+                    target.trace_id,
+                    target.initial_layout
+                );
+                // Let the already-forwarded modifier sequence finish remotely, then
+                // make the controller's exact final KLID authoritative.
+                std::thread::sleep(WINDOWS_LAYOUT_SYNC_SETTLE_DELAY);
+                log::info!(
+                    "MD_LAYOUT trace={} stage=controller-message-form klid={current_layout}",
+                    target.trace_id
+                );
+                send_windows_keyboard_layout_target(target.trace_id, current_layout);
+                return;
+            }
+            if started.elapsed() >= WINDOWS_LAYOUT_SYNC_TIMEOUT {
+                // One installed layout (or a disabled Windows shortcut): keep the
+                // controlled side aligned with the unchanged controller layout.
+                log::info!(
+                    "MD_LAYOUT trace={} stage=controller-post-klid-unchanged klid={current_layout}",
+                    target.trace_id
+                );
+                send_windows_keyboard_layout_target(target.trace_id, current_layout);
+                return;
+            }
+        }
+    });
+}
+
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+fn windows_layout_modifier_from_usb_hid(usb_hid: i32) -> Option<(Key, u32)> {
+    match usb_hid {
+        0xE0 => Some((Key::ControlLeft, 0x1D)),
+        0xE1 => Some((Key::ShiftLeft, 0x2A)),
+        0xE2 => Some((Key::Alt, 0x38)),
+        0xE4 => Some((Key::ControlRight, 0xE01D)),
+        0xE5 => Some((Key::ShiftRight, 0x36)),
+        0xE6 => Some((Key::AltGr, 0xE038)),
+        _ => None,
+    }
+}
+
+#[cfg(all(target_os = "windows", feature = "flutter"))]
+pub fn schedule_windows_keyboard_layout_sync_from_flutter(usb_hid: i32, is_press: bool) {
+    if let Some((key, position_code)) = windows_layout_modifier_from_usb_hid(usb_hid) {
+        schedule_windows_keyboard_layout_sync(
+            key,
+            is_press,
+            position_code,
+            "input-source-2-flutter",
+            "flutter-event-origin-unavailable",
+        );
+    }
 }
 
 pub mod client {
@@ -577,10 +879,8 @@ fn should_block_relative_mouse_shortcut(key: Key, is_press: bool) -> bool {
     #[cfg(target_os = "macos")]
     let is_tracked_key = key == Key::KeyG;
     #[cfg(not(target_os = "macos"))]
-    let is_tracked_key = key == Key::ControlLeft
-        || key == Key::ControlRight
-        || key == Key::Alt
-        || key == Key::AltGr;
+    let is_tracked_key =
+        key == Key::ControlLeft || key == Key::ControlRight || key == Key::Alt || key == Key::AltGr;
 
     // Block key up if key down was blocked (to avoid orphan key up event on remote).
     // This must be checked before clearing the flag below.
@@ -609,6 +909,24 @@ fn should_block_relative_mouse_shortcut(key: Key, is_press: bool) -> bool {
     false
 }
 
+/// Input source 1 uses the native rdev hook instead of Flutter key routing.
+/// Let Windows observe only modifier events after they have also been sent to
+/// the peer. This preserves local Alt+Shift/Ctrl+Shift layout shortcuts while
+/// ordinary remote keys and shortcuts remain captured by MasterDesk.
+#[cfg(target_os = "windows")]
+#[inline]
+fn should_pass_windows_modifier_to_platform(key: &Key) -> bool {
+    matches!(
+        key,
+        Key::ControlLeft
+            | Key::ControlRight
+            | Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::Alt
+            | Key::AltGr
+    )
+}
+
 fn start_grab_loop() {
     std::env::set_var("KEYBOARD_ONLY", "y");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -627,9 +945,30 @@ fn start_grab_loop() {
                 return None;
             }
 
+            #[cfg(target_os = "windows")]
+            schedule_windows_keyboard_layout_sync(
+                key,
+                is_press,
+                _scan_code,
+                "input-source-1-rdev",
+                if event.extra_data == enigo::ENIGO_INPUT_EXTRA_VALUE {
+                    "masterdesk-injected"
+                } else if event.extra_data == 0 {
+                    "physical-or-unmarked-injected"
+                } else {
+                    "foreign-tagged"
+                },
+            );
+
             let res = if KEYBOARD_HOOKED.load(Ordering::SeqCst) {
                 client::process_event(&get_keyboard_mode(), &event, None);
-                if is_press {
+
+                #[cfg(target_os = "windows")]
+                let pass_modifier_to_platform = should_pass_windows_modifier_to_platform(&key);
+                #[cfg(not(target_os = "windows"))]
+                let pass_modifier_to_platform = false;
+
+                if is_press && !pass_modifier_to_platform {
                     None
                 } else {
                     Some(event)
@@ -702,6 +1041,162 @@ fn start_grab_loop() {
     }) {
         log::error!("Failed to init rdev grab thread: {:?}", err);
     };
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_native_grab_passes_only_layout_modifiers_to_platform() {
+        for key in [
+            Key::ControlLeft,
+            Key::ControlRight,
+            Key::ShiftLeft,
+            Key::ShiftRight,
+            Key::Alt,
+            Key::AltGr,
+        ] {
+            assert!(should_pass_windows_modifier_to_platform(&key));
+        }
+
+        for key in [Key::KeyA, Key::F4, Key::Tab, Key::MetaLeft] {
+            assert!(!should_pass_windows_modifier_to_platform(&key));
+        }
+    }
+
+    #[test]
+    fn windows_layout_hotkey_triggers_once_per_physical_chord() {
+        let mut state = WindowsLayoutHotkeyState::default();
+        assert_eq!(
+            state.update(Key::Alt, true, 0x38),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            state.update(Key::ShiftLeft, true, 0x2A),
+            WindowsLayoutHotkeyTransition::Started
+        );
+        assert_eq!(
+            state.update(Key::ShiftLeft, true, 0x2A),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            state.update(Key::ShiftLeft, false, 0x2A),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            state.update(Key::ShiftLeft, true, 0x2A),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            state.update(Key::ShiftLeft, false, 0x2A),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            state.update(Key::Alt, false, 0x38),
+            WindowsLayoutHotkeyTransition::Ended
+        );
+    }
+
+    #[test]
+    fn windows_layout_hotkey_supports_ctrl_shift_and_ignores_altgr_control() {
+        let mut state = WindowsLayoutHotkeyState::default();
+        assert_eq!(
+            state.update(Key::ShiftRight, true, 0x36),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            state.update(Key::ControlRight, true, 0xE01D),
+            WindowsLayoutHotkeyTransition::Started
+        );
+
+        let mut altgr = WindowsLayoutHotkeyState::default();
+        assert_eq!(
+            altgr.update(Key::ShiftLeft, true, 0x2A),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            altgr.update(Key::ControlLeft, true, 0x021D),
+            WindowsLayoutHotkeyTransition::None
+        );
+        assert_eq!(
+            altgr.update(Key::AltGr, true, 0xE038),
+            WindowsLayoutHotkeyTransition::None
+        );
+    }
+
+    #[test]
+    fn windows_layout_sync_waits_for_the_first_changed_layout() {
+        assert!(!windows_keyboard_layout_changed(
+            Some("00000409"),
+            "00000409"
+        ));
+        assert!(windows_keyboard_layout_changed(
+            Some("00000409"),
+            "00000419"
+        ));
+        assert!(windows_keyboard_layout_changed(None, "00000419"));
+    }
+
+    #[test]
+    fn windows_layout_sync_accepts_flutter_fallback_for_native_source() {
+        assert!(windows_layout_sync_source_matches_selection(
+            "input-source-1-rdev",
+            input_source::CONFIG_INPUT_SOURCE_1
+        ));
+        // RDP can consume Alt+Shift before the native low-level hook sees it,
+        // while Flutter still receives the focused Viewer key events.
+        assert!(windows_layout_sync_source_matches_selection(
+            "input-source-2-flutter",
+            input_source::CONFIG_INPUT_SOURCE_1
+        ));
+        assert!(windows_layout_sync_source_matches_selection(
+            "input-source-2-flutter",
+            input_source::CONFIG_INPUT_SOURCE_2
+        ));
+        assert!(!windows_layout_sync_source_matches_selection(
+            "input-source-1-rdev",
+            input_source::CONFIG_INPUT_SOURCE_2
+        ));
+    }
+
+    #[cfg(feature = "flutter")]
+    #[test]
+    fn windows_flutter_layout_modifier_hid_mapping_covers_both_hotkeys() {
+        for (usb_hid, key, scan_code) in [
+            (0xE0, Key::ControlLeft, 0x1D),
+            (0xE1, Key::ShiftLeft, 0x2A),
+            (0xE2, Key::Alt, 0x38),
+            (0xE4, Key::ControlRight, 0xE01D),
+            (0xE5, Key::ShiftRight, 0x36),
+            (0xE6, Key::AltGr, 0xE038),
+        ] {
+            assert_eq!(
+                windows_layout_modifier_from_usb_hid(usb_hid),
+                Some((key, scan_code))
+            );
+        }
+        assert_eq!(windows_layout_modifier_from_usb_hid(0x2C), None);
+    }
+
+    #[test]
+    fn windows_map_mode_preserves_space_and_letter_scan_codes() {
+        for (key, scan_code) in [(Key::Space, 0x39), (Key::KeyP, 0x19)] {
+            let event = Event {
+                event_type: EventType::KeyPress(key),
+                time: std::time::SystemTime::now(),
+                unicode: None,
+                platform_code: 0,
+                position_code: scan_code,
+                usb_hid: 0,
+                extra_data: 0,
+            };
+            let mapped = map_keyboard_mode(OS_LOWER_WINDOWS, &event, KeyEvent::new());
+            assert_eq!(mapped.len(), 1);
+            assert!(mapped[0].down);
+            assert_eq!(mapped[0].union, Some(key_event::Union::Chr(scan_code)));
+        }
+    }
 }
 
 // #[allow(dead_code)] is ok here. No need to stop grabbing loop.

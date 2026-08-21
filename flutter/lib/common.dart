@@ -2962,8 +2962,8 @@ class ServerConfig {
     }
     idServer = json['host'] ?? '';
     relayServer = json['relay'] ?? '';
-    apiServer = json['api'] ?? '';
-    key = json['key'] ?? '';
+    apiServer = isMasterDeskClient ? '' : json['api'] ?? '';
+    key = isMasterDeskClient ? '' : json['key'] ?? '';
   }
 
   /// encode to shared string
@@ -2972,8 +2972,10 @@ class ServerConfig {
     Map<String, String> config = {};
     config['host'] = idServer.trim();
     config['relay'] = relayServer.trim();
-    config['api'] = apiServer.trim();
-    config['key'] = key.trim();
+    if (!isMasterDeskClient) {
+      config['api'] = apiServer.trim();
+      config['key'] = key.trim();
+    }
     return base64UrlEncode(Uint8List.fromList(jsonEncode(config).codeUnits))
         .split('')
         .reversed
@@ -2984,8 +2986,8 @@ class ServerConfig {
   ServerConfig.fromOptions(Map<String, dynamic> options)
       : idServer = options['custom-rendezvous-server'] ?? "",
         relayServer = options['relay-server'] ?? "",
-        apiServer = options['api-server'] ?? "",
-        key = options['key'] ?? "";
+        apiServer = isMasterDeskClient ? "" : options['api-server'] ?? "",
+        key = isMasterDeskClient ? "" : options['key'] ?? "";
 }
 
 Widget dialogButton(String text,
@@ -3598,13 +3600,22 @@ Future<bool> setServerConfig(
 
   config.idServer = removeEndSlash(config.idServer.trim());
   config.relayServer = removeEndSlash(config.relayServer.trim());
-  config.apiServer = removeEndSlash(config.apiServer.trim());
-  config.key = config.key.trim();
+  if (isMasterDeskClient) {
+    config.apiServer = '';
+    config.key = '';
+  } else {
+    config.apiServer = removeEndSlash(config.apiServer.trim());
+    config.key = config.key.trim();
+  }
   if (controllers != null) {
     controllers[0].text = config.idServer;
     controllers[1].text = config.relayServer;
-    controllers[2].text = config.apiServer;
-    controllers[3].text = config.key;
+    if (controllers.length > 2) {
+      controllers[2].text = config.apiServer;
+    }
+    if (controllers.length > 3) {
+      controllers[3].text = config.key;
+    }
   }
   // id
   if (config.idServer.isNotEmpty && errMsgs != null) {
@@ -3623,7 +3634,7 @@ Future<bool> setServerConfig(
     }
   }
   // api
-  if (config.apiServer.isNotEmpty && errMsgs != null) {
+  if (!isMasterDeskClient && config.apiServer.isNotEmpty && errMsgs != null) {
     if (!config.apiServer.startsWith('http://') &&
         !config.apiServer.startsWith('https://')) {
       errMsgs[2].value =
@@ -3631,15 +3642,19 @@ Future<bool> setServerConfig(
       return false;
     }
   }
-  final oldApiServer = await bind.mainGetApiServer();
+  final oldApiServer =
+      isMasterDeskClient ? '' : await bind.mainGetApiServer();
 
   // should set one by one
   await bind.mainSetOption(
       key: 'custom-rendezvous-server', value: config.idServer);
   await bind.mainSetOption(key: 'relay-server', value: config.relayServer);
-  await bind.mainSetOption(key: 'api-server', value: config.apiServer);
-  await bind.mainSetOption(key: 'key', value: config.key);
-  final newApiServer = await bind.mainGetApiServer();
+  if (!isMasterDeskClient) {
+    await bind.mainSetOption(key: 'api-server', value: config.apiServer);
+    await bind.mainSetOption(key: 'key', value: config.key);
+  }
+  final newApiServer =
+      isMasterDeskClient ? '' : await bind.mainGetApiServer();
   if (oldApiServer.isNotEmpty &&
       oldApiServer != newApiServer &&
       gFFI.userModel.isLogin) {
@@ -3989,6 +4004,9 @@ bool get isCustomClient {
   _isCustomClient ??= bind.isCustomClient();
   return _isCustomClient!;
 }
+
+bool get isMasterDeskClient =>
+    isCustomClient && bind.mainGetAppNameSync() == 'MasterDesk';
 
 get defaultOptionLang => isCustomClient ? 'default' : '';
 get defaultOptionTheme => isCustomClient ? 'system' : '';

@@ -152,6 +152,26 @@ pub(crate) fn is_allowed_windows_session_scoped_peer(
 
 #[cfg(windows)]
 #[inline]
+pub(crate) fn gui_compat_listener_security_attributes() -> io::Result<SecurityAttributes> {
+    // The installed `--server` intentionally runs with a LocalSystem token in
+    // the selected interactive session. Its current-process SID therefore
+    // cannot identify the desktop user. Let authenticated local users reach
+    // the pipe, then enforce the existing same-session/elevated/admin policy at
+    // accept time and the narrow GUI command allowlist after the handshake.
+    // This remains stricter than the world-connectable main IPC DACL.
+    SecurityAttributes::from_sddl("D:P(A;;GA;;;SY)(A;;GA;;;AU)").map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!(
+                "failed to build GUI compatibility listener security attributes: {}",
+                err
+            ),
+        )
+    })
+}
+
+#[cfg(windows)]
+#[inline]
 fn is_allowed_windows_main_ipc_peer(
     client_is_system: bool,
     client_session_id: Option<u32>,
@@ -723,6 +743,40 @@ pub(crate) fn authorize_windows_main_ipc_connection(stream: &Connection, postfix
 }
 
 #[cfg(windows)]
+pub(crate) fn authorize_windows_gui_compat_ipc_connection(
+    stream: &Connection,
+    postfix: &str,
+) -> bool {
+    let (
+        authorized,
+        peer_pid,
+        peer_session_id,
+        server_session_id,
+        peer_is_system,
+        peer_is_elevated,
+        peer_is_admin,
+    ) = stream.server_authorization_status();
+    if !authorized || peer_pid.is_none() {
+        log_rejected_windows_ipc_connection(
+            postfix,
+            peer_pid,
+            peer_session_id,
+            server_session_id,
+            peer_is_system,
+            peer_is_elevated,
+            peer_is_admin,
+        );
+        return false;
+    }
+
+    // A future portable binary cannot satisfy the exact-path check used by the
+    // installed main IPC. The protected pipe DACL plus the existing Windows
+    // session/admin policy is therefore the trust boundary for this narrowly
+    // allowlisted compatibility channel. Main IPC remains intact.
+    true
+}
+
+#[cfg(windows)]
 pub(crate) fn authorize_windows_portable_service_ipc_connection(
     stream: &Connection,
     postfix: &str,
@@ -1058,6 +1112,12 @@ mod tests {
         assert!(!super::should_allow_everyone_create_on_windows(
             "_portable_service"
         ));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_gui_compat_listener_security_attributes_are_constructible() {
+        assert!(super::gui_compat_listener_security_attributes().is_ok());
     }
 
     #[test]

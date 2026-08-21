@@ -21,6 +21,15 @@ import 'peer_card.dart';
 typedef PeerFilter = bool Function(Peer peer);
 typedef PeerCardBuilder = Widget Function(Peer peer);
 
+@visibleForTesting
+bool onlineQueryBudgetAllows({
+  required bool isPublicServer,
+  required int queryCount,
+  required int maxQueryCount,
+  required bool fastRefreshActive,
+}) =>
+    queryCount < maxQueryCount || !isPublicServer || fastRefreshActive;
+
 class PeerSortType {
   static const String remoteId = 'Remote ID';
   static const String remoteHost = 'Remote Host';
@@ -89,6 +98,8 @@ class _PeersView extends StatefulWidget {
 class _PeersViewState extends State<_PeersView>
     with WindowListener, WidgetsBindingObserver {
   static const int _maxQueryCount = 3;
+  static const Duration _fastQueryInterval = Duration(seconds: 1);
+  static const Duration _fastQueryWindow = Duration(seconds: 15);
   final HashMap<String, String> _emptyMessages = HashMap.from({
     LoadEvent.recent: 'empty_recent_tip',
     LoadEvent.favorite: 'empty_favorite_tip',
@@ -104,6 +115,8 @@ class _PeersViewState extends State<_PeersView>
   var _queryCount = 0;
   var _exit = false;
   bool _isActive = true;
+  DateTime _fastQueryUntil = DateTime.fromMillisecondsSinceEpoch(0);
+  Set<String>? _lastOnlinePeers;
 
   final _scrollController = ScrollController();
 
@@ -130,6 +143,7 @@ class _PeersViewState extends State<_PeersView>
   void onWindowFocus() {
     _queryCount = 0;
     _isActive = true;
+    _startFastOnlineRefresh();
   }
 
   @override
@@ -156,6 +170,7 @@ class _PeersViewState extends State<_PeersView>
     _queryCount = 0;
     _isActive = true;
     _lastWindowRestoreTime = DateTime.now();
+    _startFastOnlineRefresh();
   }
 
   @override
@@ -172,6 +187,7 @@ class _PeersViewState extends State<_PeersView>
     if (state == AppLifecycleState.resumed) {
       _isActive = true;
       _queryCount = 0;
+      _startFastOnlineRefresh();
     } else if (state == AppLifecycleState.inactive) {
       _isActive = false;
     }
@@ -312,6 +328,34 @@ class _PeersViewState extends State<_PeersView>
 
   var _queryInterval = const Duration(seconds: 20);
 
+  void _startFastOnlineRefresh({bool immediate = true}) {
+    final now = DateTime.now();
+    _fastQueryUntil = now.add(_fastQueryWindow);
+    if (immediate) {
+      _lastQueryTime = now.subtract(_fastQueryInterval);
+    }
+  }
+
+  bool _hasVisibleOfflinePeers() => widget.peers.peers
+      .any((peer) => _curPeers.contains(peer.id) && !peer.online);
+
+  Duration _effectiveQueryInterval(DateTime now) =>
+      now.isBefore(_fastQueryUntil) || _hasVisibleOfflinePeers()
+          ? _fastQueryInterval
+          : _queryInterval;
+
+  void _detectOnlineLoss() {
+    final online = widget.peers.peers
+        .where((peer) => _curPeers.contains(peer.id) && peer.online)
+        .map((peer) => peer.id)
+        .toSet();
+    final previous = _lastOnlinePeers;
+    if (previous != null && previous.difference(online).isNotEmpty) {
+      _startFastOnlineRefresh();
+    }
+    _lastOnlinePeers = online;
+  }
+
   void _startCheckOnlines() {
     () async {
       final p = await bind.mainIsUsingPublicServer();
@@ -320,6 +364,7 @@ class _PeersViewState extends State<_PeersView>
       }
       while (!_exit) {
         final now = DateTime.now();
+        _detectOnlineLoss();
         if (!setEquals(_curPeers, _lastQueryPeers)) {
           if (now.difference(_lastChangeTime) > const Duration(seconds: 1)) {
             _queryOnlines(false);
@@ -330,8 +375,17 @@ class _PeersViewState extends State<_PeersView>
           final skipIfMobile =
               (isAndroid || isIOS) && !stateGlobal.isInMainPage;
           final skipIfNotActive = skipIfIsWeb || skipIfMobile || !_isActive;
-          if (!skipIfNotActive && (_queryCount < _maxQueryCount || !p)) {
-            if (now.difference(_lastQueryTime) >= _queryInterval) {
+          final fastRefreshActive =
+              now.isBefore(_fastQueryUntil) || _hasVisibleOfflinePeers();
+          if (!skipIfNotActive &&
+              onlineQueryBudgetAllows(
+                isPublicServer: p,
+                queryCount: _queryCount,
+                maxQueryCount: _maxQueryCount,
+                fastRefreshActive: fastRefreshActive,
+              )) {
+            if (now.difference(_lastQueryTime) >=
+                _effectiveQueryInterval(now)) {
               if (_curPeers.isNotEmpty) {
                 bind.queryOnlines(ids: _curPeers.toList(growable: false));
                 _lastQueryTime = DateTime.now();
@@ -353,8 +407,10 @@ class _PeersViewState extends State<_PeersView>
     _lastQueryPeers = {..._curPeers};
     if (isLoadEvent) {
       _lastChangeTime = DateTime.now();
+      _startFastOnlineRefresh(immediate: false);
     } else {
-      _lastQueryTime = DateTime.now().subtract(_queryInterval);
+      final now = DateTime.now();
+      _lastQueryTime = now.subtract(_effectiveQueryInterval(now));
     }
   }
 

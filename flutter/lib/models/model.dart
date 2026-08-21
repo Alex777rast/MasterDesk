@@ -45,6 +45,7 @@ import '../utils/image.dart' as img;
 import '../common/widgets/dialog.dart';
 import 'input_model.dart';
 import 'platform_model.dart';
+import 'session_reconnect_utils.dart';
 import 'package:flutter_hbb/utils/scale.dart';
 
 import 'package:flutter_hbb/generated_bridge.dart'
@@ -985,31 +986,22 @@ class FfiModel with ChangeNotifier {
     _restartReconnectDelayTimer = null;
   }
 
-  /// Auto-retry check for "Remote desktop is offline" error.
-  /// returns true to auto-retry, false otherwise.
+  /// Keeps an established session alive while the installed service replaces
+  /// its desktop server during sign-out, sign-in, lock or RDP/console handoff.
   bool shouldAutoRetryOnOffline(
     String type,
     String title,
     String text,
   ) {
-    if (type == 'error' &&
-        title == 'Connection Error' &&
-        text == 'Remote desktop is offline' &&
-        _pi.isSet.isTrue) {
-      // Auto retry for ~30s (server's peer offline threshold) when controlled peer's account changes
-      // (e.g., signout, switch user, login into OS) causes temporary offline via websocket/tcp connection.
-      // The actual wait may exceed 30s (e.g., 20s elapsed + 16s next retry = 36s), which is acceptable
-      // since the controlled side reconnects quickly after account changes.
-      // Uses time-based check instead of _reconnects count because user can manually retry.
-      // https://github.com/rustdesk/rustdesk/discussions/14048
+    if (_pi.isSet.isTrue &&
+        isTransientInstalledServerHandoffError(type, title, text)) {
       if (_offlineReconnectStartTime == null) {
-        // First offline, record time and start retry
         _offlineReconnectStartTime = DateTime.now();
         return true;
       } else {
         final elapsed =
             DateTime.now().difference(_offlineReconnectStartTime!).inSeconds;
-        if (elapsed < 30) {
+        if (elapsed < sessionHandoffReconnectWindowSeconds) {
           return true;
         }
       }
@@ -1447,6 +1439,7 @@ class FfiModel with ChangeNotifier {
       }
       Map<String, dynamic> features = json.decode(evt['features']);
       _pi.features.privacyMode = features['privacy_mode'] == true;
+      _pi.features.safeModeReboot = features['safe_mode_reboot'] == true;
       if (!isCache) {
         handleResolutions(peerId, evt["resolutions"]);
       }
@@ -4118,6 +4111,7 @@ class Resolution {
 
 class Features {
   bool privacyMode = false;
+  bool safeModeReboot = false;
 }
 
 const kInvalidDisplayIndex = -1;

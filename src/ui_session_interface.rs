@@ -404,6 +404,29 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::Message(msg_out));
     }
 
+    #[cfg(target_os = "windows")]
+    pub fn send_keyboard_layout_target(&self, klid: String) {
+        let peer_platform = self.peer_platform();
+        let keyboard_enabled = *self.server_keyboard_enabled.read().unwrap();
+        if peer_platform != crate::PLATFORM_WINDOWS || !keyboard_enabled {
+            log::warn!(
+                "MD_LAYOUT stage=controller-message-blocked klid={klid} peer_platform={peer_platform} keyboard_enabled={keyboard_enabled}"
+            );
+            return;
+        }
+        log::info!(
+            "MD_LAYOUT stage=controller-message-send klid={klid} peer_platform={peer_platform} keyboard_enabled=true"
+        );
+        let mut misc = Misc::new();
+        misc.set_keyboard_layout(KeyboardLayout {
+            klid,
+            ..Default::default()
+        });
+        let mut message = Message::new();
+        message.set_misc(misc);
+        self.send(Data::Message(message));
+    }
+
     pub fn get_toggle_option(&self, name: String) -> bool {
         self.lc.read().unwrap().get_toggle_option(&name)
     }
@@ -563,9 +586,13 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn restart_remote_device(&self) {
+        self.restart_remote_device_with_mode(false);
+    }
+
+    pub fn restart_remote_device_with_mode(&self, safe_mode: bool) {
         let mut lc = self.lc.write().unwrap();
         lc.mark_restarting_remote_device();
-        let msg = lc.restart_remote_device();
+        let msg = lc.restart_remote_device(safe_mode);
         self.send(Data::Message(msg));
     }
 

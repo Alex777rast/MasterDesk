@@ -131,6 +131,14 @@ pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
+fn relay_request_device_id(relay_ticket: Option<&RelayTicket>, fallback_id: &str) -> String {
+    relay_ticket
+        .map(|ticket| ticket.device_id.as_str())
+        .filter(|device_id| !device_id.is_empty())
+        .unwrap_or(fallback_id)
+        .to_owned()
+}
+
 #[cfg(not(target_os = "linux"))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
 
@@ -459,7 +467,7 @@ impl Client {
         };
         let udp_nat_port = udp.1.map(|x| *x.lock().unwrap()).unwrap_or(0);
         let punch_type = if udp_nat_port > 0 { "UDP" } else { "TCP" };
-        msg_out.set_punch_hole_request(PunchHoleRequest {
+        let mut punch_hole_request = PunchHoleRequest {
             id: peer.to_owned(),
             token: token.to_owned(),
             nat_type: nat_type.into(),
@@ -470,7 +478,11 @@ impl Client {
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
             ..Default::default()
-        });
+        };
+        if let Some(auth) = Self::new_relay_auth(&peer, "", "", conn_type).await {
+            punch_hole_request.relay_auth = hbb_common::protobuf::MessageField::some(auth);
+        }
+        msg_out.set_punch_hole_request(punch_hole_request);
         for i in 1..=3 {
             log::info!(
                 "#{} {} punch attempt with {}, id: {}",
@@ -551,6 +563,7 @@ impl Client {
                             }
                         }
                         signed_id_pk = rr.pk().into();
+                        let relay_ticket = rr.relay_ticket.clone().into_option();
                         let fut = Self::create_relay(
                             &peer,
                             rr.uuid,
@@ -558,6 +571,7 @@ impl Client {
                             &key,
                             conn_type,
                             my_addr.is_ipv4(),
+                            relay_ticket,
                         );
                         connect_futures.push(
                             async move {
@@ -848,6 +862,7 @@ impl Client {
         let mut succeed = false;
         let mut uuid = "".to_owned();
         let mut ipv4 = true;
+        let mut relay_ticket = None;
 
         for i in 1..=3 {
             // use different socket due to current hbbs implementation requiring different nat address for each attempt
@@ -871,14 +886,19 @@ impl Client {
                 relay_server,
                 secure,
             );
-            msg_out.set_request_relay(RequestRelay {
+            let mut request_relay = RequestRelay {
                 id: peer.to_owned(),
                 token: token.to_owned(),
                 uuid: uuid.clone(),
                 relay_server: relay_server.clone(),
                 secure,
+                conn_type: conn_type.into(),
                 ..Default::default()
-            });
+            };
+            if let Some(auth) = Self::new_relay_auth(peer, &uuid, &relay_server, conn_type).await {
+                request_relay.relay_auth = hbb_common::protobuf::MessageField::some(auth);
+            }
+            msg_out.set_request_relay(request_relay);
             socket.send(&msg_out).await?;
 
             if let Some(msg_in) =
@@ -888,6 +908,7 @@ impl Client {
                     if !rs.refuse_reason.is_empty() {
                         bail!(rs.refuse_reason);
                     }
+                    relay_ticket = rs.relay_ticket.into_option();
                     succeed = true;
                     break;
                 }
@@ -896,17 +917,61 @@ impl Client {
         if !succeed {
             bail!("Timeout");
         }
-        Self::create_relay(peer, uuid, relay_server, key, conn_type, ipv4).await
+        Self::create_relay(peer, uuid, relay_server, key, conn_type, ipv4, relay_ticket).await
+    }
+
+    async fn new_relay_auth(
+        peer: &str,
+        uuid: &str,
+        relay_server: &str,
+        conn_type: ConnType,
+    ) -> Option<RelayAuth> {
+        #[cfg(windows)]
+        if crate::ipc::should_use_installed_server_identity() {
+            match crate::ipc::request_installed_relay_auth(
+                peer,
+                uuid,
+                relay_server,
+                conn_type as i32,
+            )
+            .await
+            {
+                Ok(auth) => return Some(auth),
+                Err(err) => {
+                    log::warn!(
+                        "Installed MasterDesk server could not sign the connection request: {err}"
+                    );
+                    return None;
+                }
+            }
+        }
+        let requester_id = Config::get_id();
+        let secret_key = Config::get_key_pair().0;
+        let Some(secret_key) = hbb_common::masterdesk_security::secret_key_from_bytes(&secret_key)
+        else {
+            log::error!("Cannot sign the MasterDesk relay request: invalid local private key.");
+            return None;
+        };
+        Some(hbb_common::masterdesk_security::new_relay_auth(
+            peer,
+            uuid,
+            relay_server,
+            conn_type as i32,
+            &requester_id,
+            hbb_common::masterdesk_security::process_session_nonce(),
+            &secret_key,
+        ))
     }
 
     /// Create a relay connection to the server.
     async fn create_relay(
-        peer: &str,
+        _peer: &str,
         uuid: String,
         relay_server: String,
         key: &str,
         conn_type: ConnType,
         ipv4: bool,
+        relay_ticket: Option<RelayTicket>,
     ) -> ResultType<Stream> {
         let mut conn = connect_tcp(
             ipv4_to_ipv6(check_port(relay_server, RELAY_PORT), ipv4),
@@ -915,13 +980,18 @@ impl Client {
         .await
         .with_context(|| "Failed to connect to relay server")?;
         let mut msg_out = RendezvousMessage::new();
-        msg_out.set_request_relay(RequestRelay {
+        let device_id = relay_request_device_id(relay_ticket.as_ref(), &Config::get_id());
+        let mut request_relay = RequestRelay {
             licence_key: key.to_owned(),
-            id: peer.to_owned(),
+            id: device_id,
             uuid,
             conn_type: conn_type.into(),
             ..Default::default()
-        });
+        };
+        if let Some(relay_ticket) = relay_ticket {
+            request_relay.relay_ticket = hbb_common::protobuf::MessageField::some(relay_ticket);
+        }
+        msg_out.set_request_relay(request_relay);
         conn.send(&msg_out).await?;
         Ok(conn)
     }
@@ -1727,6 +1797,36 @@ struct ConnToken {
     password: Vec<u8>,
     password_source: PasswordSource,
     session_id: u64,
+}
+
+const MASTERDESK_WINDOWS_MAP_MODE_MIGRATION: &str = "masterdesk-windows-map-mode-v1";
+
+fn migrate_masterdesk_windows_keyboard_mode(
+    config: &mut PeerConfig,
+    peer_version: i64,
+    peer_platform: &str,
+) {
+    if peer_platform != crate::PLATFORM_WINDOWS
+        || config
+            .options
+            .get(MASTERDESK_WINDOWS_MAP_MODE_MIGRATION)
+            .map(String::as_str)
+            == Some("Y")
+        || !is_keyboard_mode_supported(&KeyboardMode::Map, peer_version, peer_platform)
+    {
+        return;
+    }
+
+    let current_mode = KeyboardMode::from_str(&config.keyboard_mode).unwrap_or_default();
+    if config.keyboard_mode.is_empty() || current_mode == KeyboardMode::Translate {
+        config.keyboard_mode = KeyboardMode::Map.to_string();
+    }
+    // Mark the one-time migration even when the user already selected Map or
+    // Legacy. Future explicit choices must not be overwritten on reconnect.
+    config.options.insert(
+        MASTERDESK_WINDOWS_MAP_MODE_MIGRATION.to_owned(),
+        "Y".to_owned(),
+    );
 }
 
 /// Login config handler for [`Client`].
@@ -2600,6 +2700,11 @@ impl LoginConfigHandler {
                 crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, evt);
             }
         }
+        migrate_masterdesk_windows_keyboard_mode(
+            &mut config,
+            get_version_number(&pi.version),
+            &pi.platform,
+        );
         if config.keyboard_mode.is_empty() {
             let preferred_mode =
                 KeyboardMode::from_str(crate::custom_defaults::DEFAULT_KEYBOARD_MODE)
@@ -2787,12 +2892,8 @@ impl LoginConfigHandler {
         msg_out
     }
 
-    pub fn restart_remote_device(&self) -> Message {
-        let mut misc = Misc::new();
-        misc.set_restart_remote_device(true);
-        let mut msg_out = Message::new();
-        msg_out.set_misc(misc);
-        msg_out
+    pub fn restart_remote_device(&self, safe_mode: bool) -> Message {
+        restart_remote_device_message(safe_mode)
     }
 
     pub fn mark_restarting_remote_device(&mut self) {
@@ -4144,7 +4245,7 @@ pub mod peer_online {
             Ok(s) => s,
             Err(e) => {
                 log::debug!("Failed to create peers online stream, {e}");
-                return Ok((vec![], ids.clone()));
+                return Err(e);
             }
         };
         // TODO: Use long connections to avoid socket creation
@@ -4153,7 +4254,7 @@ pub mod peer_online {
         // An established connection was aborted by the software in your host machine. (os error 10053)
         if let Err(e) = socket.send(&msg_out).await {
             log::debug!("Failed to send peers online states query, {e}");
-            return Ok((vec![], ids.clone()));
+            return Err(e.into());
         }
         // Retry for 2 times to get the online response
         for _ in 0..2 {
@@ -4163,19 +4264,7 @@ pub mod peer_online {
             {
                 match msg_in.union {
                     Some(rendezvous_message::Union::OnlineResponse(online_response)) => {
-                        let states = online_response.states;
-                        let mut onlines = Vec::new();
-                        let mut offlines = Vec::new();
-                        for i in 0..ids.len() {
-                            // bytes index from left to right
-                            let bit_value = 0x01 << (7 - i % 8);
-                            if (states[i / 8] & bit_value) == bit_value {
-                                onlines.push(ids[i].clone());
-                            } else {
-                                offlines.push(ids[i].clone());
-                            }
-                        }
-                        return Ok((onlines, offlines));
+                        return split_online_states(ids, &online_response.states);
                     }
                     _ => {
                         // ignore
@@ -4190,9 +4279,43 @@ pub mod peer_online {
         bail!("Failed to query online states, no online response");
     }
 
+    fn split_online_states(
+        ids: &[String],
+        states: &[u8],
+    ) -> ResultType<(Vec<String>, Vec<String>)> {
+        let required = (ids.len() + 7) / 8;
+        if states.len() < required {
+            bail!(
+                "Online response is truncated: received {} state bytes for {} peers",
+                states.len(),
+                ids.len()
+            );
+        }
+        let mut onlines = Vec::new();
+        let mut offlines = Vec::new();
+        for (i, id) in ids.iter().enumerate() {
+            let bit_value = 0x01 << (7 - i % 8);
+            if (states[i / 8] & bit_value) == bit_value {
+                onlines.push(id.clone());
+            } else {
+                offlines.push(id.clone());
+            }
+        }
+        Ok((onlines, offlines))
+    }
+
     #[cfg(test)]
     mod tests {
         use hbb_common::tokio;
+
+        #[test]
+        fn online_state_response_is_explicit_and_length_checked() {
+            let ids = vec!["one".to_owned(), "two".to_owned(), "three".to_owned()];
+            let (online, offline) = super::split_online_states(&ids, &[0b1010_0000]).unwrap();
+            assert_eq!(online, vec!["one", "three"]);
+            assert_eq!(offline, vec!["two"]);
+            assert!(super::split_online_states(&ids, &[]).is_err());
+        }
 
         #[tokio::test]
         async fn test_query_onlines() {
@@ -4333,4 +4456,130 @@ async fn udp_nat_connect(
             anyhow!(err)
         })?;
     Ok((res.1, Some(res.0), typ))
+}
+
+fn restart_remote_device_message(safe_mode: bool) -> Message {
+    let mut misc = Misc::new();
+    if safe_mode {
+        misc.set_restart_remote_device_safe_mode(true);
+    } else {
+        misc.set_restart_remote_device(true);
+    }
+    let mut message = Message::new();
+    message.set_misc(misc);
+    message
+}
+
+#[cfg(test)]
+mod masterdesk_relay_identity_tests {
+    use super::relay_request_device_id;
+    use hbb_common::rendezvous_proto::RelayTicket;
+
+    #[test]
+    fn relay_device_id_uses_the_server_authorized_ticket_identity() {
+        let ticket = RelayTicket {
+            device_id: "installed-masterdesk-id".to_owned(),
+            ..Default::default()
+        };
+        assert_eq!(
+            relay_request_device_id(Some(&ticket), "stale-window-id"),
+            "installed-masterdesk-id"
+        );
+        assert_eq!(relay_request_device_id(None, "fallback-id"), "fallback-id");
+    }
+}
+
+#[cfg(test)]
+mod masterdesk_restart_message_tests {
+    use super::restart_remote_device_message;
+    use hbb_common::message_proto::{message, misc};
+
+    #[test]
+    fn restart_remote_device_message_preserves_normal_wire_command() {
+        let message = restart_remote_device_message(false);
+        let Some(message::Union::Misc(misc)) = message.union else {
+            panic!("restart message must use Misc");
+        };
+        assert!(matches!(
+            misc.union,
+            Some(misc::Union::RestartRemoteDevice(true))
+        ));
+    }
+
+    #[test]
+    fn restart_remote_device_message_uses_safe_mode_wire_command() {
+        let message = restart_remote_device_message(true);
+        let Some(message::Union::Misc(misc)) = message.union else {
+            panic!("restart message must use Misc");
+        };
+        assert!(matches!(
+            misc.union,
+            Some(misc::Union::RestartRemoteDeviceSafeMode(true))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod masterdesk_keyboard_mode_tests {
+    use super::{
+        migrate_masterdesk_windows_keyboard_mode, MASTERDESK_WINDOWS_MAP_MODE_MIGRATION,
+    };
+    use hbb_common::{config::PeerConfig, get_version_number};
+
+    #[test]
+    fn migrates_existing_windows_translate_mode_to_physical_map_once() {
+        let mut config = PeerConfig {
+            keyboard_mode: "translate".to_owned(),
+            ..Default::default()
+        };
+        migrate_masterdesk_windows_keyboard_mode(
+            &mut config,
+            get_version_number("1.4.9"),
+            crate::PLATFORM_WINDOWS,
+        );
+        assert_eq!(config.keyboard_mode, "map");
+        assert_eq!(
+            config
+                .options
+                .get(MASTERDESK_WINDOWS_MAP_MODE_MIGRATION)
+                .map(String::as_str),
+            Some("Y")
+        );
+
+        config.keyboard_mode = "translate".to_owned();
+        migrate_masterdesk_windows_keyboard_mode(
+            &mut config,
+            get_version_number("1.4.9"),
+            crate::PLATFORM_WINDOWS,
+        );
+        assert_eq!(config.keyboard_mode, "translate");
+    }
+
+    #[test]
+    fn preserves_explicit_legacy_mode_and_non_windows_peers() {
+        let mut legacy = PeerConfig {
+            keyboard_mode: "legacy".to_owned(),
+            ..Default::default()
+        };
+        migrate_masterdesk_windows_keyboard_mode(
+            &mut legacy,
+            get_version_number("1.4.9"),
+            crate::PLATFORM_WINDOWS,
+        );
+        assert_eq!(legacy.keyboard_mode, "legacy");
+
+        let mut linux = PeerConfig {
+            keyboard_mode: "translate".to_owned(),
+            ..Default::default()
+        };
+        migrate_masterdesk_windows_keyboard_mode(
+            &mut linux,
+            get_version_number("1.4.9"),
+            "Linux",
+        );
+        assert_eq!(linux.keyboard_mode, "translate");
+        assert!(!linux
+            .options
+            .contains_key(MASTERDESK_WINDOWS_MAP_MODE_MIGRATION));
+    }
 }

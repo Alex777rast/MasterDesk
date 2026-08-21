@@ -1,5 +1,10 @@
 # MasterDesk self-hosted Windows build
 
+For a new Codex account or context-free continuation, read
+`CODEX_START_HERE.md` first. It routes only the relevant portions of the
+detailed handoff and plan. This guide does not authorize a build, publication,
+or production change by itself.
+
 This repository is based on the upstream RustDesk `1.4.9` tag
 (`6c578292e8ebbbec708b76986ba8c4bc7c509747`).
 
@@ -10,9 +15,8 @@ The client loads the following values before it reads a user profile:
 - Product name, Windows service and configuration namespace: `MasterDesk`
 - ID server: `hbbs.masterdesk.online`
 - Relay server: `hbbr.masterdesk.online`
-- Account/address-book API: `https://api.masterdesk.online`
-- Server public key:
-  `oxdGP9iGMJ1gA3gmyAyjUNmgNAx6F4kD6Z3sLRjY7G4=`
+- Account/address-book API: internal compiled endpoint, hidden from UI and exported configuration
+- Server public key: internal compiled value, hidden from UI and exported configuration
 - Codec: `VP9`
 - Image quality: `Balanced`
 - View style: `Adaptive`
@@ -37,8 +41,10 @@ The client loads the following values before it reads a user profile:
   verification
 - Unattended background installation: disabled
 
-The implementation is in `src/custom_defaults.rs`. The settings are defaults,
-not locked policy overrides, so an administrator can change them in the UI.
+The implementation is in `src/custom_defaults.rs`. ID and relay endpoints remain
+administrator-configurable. API Server and Key are protected internal values:
+they are obfuscated in the executable, hidden from the UI and cannot be replaced
+through the generic options bridge.
 Profiles that still contain the previous `desk.masteronline.space` or split
 `*.masteronline.space` endpoints are migrated to `*.masterdesk.online` during
 an application update. Unrecognized administrator-defined servers are kept.
@@ -54,18 +60,38 @@ relay traffic. Account and address-book requests use the separate HTTPS API at
 
 ## MasterDesk update channel
 
-At startup the client reads
-`https://api.masterdesk.online/masterdesk/version/latest`. The manifest
+An installed client can read the compiled HTTPS update manifest at startup. A
+portable client never requests the manifest automatically. The manifest
 contains an independent branded release sequence and an HTTPS release-page
 URL. A newer sequence displays a dismissible update card in the main window.
 
 For an installed Windows client the card downloads the exact MasterDesk release
 asset, verifies it against `SHA256.txt` from the same GitHub Release and starts
 an elevated in-place update. A downloaded `MasterDesk-*.exe` opens portably on
-a clean computer and shows the normal Install card in the main window. The same
-file updates in place when an installed MasterDesk copy is detected.
+a clean computer and shows the normal Install card in the main window. It also
+opens portably when an installed MasterDesk copy is detected: startup never
+enters installation or update automatically. If the portable build is newer
+than the installed copy, the main window shows an explicit `Update` button.
+Only that user action may start the local in-place update.
+Every package remains portable-by-default; never create a filename ending in
+`-install.exe`. Each new EXE uses
+`MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe`, with an increasing
+numeric beta. The same full `<version> beta <N>` and `YYYY-MM-DD HH:mm` build
+date are embedded in the package, displayed on **About MasterDesk**, written to
+installed registry metadata, and used for the local GUI Update comparison.
 The unattended background auto-installer remains disabled. Authenticode through
 SignPath is still required before describing the binaries as publisher-signed.
+
+A permanent password set by a clean portable process is stored as an encrypted
+verifier/salt pair in the user's `MasterDesk.toml`. The GUI reports success only
+after a checked write and fresh read confirm that exact pair, so closing and
+reopening the portable process must retain it. An installed Windows client uses
+the separate service-owned machine store instead.
+
+On Windows, Ctrl+Shift/Alt+Shift layout synchronization waits for Windows to
+commit the controller's local change (including key-up) and then sends that
+exact KLID to the controlled endpoint. Mismatched controller/controlled layouts
+must therefore converge after the first physical shortcut.
 To publish a release, first upload and verify the release assets, then allow the
 manifest refresh service to promote it. This ordering prevents clients from
 being directed to an incomplete release.
@@ -132,12 +158,60 @@ The script pins Rust 1.75.0, Flutter 3.24.5, LLVM 15.0.6, the upstream vcpkg
 baseline and flutter-rust-bridge 1.80.1. It also generates bridge files when a
 fresh Git checkout does not contain them.
 
-The packaged RDS build is written to
-`dist/MasterDesk-1.4.9-RDS-x86_64.exe`.
+The packaged RDS build is written to a beta/date-qualified path under `dist/`.
+
+For an intermediate Rust-only candidate, reuse the existing Flutter release
+runner with:
+
+`scripts/Build-CustomWindows.ps1 -SkipVcpkg -SkipFlutterSetup -IncrementalRustOnly -BetaNumber <N>`
+
+This mode rebuilds `librustdesk.dll` and the portable container only. It does
+not run Flutter AOT, CMake, vcpkg installation, `build.py`, or `cargo clean`.
+It requires a previously verified `flutter/build/windows/x64/runner/Release`
+directory and is not a substitute for the final release validation.
+
+For repeatable short edit/test cycles, use
+`scripts/Test-TargetedWindowsClient.ps1`. It keeps verbose Cargo output under
+`artifacts/targeted-windows-client/` and prints only compact PASS/FAIL lines.
+After those tests pass, `scripts/Build-IncrementalBeta.ps1` runs the same
+targeted gate, selects `max(existing beta) + 1`, and delegates to the cached
+Rust-only packaging path above. An explicit `-BetaNumber <N>` is accepted only
+when it is newer than every existing dated beta. Use `-SkipTargetedTests` only
+when the exact current tree has already passed that gate in the same task.
+Neither wrapper clears caches or touches VMware.
+
+If the same intermediate candidate also contains a targeted Dart UI change,
+add `-RefreshFlutterAot`. This invokes Flutter's cached Windows release AOT
+backend directly and copies the resulting `app.so`, then performs the same
+incremental Rust/package step. It does not run the outer CMake wrapper,
+`build.py`, vcpkg setup, `cargo clean`, or the full Windows build.
+
+The incremental AOT path includes a bounded watchdog for Flutter 3.24: after a
+new `app.so` has remained unchanged for 15 seconds, it stops only the stale
+hidden `tool_backend.bat` wrapper and continues with that verified output. A
+ten-minute deadline fails with paths to the isolated stdout/stderr logs under
+`.tools\logs\` instead of leaving the build waiting indefinitely.
+
+On this Codex Windows sandbox the legacy Flutter 3.24 backend can finish a new
+`flutter\.dart_tool\flutter_build\...\app.so` and its stamps but leave idle Dart
+wrapper processes. Do not rerun AOT or clear caches. Confirm the newest
+`app.so` is complete and stable, stop only that build wrapper, copy the exact
+new AOT to `flutter\build\windows\x64\runner\Release\data\app.so`, and resume
+the same beta with `-SkipTargetedTests` and without `-RefreshFlutterAot`.
 
 Use `scripts/Test-CustomDefaults.ps1` to run the offline tests that verify the
 resolved clean-profile server, permission, local/display and direct-routing
 settings.
+
+For edit/test iterations, use the economical sequence
+`FAST → INCREMENTAL BUILD → TARGETED VM RUNTIME → FINAL CANDIDATE → FULL REGRESSION / CLEAN BUILD only when required`.
+Run targeted tests first, preserve the existing build caches, use only the
+applicable VMware lab scenario, and create one full local candidate EXE after
+the whole change set has passed those checks. Full regression or a clean build
+is reserved for a release/final candidate that requires it, a build-system or
+toolchain change, proven cache incompatibility, or an explicit request. The lab
+is driven by `scripts/lab/Test-MasterDeskLab.ps1`; detailed output is kept under
+`artifacts/lab/` instead of being printed to the working context.
 
 ## GitHub Actions and releases
 

@@ -22,12 +22,17 @@ macro_rules! my_println{
     };
 }
 
-fn should_update_from_masterdesk_package(
-    package_name: &str,
-    args: &[String],
-    is_installed: bool,
-) -> bool {
-    is_installed && args.is_empty() && crate::common::is_masterdesk_release(package_name)
+#[cfg(windows)]
+fn wait_for_portable_handoff_before_initialization() {
+    let mut arguments = std::env::args().skip(1);
+    while let Some(argument) = arguments.next() {
+        if argument == "--wait-for-portable" {
+            if let Some(process_id) = arguments.next().and_then(|value| value.parse::<u32>().ok()) {
+                crate::platform::wait_for_process_exit(process_id, 30_000);
+            }
+            break;
+        }
+    }
 }
 
 /// shared by flutter and sciter main function
@@ -37,10 +42,21 @@ fn should_update_from_masterdesk_package(
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    #[cfg(windows)]
+    wait_for_portable_handoff_before_initialization();
+
     if !crate::common::global_init() {
         return None;
     }
     crate::load_custom_client();
+    #[cfg(windows)]
+    if crate::platform::is_cur_exe_the_installed() {
+        // The portable packer exposes the package name through this variable.
+        // An installed descendant can inherit it after an explicit GUI-driven
+        // install/update. Clear it before Windows bootstrap and before Flutter
+        // starts so the installed process can never be mistaken for portable.
+        std::env::remove_var(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY);
+    }
     #[cfg(windows)]
     if !crate::platform::windows::bootstrap() {
         // return None to terminate the process
@@ -87,6 +103,21 @@ pub fn core_main() -> Option<Vec<String>> {
         }
         i += 1;
     }
+    #[cfg(windows)]
+    if let Some(index) = args.iter().position(|arg| arg == "--wait-for-portable") {
+        let process_id = args
+            .get(index + 1)
+            .and_then(|value| value.parse::<u32>().ok());
+        let remove_end = if process_id.is_some() && index + 1 < args.len() {
+            index + 1
+        } else {
+            index
+        };
+        args.drain(index..=remove_end);
+        if process_id.is_none() {
+            log::warn!("Missing or invalid PID for --wait-for-portable.");
+        }
+    }
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if args.is_empty() {
         #[cfg(target_os = "linux")]
@@ -132,38 +163,23 @@ pub fn core_main() -> Option<Vec<String>> {
         args.push("--install".to_owned());
         flutter_args.push("--install".to_string());
     }
-    #[cfg(windows)]
-    {
-        // The portable packer runs its extracted executable from a temporary
-        // directory and exposes the downloaded package name through this
-        // environment variable. A downloaded MasterDesk release opens as a
-        // portable client on a clean computer, but becomes an in-place update
-        // when an installed copy is detected. Conventional *install.exe files
-        // retain their original installer/update behavior.
-        let package_name =
-            std::env::var(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY).unwrap_or_default();
-        let is_installed = crate::platform::is_installed();
-        if should_update_from_masterdesk_package(&package_name, &args, is_installed) {
-            args.push("--update".to_owned());
-        } else if click_setup
-            && is_installed
-            && args.first().map(String::as_str) == Some("--install")
-        {
-            if let Some(first) = args.first_mut() {
-                *first = "--update".to_owned();
-            }
-            flutter_args.retain(|arg| arg != "--install");
-        }
-    }
     if args.contains(&"--noinstall".to_string()) {
         args.clear();
     }
     if args.len() > 0 {
         if args[0] == "--version" {
-            println!("{}", crate::VERSION);
+            if crate::common::is_custom_client() {
+                println!("{}", crate::custom_defaults::build_display_version());
+            } else {
+                println!("{}", crate::VERSION);
+            }
             return None;
         } else if args[0] == "--build-date" {
-            println!("{}", crate::BUILD_DATE);
+            if crate::common::is_custom_client() {
+                println!("{}", crate::custom_defaults::CUSTOM_BUILD_DATE);
+            } else {
+                println!("{}", crate::BUILD_DATE);
+            }
             return None;
         }
     }
@@ -190,6 +206,8 @@ pub fn core_main() -> Option<Vec<String>> {
         }
     }
     hbb_common::init_log(false, &log_name);
+    #[cfg(windows)]
+    crate::platform::windows::clear_stale_stop_service_for_portable();
 
     // linux uni (url) go here.
     #[cfg(all(target_os = "linux", feature = "flutter"))]
@@ -228,7 +246,18 @@ pub fn core_main() -> Option<Vec<String>> {
             crate::platform::try_remove_temp_update_files();
             hbb_common::config::PeerConfig::preload_peers();
         }
-        std::thread::spawn(move || crate::start_server(false, no_server));
+        #[cfg(windows)]
+        let attach_to_installed_server =
+            args.is_empty() && crate::ipc::should_use_installed_server_identity();
+        #[cfg(not(windows))]
+        let attach_to_installed_server = false;
+        if attach_to_installed_server {
+            log::info!(
+                "MasterDesk GUI will use the service-owned installed server instead of starting a competing local server"
+            );
+        } else {
+            std::thread::spawn(move || crate::start_server(false, no_server));
+        }
     } else {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         // Root CLI management commands must talk to the user `--server` main IPC.
@@ -257,27 +286,31 @@ pub fn core_main() -> Option<Vec<String>> {
                     return None;
                 }
 
-                let text = match crate::platform::prepare_custom_client_update() {
+                let update_error = match crate::platform::prepare_custom_client_update() {
                     Err(e) => {
                         log::error!("Error preparing custom client update: {}", e);
-                        "Update failed!".to_string()
+                        Some(e.to_string())
                     }
-                    Ok(false) => "Update failed!".to_string(),
-                    Ok(true) => match platform::update_me(false) {
-                        Ok(_) => "Updated successfully!".to_string(),
-                        Err(err) => {
-                            log::error!("Failed with error: {err}");
-                            "Update failed!".to_string()
-                        }
-                    },
+                    Ok(false) => Some("Custom client update preparation failed".to_owned()),
+                    Ok(true) => platform::update_me(false).err().map(|err| err.to_string()),
                 };
-                Toast::new(Toast::POWERSHELL_APP_ID)
-                    .title(&config::APP_NAME.read().unwrap())
-                    .text1(&translate(text))
-                    .sound(Some(Sound::Default))
-                    .duration(Duration::Short)
-                    .show()
-                    .ok();
+                if let Some(err) = update_error {
+                    log::error!("Update failed with error: {err}");
+                    Toast::new(Toast::POWERSHELL_APP_ID)
+                        .title(&config::APP_NAME.read().unwrap())
+                        .text1(&translate("Update failed!".to_string()))
+                        .sound(Some(Sound::Default))
+                        .duration(Duration::Short)
+                        .show()
+                        .ok();
+                } else {
+                    // The installed handoff process is already waiting for this
+                    // updater PID. Do not show a success toast here: on some
+                    // Windows builds the notification call keeps the portable
+                    // updater alive, so the installed GUI never gets past the
+                    // handoff wait.
+                    log::info!("Update succeeded; closing the portable updater for GUI handoff.");
+                }
                 return None;
             } else if args[0] == "--after-install" {
                 if let Err(err) = platform::run_after_install() {
@@ -439,7 +472,28 @@ pub fn core_main() -> Option<Vec<String>> {
                 hbb_common::allow_err!(crate::run_me(vec!["--tray"]));
             }
             #[cfg(windows)]
-            crate::privacy_mode::restore_reg_connectivity(true, false);
+            {
+                if let Err(err) =
+                    crate::platform::windows::wait_for_server_handoff_if_requested(&args)
+                {
+                    log::error!("Failed protected --server handoff: {err}");
+                    return None;
+                }
+                crate::privacy_mode::restore_reg_connectivity(true, false);
+                if crate::platform::is_installed() {
+                    if let Err(err) = crate::ipc::sync_machine_session_nonce_for_server() {
+                        log::error!(
+                            "Failed to synchronize service-owned runtime identity nonce: {err}"
+                        );
+                    }
+                    if let Err(err) = crate::ipc::sync_machine_permanent_password_for_server() {
+                        log::error!(
+                            "Failed to synchronize service-owned permanent password; disabling per-user fallback: {err}"
+                        );
+                        config::Config::set_machine_permanent_password_runtime_unavailable();
+                    }
+                }
+            }
             #[cfg(any(target_os = "linux", target_os = "windows"))]
             {
                 crate::start_server(true, false);
@@ -791,39 +845,6 @@ pub fn core_main() -> Option<Vec<String>> {
     return Some(args);
 }
 
-#[cfg(test)]
-mod masterdesk_package_tests {
-    use super::should_update_from_masterdesk_package;
-
-    #[test]
-    fn clean_computer_runs_release_as_portable_client() {
-        assert!(!should_update_from_masterdesk_package(
-            "MasterDesk-1.4.9-RDS-x86_64.exe",
-            &[],
-            false
-        ));
-    }
-
-    #[test]
-    fn installed_computer_routes_release_to_update() {
-        assert!(should_update_from_masterdesk_package(
-            r"C:\Users\User\Downloads\MasterDesk-1.4.9-RDS-x86_64.exe",
-            &[],
-            true
-        ));
-        assert!(!should_update_from_masterdesk_package(
-            "MasterDesk-1.4.9-RDS-x86_64.exe",
-            &["--update".to_owned()],
-            true
-        ));
-        assert!(!should_update_from_masterdesk_package(
-            "rustdesk-1.4.9-install.exe",
-            &[],
-            true
-        ));
-    }
-}
-
 #[inline]
 #[cfg(all(feature = "flutter", feature = "plugin_framework"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -852,11 +873,16 @@ fn import_config(path: &str) {
         log::info!("Empty source config, skipped");
         return;
     }
-    if get_modified_time(&path) > get_modified_time(&Config::file())
-        && get_modified_time(&path) < get_exe_time()
-    {
-        if store_path(Config::file(), config).is_err() {
-            log::info!("config written");
+    let destination: Config = load_path(Config::file());
+    if should_import_primary_config(
+        destination.is_empty(),
+        get_modified_time(path),
+        get_modified_time(&Config::file()),
+        get_exe_time(),
+    ) {
+        match store_path(Config::file(), config) {
+            Ok(()) => log::info!("Primary config imported"),
+            Err(err) => log::error!("Failed to import primary config: {err}"),
         }
     }
     let config2: Config2 = load_path(path2.into());
@@ -865,6 +891,17 @@ fn import_config(path: &str) {
             log::info!("config2 written");
         }
     }
+}
+
+#[inline]
+fn should_import_primary_config(
+    destination_is_empty: bool,
+    source_modified: std::time::SystemTime,
+    destination_modified: std::time::SystemTime,
+    executable_time: std::time::SystemTime,
+) -> bool {
+    destination_is_empty
+        || (source_modified > destination_modified && source_modified < executable_time)
 }
 
 /// invoke a new connection
@@ -1021,6 +1058,7 @@ fn parse_silent_install_args(args: &[String]) -> (Option<bool>, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
@@ -1051,6 +1089,26 @@ mod tests {
         ] {
             assert!(!is_user_main_ipc_scope_cli_command(&args(&[command])));
         }
+    }
+
+    #[test]
+    fn empty_service_profile_imports_newer_user_identity() {
+        let source = UNIX_EPOCH + Duration::from_secs(300);
+        let executable = UNIX_EPOCH + Duration::from_secs(200);
+        assert!(should_import_primary_config(true, source, UNIX_EPOCH, executable));
+    }
+
+    #[test]
+    fn existing_service_identity_is_not_overwritten_by_post_build_config() {
+        let destination = UNIX_EPOCH + Duration::from_secs(100);
+        let executable = UNIX_EPOCH + Duration::from_secs(200);
+        let source = UNIX_EPOCH + Duration::from_secs(300);
+        assert!(!should_import_primary_config(
+            false,
+            source,
+            destination,
+            executable
+        ));
     }
 }
 

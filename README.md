@@ -55,7 +55,14 @@ pwsh -File .\scripts\Build-CustomWindows.ps1
 pwsh -File .\scripts\Test-CustomDefaults.ps1
 ```
 
-Результат: `dist/MasterDesk-1.4.9-RDS-x86_64.exe`.
+Результат следует правилу идентичности сборки:
+`dist/MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe`.
+
+Текущий проверенный пакет:
+`dist/MasterDesk-1.4.9-10-beta-19-2026-08-21-RDS-x86_64.exe`, SHA-256
+`D3061D886448B8A1C37AD290CEE948AA8B5A61AF02042345EDF612D0BE9B0355`.
+Это неподписанная portable-сборка, опубликованная без переименования как
+`v1.4.9-masterdesk.10-beta.19`.
 
 Зависимость `libs/hbb_common` публикуется отдельно как видимый fork:
 <https://github.com/Alex777rast/MasterDesk-hbb-common>.
@@ -86,3 +93,48 @@ RustDesk, а не официальный релиз RustDesk и не проду�
 
 Исходный проект и его история сохранены в fork. Сведения об авторских правах и
 модификациях приведены в [NOTICE](NOTICE).
+
+## Локальный GUI-тестовый контур
+
+Для воспроизводимых Windows GUI-тестов используется RDP/VMware-контур с двумя
+машинами: VM-A — управляемая, VM-B — управляющая. Чистые контрольные точки
+`00-CLEAN-RDP-MCP-ON/OFF` содержат только RDP и Windows-MCP, без MasterDesk;
+исходные `00-CLEAN-MASTERDESK-ON/OFF` сохранены отдельно.
+
+Полный тест установки, реальной передачи мыши/клавиатуры B → A и переключения
+удалённой раскладки запускается так:
+
+```powershell
+.\scripts\lab\Invoke-MasterDeskRdpLab.ps1 -Action IdentityTest -Vm A -ExePath <candidate.exe>
+.\scripts\lab\Invoke-MasterDeskRdpLab.ps1 -Action PasswordTest -Vm All -ExePath <candidate.exe>
+.\scripts\lab\Invoke-MasterDeskRdpLab.ps1 -Action InputTest -Vm All -ExePath <candidate.exe>
+```
+
+`IdentityTest` installs from the clean MCP baseline and verifies that the ID is
+unchanged across three service restarts. `PasswordTest` proves that an open
+main GUI keeps temporary-password authorization available: VM-B sees the
+password field instead of a mandatory approval wait, and VM-A Accept is never
+clicked. `InputTest` restarts Windows-MCP only
+after the final RDP desktop exists and selects the running RDP session from the
+live UI tree, so Viewer size changes do not invalidate clicks. Beta 16 passed
+the clean-baseline identity/password/input matrix. Beta 19 additionally passed
+installation on both live VMs, full Flutter-payload verification, temporary-
+password authentication, remembered-password reconnect and B → A attachment to
+the active RDP session. The user accepted the physical EN/RU synchronization
+result. Compact evidence is in `artifacts/beta19-upgrade-vm/result.txt`.
+
+Артефакты сохраняются в `artifacts/gui-runs/<timestamp>/`. Пароль RDP и разные
+bearer-токены VM-A/VM-B не хранятся в репозитории, конфигурации или артефактах;
+скрипты получают их только из пользовательских переменных окружения.
+
+## Текущее состояние сервера
+
+Production работает на exact image
+`sha256:bada4754be4c41e5fef6cc9ce8540c7c13d19a93a36eb44969df569d3f2049a1`
+в compatibility-режиме `N/N`. Исправлена повторная регистрация нового process
+nonce той же authenticated installation без ожидания старой 45-секундной
+аренды. Native direct/relay и WSS registration/reconnect/routing/relay canary-
+тесты прошли; реальные VM прошли direct и forced-relay соединения. Порты
+21118/21119 остаются loopback-only, внешний WSS доступен только через
+Caddy/HTTPS 443. Свежий backup и остановленные recovery-контейнеры прежнего
+exact image сохранены; подробности — в `artifacts/server-production-20260821/`.

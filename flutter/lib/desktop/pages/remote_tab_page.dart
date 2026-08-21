@@ -303,6 +303,23 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       ));
     }
 
+    if (perms['restart'] != false &&
+        pi.platform == kPeerPlatformWindows &&
+        pi.features.safeModeReboot) {
+      menu.add(MenuEntryButton<String>(
+        childBuilder: (TextStyle? style) => Text(
+          translate('Restart remote device in Safe Mode'),
+          style: style,
+        ),
+        proc: () => showRestartRemoteDevice(
+            pi, peerId ?? '', sessionId, ffi.dialogManager,
+            safeMode: true),
+        padding: padding,
+        dismissOnClicked: true,
+        dismissCallback: cancelFunc,
+      ));
+    }
+
     if (perms['keyboard'] != false && !ffi.ffiModel.viewOnly) {
       menu.add(RemoteMenuEntry.insertLock(sessionId, padding,
           dismissFunc: cancelFunc));

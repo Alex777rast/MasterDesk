@@ -290,6 +290,7 @@ pub async fn create_relay_connection(
     secure: bool,
     ipv4: bool,
     meta: ConnectionMeta,
+    relay_ticket: Option<RelayTicket>,
 ) {
     if let Err(err) = create_relay_connection_(
         server,
@@ -299,6 +300,7 @@ pub async fn create_relay_connection(
         secure,
         ipv4,
         meta,
+        relay_ticket,
     )
     .await
     {
@@ -319,6 +321,7 @@ async fn create_relay_connection_(
     secure: bool,
     ipv4: bool,
     meta: ConnectionMeta,
+    relay_ticket: Option<RelayTicket>,
 ) -> ResultType<()> {
     let mut stream = socket_client::connect_tcp(
         socket_client::ipv4_to_ipv6(crate::check_port(relay_server, RELAY_PORT), ipv4),
@@ -327,11 +330,17 @@ async fn create_relay_connection_(
     .await?;
     let mut msg_out = RendezvousMessage::new();
     let licence_key = crate::get_key(true).await;
-    msg_out.set_request_relay(RequestRelay {
+    let mut request_relay = RequestRelay {
         licence_key,
+        id: Config::get_id(),
         uuid,
         ..Default::default()
-    });
+    };
+    if let Some(relay_ticket) = relay_ticket {
+        request_relay.conn_type = relay_ticket.conn_type;
+        request_relay.relay_ticket = hbb_common::protobuf::MessageField::some(relay_ticket);
+    }
+    msg_out.set_request_relay(request_relay);
     stream.send(&msg_out).await?;
     create_tcp_connection(server, stream, peer_addr, secure, meta).await?;
     Ok(())
@@ -588,6 +597,14 @@ pub async fn start_server(is_server: bool, no_server: bool) {
 
     if is_server {
         crate::common::set_server_running(true);
+        #[cfg(windows)]
+        if crate::platform::is_cur_exe_the_installed() {
+            std::thread::spawn(|| {
+                if let Err(err) = crate::ipc::start_gui_compat() {
+                    log::error!("Failed to start installed GUI compatibility IPC: {err}");
+                }
+            });
+        }
         std::thread::spawn(move || {
             if let Err(err) = crate::ipc::start("") {
                 log::error!("Failed to start ipc: {}", err);

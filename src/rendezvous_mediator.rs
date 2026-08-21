@@ -19,6 +19,7 @@ use hbb_common::{
     log,
     protobuf::Message as _,
     rendezvous_proto::*,
+    sha2::{Digest, Sha256},
     sleep,
     socket_client::{self, connect_tcp, is_ipv4, new_direct_udp_for, new_udp_for},
     tokio::{self, select, sync::Mutex, time::interval},
@@ -32,6 +33,21 @@ use crate::{
 };
 
 type Message = RendezvousMessage;
+
+fn reconnect_identity_fingerprint(value: &[u8]) -> String {
+    if value.is_empty() {
+        return "empty".to_owned();
+    }
+    Sha256::digest(value)
+        .iter()
+        .take(6)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn websocket_heartbeat_due(elapsed_ms: u128, keep_alive_ms: i32) -> bool {
+    keep_alive_ms > 0 && elapsed_ms >= keep_alive_ms as u128 / 2
+}
 
 fn connection_meta(
     control_permissions: Option<ControlPermissions>,
@@ -51,6 +67,7 @@ lazy_static::lazy_static! {
 static SHOULD_EXIT: AtomicBool = AtomicBool::new(false);
 static MANUAL_RESTARTED: AtomicBool = AtomicBool::new(false);
 static SENT_REGISTER_PK: AtomicBool = AtomicBool::new(false);
+static IDENTITY_ROTATION_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub(crate) static NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "android")]
 static NOTIFIED_NEEDS_DEPLOY: AtomicBool = AtomicBool::new(false);
@@ -342,6 +359,16 @@ impl RendezvousMediator {
         match msg {
             Some(rendezvous_message::Union::RegisterPeerResponse(rpr)) => {
                 update_latency();
+                log::info!(
+                    "MD_RECONNECT stage=T4-client-response server={} request_pk={} identity_rotation={}",
+                    self.host,
+                    rpr.request_pk,
+                    rpr.identity_rotation.is_some()
+                );
+                if let Some(rotation) = rpr.identity_rotation.into_option() {
+                    self.handle_identity_rotation(rotation, sink).await?;
+                    return Ok(());
+                }
                 if rpr.request_pk {
                     log::info!("request_pk received from {}", self.host);
                     self.register_pk(sink).await?;
@@ -355,6 +382,7 @@ impl RendezvousMediator {
                         Config::set_host_key_confirmed(&self.host_prefix, true);
                         *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
                         NEEDS_DEPLOY.store(false, Ordering::SeqCst);
+                        IDENTITY_ROTATION_IN_PROGRESS.store(false, Ordering::SeqCst);
                         #[cfg(target_os = "android")]
                         reset_needs_deploy_notification();
                     }
@@ -422,6 +450,7 @@ impl RendezvousMediator {
 
     pub async fn start_tcp(server: ServerPtr, host: String) -> ResultType<()> {
         let host = check_port(&host, RENDEZVOUS_PORT);
+        let client_drives_heartbeat = use_ws();
         log::info!("start tcp: {}", hbb_common::websocket::check_ws(&host));
         let mut conn = connect_tcp(host.clone(), CONNECT_TIMEOUT).await?;
         let key = crate::get_key(true).await;
@@ -435,6 +464,7 @@ impl RendezvousMediator {
         let mut timer = crate::rustdesk_interval(interval(crate::TIMER_OUT));
         let mut last_register_sent: Option<Instant> = None;
         let mut last_recv_msg = Instant::now();
+        let mut last_heartbeat_sent = Instant::now();
         // we won't support connecting to multiple rendzvous servers any more, so we can use a global variable here.
         Config::set_host_key_confirmed(&rz.host_prefix, false);
         loop {
@@ -465,6 +495,19 @@ impl RendezvousMediator {
                     // https://www.emqx.com/en/blog/mqtt-keep-alive
                     if last_recv_msg.elapsed().as_millis() as u64 > rz.keep_alive as u64 * 3 / 2 {
                         bail!("Rendezvous connection is timeout");
+                    }
+                    if client_drives_heartbeat
+                        && websocket_heartbeat_due(
+                            last_heartbeat_sent.elapsed().as_millis(),
+                            rz.keep_alive,
+                        )
+                    {
+                        conn.send_bytes(bytes::Bytes::new()).await?;
+                        last_heartbeat_sent = Instant::now();
+                        // A successful write proves that the transport is still usable and
+                        // keeps both the WSS proxy and hbbs registration alive. A broken
+                        // connection is reported by the send itself.
+                        last_recv_msg = Instant::now();
                     }
                     if (!Config::get_key_confirmed() ||
                         !Config::get_host_key_confirmed(&rz.host_prefix)) &&
@@ -504,6 +547,7 @@ impl RendezvousMediator {
             rr.control_permissions.into_option(),
             rr.controlled_context.into_option(),
         );
+        let relay_ticket = rr.relay_ticket.clone().into_option();
 
         self.create_relay(
             rr.socket_addr.into(),
@@ -514,6 +558,7 @@ impl RendezvousMediator {
             false,
             Default::default(),
             meta,
+            relay_ticket,
         )
         .await
     }
@@ -528,6 +573,7 @@ impl RendezvousMediator {
         initiate: bool,
         socket_addr_v6: bytes::Bytes,
         meta: ConnectionMeta,
+        relay_ticket: Option<RelayTicket>,
     ) -> ResultType<()> {
         let peer_addr = AddrMangle::decode(&socket_addr);
         log::info!(
@@ -562,6 +608,7 @@ impl RendezvousMediator {
             secure,
             is_ipv4(&self.addr),
             meta,
+            relay_ticket,
         )
         .await;
         Ok(())
@@ -583,6 +630,7 @@ impl RendezvousMediator {
             fla.control_permissions.clone().into_option(),
             fla.controlled_context.clone().into_option(),
         );
+        let relay_ticket = fla.relay_ticket.clone().into_option();
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 = start_ipv6(peer_addr_v6, addr, server.clone(), meta.clone()).await;
         }
@@ -612,6 +660,7 @@ impl RendezvousMediator {
             true,
             socket_addr_v6,
             meta,
+            relay_ticket,
         )
         .await
     }
@@ -662,6 +711,7 @@ impl RendezvousMediator {
             ph.control_permissions.into_option(),
             ph.controlled_context.into_option(),
         );
+        let relay_ticket = ph.relay_ticket.clone().into_option();
         if peer_addr_v6.port() > 0 && !relay {
             socket_addr_v6 =
                 start_ipv6(peer_addr_v6, peer_addr, server.clone(), meta.clone()).await;
@@ -684,6 +734,7 @@ impl RendezvousMediator {
                     true,
                     socket_addr_v6.clone(),
                     meta,
+                    relay_ticket,
                 )
                 .await;
         }
@@ -765,30 +816,45 @@ impl RendezvousMediator {
         let pk = Config::get_key_pair().1;
         let uuid = hbb_common::get_uuid();
         let id = Config::get_id();
-        msg_out.set_register_pk(RegisterPk {
+        let mut register_pk = RegisterPk {
             id,
             uuid: uuid.into(),
             pk: pk.into(),
             no_register_device: Config::no_register_device(),
             ..Default::default()
-        });
+        };
+        if let Some(lease) = Self::new_device_lease(&register_pk.id) {
+            register_pk.lease = hbb_common::protobuf::MessageField::some(lease);
+        }
+        msg_out.set_register_pk(register_pk);
         socket.send(&msg_out).await?;
         SENT_REGISTER_PK.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     async fn handle_uuid_mismatch(&mut self, socket: Sink<'_>) -> ResultType<()> {
-        {
-            let mut solving = SOLVING_PK_MISMATCH.lock().await;
-            if solving.is_empty() || *solving == self.host {
-                log::info!("UUID_MISMATCH received from {}", self.host);
-                Config::set_key_confirmed(false);
-                Config::update_id();
+        let mut solving = SOLVING_PK_MISMATCH.lock().await;
+        let mismatch_already_seen = !solving.is_empty();
+        log::warn!("UUID_MISMATCH received from {}", self.host);
+        Config::set_key_confirmed(false);
+        Config::set_host_key_confirmed(&self.host_prefix, false);
+        let custom_client = crate::common::is_custom_client();
+        if custom_client {
+            if !mismatch_already_seen {
                 *solving = self.host.clone();
-            } else {
-                return Ok(());
             }
+            log::warn!(
+                "MasterDesk ID was preserved after an unauthenticated UUID_MISMATCH; waiting for a signed identity rotation. Check Windows time, MachineGuid, config write errors, and server registration."
+            );
+            return Ok(());
         }
+        if !should_rotate_legacy_uuid_mismatch(custom_client, mismatch_already_seen) {
+            log::warn!("Ignoring repeated UUID_MISMATCH without rotating the ID again");
+            return Ok(());
+        }
+        Config::update_id();
+        *solving = self.host.clone();
+        drop(solving);
         self.register_pk(socket).await
     }
 
@@ -813,13 +879,101 @@ impl RendezvousMediator {
         );
         let mut msg_out = Message::new();
         let serial = Config::get_serial();
-        msg_out.set_register_peer(RegisterPeer {
+        let mut register_peer = RegisterPeer {
             id,
             serial,
             ..Default::default()
-        });
+        };
+        if let Some(lease) = Self::new_device_lease(&register_peer.id) {
+            log::info!(
+                "MD_RECONNECT stage=T3-register-send server={} transport={} id={} installation_fp={} process_fp={} lease_timestamp={}",
+                self.host,
+                if use_ws() { "websocket" } else { "native" },
+                register_peer.id,
+                reconnect_identity_fingerprint(&lease.installation_id),
+                reconnect_identity_fingerprint(&lease.session_nonce),
+                lease.timestamp
+            );
+            register_peer.lease = hbb_common::protobuf::MessageField::some(lease);
+        } else {
+            log::warn!(
+                "MD_RECONNECT stage=T3-register-send server={} transport={} id={} lease=missing",
+                self.host,
+                if use_ws() { "websocket" } else { "native" },
+                register_peer.id
+            );
+        }
+        msg_out.set_register_peer(register_peer);
         socket.send(&msg_out).await?;
         Ok(())
+    }
+
+    fn new_device_lease(id: &str) -> Option<DeviceLease> {
+        let secret_key = Config::get_key_pair().0;
+        let Some(secret_key) =
+            hbb_common::masterdesk_security::secret_key_from_bytes(&secret_key)
+        else {
+            log::error!("Cannot sign the MasterDesk device lease: invalid local private key.");
+            return None;
+        };
+        Some(hbb_common::masterdesk_security::new_device_lease(
+            id,
+            &Config::get_installation_id(),
+            hbb_common::masterdesk_security::process_session_nonce(),
+            &secret_key,
+        ))
+    }
+
+    async fn handle_identity_rotation(
+        &mut self,
+        rotation: IdentityRotation,
+        socket: Sink<'_>,
+    ) -> ResultType<()> {
+        let id = Config::get_id();
+        let session_nonce = hbb_common::masterdesk_security::process_session_nonce();
+        if rotation.session_nonce.as_ref() != session_nonce
+            || rotation.nonce.len() < 16
+            || !hbb_common::masterdesk_security::timestamp_is_fresh(
+                rotation.issued_at,
+                hbb_common::masterdesk_security::unix_timestamp_secs(),
+                120,
+            )
+        {
+            log::warn!("Ignored an invalid or stale MasterDesk identity rotation command.");
+            return Ok(());
+        }
+        let Some(server_key) = hbb_common::masterdesk_security::public_key_from_base64(
+            &crate::custom_defaults::internal_server_public_key(),
+        ) else {
+            log::error!("Cannot verify identity rotation: invalid bundled server key.");
+            return Ok(());
+        };
+        if !hbb_common::masterdesk_security::verify_identity_rotation(
+            &id,
+            &rotation,
+            &server_key,
+        ) {
+            log::warn!("Ignored an identity rotation command with an invalid signature.");
+            return Ok(());
+        }
+        if IDENTITY_ROTATION_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            log::info!("A MasterDesk identity rotation is already in progress.");
+            return Ok(());
+        }
+
+        Config::rotate_masterdesk_identity();
+        Config::set_host_key_confirmed(&self.host_prefix, false);
+        *SOLVING_PK_MISMATCH.lock().await = self.host.clone();
+        let delay_ms = 100 + hbb_common::time_based_rand() % 900;
+        sleep(delay_ms as f32 / 1000.).await;
+        let result = self.register_pk(socket).await;
+        if result.is_err() {
+            IDENTITY_ROTATION_IN_PROGRESS.store(false, Ordering::SeqCst);
+        }
+        result
     }
 
     fn get_relay_server(&self, provided_by_rendezvous_server: String) -> String {
@@ -831,6 +985,36 @@ impl RendezvousMediator {
             relay_server = crate::increase_port(&self.host, 1);
         }
         relay_server
+    }
+}
+
+#[inline]
+fn should_rotate_legacy_uuid_mismatch(custom_client: bool, mismatch_already_seen: bool) -> bool {
+    !custom_client && !mismatch_already_seen
+}
+
+#[cfg(test)]
+mod masterdesk_websocket_heartbeat_tests {
+    use super::{should_rotate_legacy_uuid_mismatch, websocket_heartbeat_due};
+
+    #[test]
+    fn websocket_heartbeat_uses_half_of_server_keep_alive() {
+        assert!(!websocket_heartbeat_due(9_999, 20_000));
+        assert!(websocket_heartbeat_due(10_000, 20_000));
+        assert!(websocket_heartbeat_due(25_000, 20_000));
+        assert!(!websocket_heartbeat_due(10_000, 0));
+    }
+
+    #[test]
+    fn custom_client_never_rotates_on_unauthenticated_uuid_mismatch() {
+        assert!(!should_rotate_legacy_uuid_mismatch(true, false));
+        assert!(!should_rotate_legacy_uuid_mismatch(true, true));
+    }
+
+    #[test]
+    fn legacy_client_rotates_at_most_once_per_mismatch_cycle() {
+        assert!(should_rotate_legacy_uuid_mismatch(false, false));
+        assert!(!should_rotate_legacy_uuid_mismatch(false, true));
     }
 }
 

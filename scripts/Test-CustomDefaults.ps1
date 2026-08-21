@@ -5,7 +5,11 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ProjectRoot = [System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$VcpkgRoot = Join-Path $ProjectRoot '.tools\vcpkg'
+$VcpkgRoot = if ($env:MASTERDESK_VCPKG_ROOT) {
+    [System.IO.Path]::GetFullPath($env:MASTERDESK_VCPKG_ROOT)
+} else {
+    Join-Path $ProjectRoot '.tools\vcpkg'
+}
 $CargoBin = Join-Path $env:USERPROFILE '.cargo\bin'
 $LlvmBin = if ($env:MASTERDESK_LLVM_BIN) {
     [System.IO.Path]::GetFullPath($env:MASTERDESK_LLVM_BIN)
@@ -15,6 +19,29 @@ $LlvmBin = if ($env:MASTERDESK_LLVM_BIN) {
         [System.IO.Path]::GetDirectoryName($clangCommand.Source)
     } else {
         'C:\Program Files\LLVM\bin'
+    }
+}
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [Parameter()][string[]]$Arguments = @(),
+        [Parameter(Mandatory)][string]$FailureMessage
+    )
+
+    # Python unittest and Cargo legitimately write progress to stderr. When a
+    # caller redirects this script to an artifact, Windows PowerShell otherwise
+    # promotes those lines to terminating NativeCommandError records.
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        & $FilePath @Arguments
+        $nativeExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($nativeExitCode -ne 0) {
+        throw "$FailureMessage with exit code $nativeExitCode."
     }
 }
 $VsDevCmd = if ($env:MASTERDESK_VSDEVCMD) {
@@ -91,9 +118,8 @@ $customDefaults = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\custom_d
 foreach ($expectedValue in @(
     'hbbs.masterdesk.online',
     'hbbr.masterdesk.online',
-    'https://api.masterdesk.online/masterdesk/version/latest',
     'MasterDesk-1.4.9-RDS-x86_64.exe',
-    '1.4.9-6'
+    '1.4.9-10'
 )) {
     if ($customDefaults -notmatch [regex]::Escape($expectedValue)) {
         throw "Compiled MasterDesk defaults are missing $expectedValue."
@@ -105,8 +131,98 @@ if ($customDefaults -notmatch 'migrate_previous_network_settings') {
 if ($customDefaults -notmatch 'DEFAULT_IMAGE_QUALITY:\s*&str\s*=\s*"balanced"') {
     throw 'Default image quality must be "balanced".'
 }
+if ($customDefaults -notmatch 'is_protected_network_option' -or
+    $customDefaults -notmatch 'OBFUSCATED_API_SERVER' -or
+    $customDefaults -notmatch 'OBFUSCATED_UPDATE_MANIFEST_URL' -or
+    $customDefaults -notmatch 'OBFUSCATED_SERVER_PUBLIC_KEY' -or
+    $customDefaults -notmatch 'OPTION_FORCE_SECURE_WEBSOCKET') {
+    throw 'MasterDesk API/Key are not protected as internal compiled settings.'
+}
+if ($customDefaults -match 'https://api\.masterdesk\.online') {
+    throw 'The MasterDesk API URL must not be stored as plain text in the client source.'
+}
+
+$websocketSource = Get-Content -LiteralPath `
+    (Join-Path $ProjectRoot 'libs\hbb_common\src\websocket.rs') -Raw
+if ($websocketSource -notmatch 'OPTION_FORCE_SECURE_WEBSOCKET' -or
+    $websocketSource -notmatch 'client_async_tls_with_config' -or
+    $websocketSource -notmatch 'connect_direct_server') {
+    throw 'MasterDesk WSS is not forced through the direct Windows route.'
+}
+
+$uiInterface = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\ui_interface.rs') -Raw
+if ($uiInterface -notmatch '\.filter\(\|\(key, _\)\| !crate::custom_defaults::is_protected_network_option\(key\)\)' -or
+    $uiInterface -notmatch 'm\.retain\(\|key, _\| !crate::custom_defaults::is_protected_network_option\(key\)\)') {
+    throw 'Protected API/Key settings are not filtered from the native UI bridge.'
+}
 
 $flutterCommon = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\common.dart') -Raw
+if ($flutterCommon -notmatch 'isMasterDeskClient' -or
+    $flutterCommon -notmatch "apiServer\s*=\s*isMasterDeskClient\s*\?\s*''" -or
+    $flutterCommon -notmatch "key\s*=\s*isMasterDeskClient\s*\?\s*''") {
+    throw 'Protected API/Key settings are not removed from the Flutter model.'
+}
+
+$rendezvousProto = Get-Content -LiteralPath `
+    (Join-Path $ProjectRoot 'libs\hbb_common\protos\rendezvous.proto') -Raw
+foreach ($securityMessage in @('DeviceLease', 'IdentityRotation', 'RelayAuth', 'RelayTicket')) {
+    if ($rendezvousProto -notmatch "message\s+$securityMessage") {
+        throw "Rendezvous protocol is missing $securityMessage."
+    }
+}
+
+$messageProto = Get-Content -LiteralPath `
+    (Join-Path $ProjectRoot 'libs\hbb_common\protos\message.proto') -Raw
+if ($messageProto -notmatch 'message\s+KeyboardLayout' -or
+    $messageProto -notmatch 'KeyboardLayout\s+keyboard_layout\s*=\s*39') {
+    throw 'The legacy KeyboardLayout wire field must remain for protocol compatibility.'
+}
+$inputModel = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\models\input_model.dart') -Raw
+$inputModifierUtils = Get-Content -LiteralPath `
+    (Join-Path $ProjectRoot 'flutter\lib\models\input_modifier_utils.dart') -Raw
+$nativeKeyboard = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\keyboard.rs') -Raw
+if ($inputModel -notmatch 'shouldPassWindowsModifierToPlatform' -or
+    $inputModel -notmatch 'KeyEventResult\.skipRemainingHandlers' -or
+    $inputModifierUtils -notmatch 'PhysicalKeyboardKey\.altLeft' -or
+    $inputModifierUtils -notmatch 'PhysicalKeyboardKey\.controlLeft' -or
+    $inputModifierUtils -notmatch 'PhysicalKeyboardKey\.shiftLeft' -or
+    $nativeKeyboard -notmatch 'should_pass_windows_modifier_to_platform' -or
+    $nativeKeyboard -notmatch 'is_press\s*&&\s*!pass_modifier_to_platform') {
+    throw 'Windows modifiers are not forwarded to both the peer and local platform for both input sources.'
+}
+$serverConnection = Get-Content -LiteralPath `
+    (Join-Path $ProjectRoot 'src\server\connection.rs') -Raw
+$clientIoLoop = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\client\io_loop.rs') -Raw
+if ($serverConnection -match 'should_sync_keyboard_layout_after_key' -or
+    $clientIoLoop -notmatch 'Ignored peer keyboard layout' -or
+    $clientIoLoop -match 'apply_keyboard_layout_klid') {
+    throw 'The stale peer-KLID feedback path can still override the controller layout.'
+}
+
+$serverPatch = Join-Path $ProjectRoot 'deploy\masterdesk-server\masterdesk-server-a7736be.patch'
+$serverPatchScript = Join-Path $ProjectRoot 'deploy\masterdesk-server\Apply-MasterDeskServerPatch.ps1'
+$caddyExample = Join-Path $ProjectRoot 'deploy\masterdesk-server\Caddyfile.example'
+foreach ($serverArtifact in @($serverPatch, $serverPatchScript, $caddyExample)) {
+    if (-not (Test-Path -LiteralPath $serverArtifact)) {
+        throw "Server security artifact is missing: $serverArtifact"
+    }
+}
+$serverPatchSource = Get-Content -LiteralPath $serverPatch -Raw
+foreach ($serverSecurityMarker in @(
+    'require-relay-ticket',
+    'relay_ed25519',
+    'CONSUMED_TICKETS',
+    'MAX_ACTIVE_PER_IP',
+    'DEVICE_LEASE_TIMEOUT'
+)) {
+    if ($serverPatchSource -notmatch [regex]::Escape($serverSecurityMarker)) {
+        throw "Server security patch is missing $serverSecurityMarker."
+    }
+}
+if ($serverPatchSource -notmatch 'if\s+!relay_security_required\(\)\s*\{\s*\+?\s*return true;') {
+    throw 'Server compatibility mode can still reject partially upgraded clients.'
+}
+
 if ($flutterCommon -notmatch 'kCheckSoftwareUpdateFinish') {
     throw 'The Flutter main process is not registered for update notifications.'
 }
@@ -128,6 +244,31 @@ if ($desktopHome -notmatch '!bind\.mainIsInstalled\(\)' -or
     $desktopHome -notmatch 'bind\.mainGotoInstall\(\)') {
     throw 'The portable MasterDesk client does not offer installation from the main window.'
 }
+if ($desktopHome -notmatch 'mainIsInstalledLowerVersion\(\)' -or
+    $desktopHome -notmatch '"Update"' -or
+    $desktopHome -notmatch 'bind\.mainUpdateMe\(\)') {
+    throw 'The portable MasterDesk client does not expose the explicit GUI Update button.'
+}
+if ($customDefaults -notmatch 'BUILD_BETA_NUMBER' -or
+    $customDefaults -notmatch 'CUSTOM_BUILD_DATE' -or
+    $customDefaults -notmatch 'installed_build_is_older') {
+    throw 'Numeric beta/date identity or local installed-version comparison is missing.'
+}
+$buildScript = Get-Content -LiteralPath (Join-Path $ProjectRoot 'scripts\Build-CustomWindows.ps1') -Raw
+if ($buildScript -notmatch 'MasterDesk-\$BuildBaseVersion-beta-\$BetaNumber-\$BuildDateForFileName-RDS-x86_64\.exe' -or
+    $buildScript -notmatch 'MASTERDESK_BUILD_BETA_NUMBER' -or
+    $buildScript -notmatch 'MASTERDESK_BUILD_DATE') {
+    throw 'The Windows build script does not enforce the beta/date EXE identity.'
+}
+if ($buildScript -match '(?i)-install\.exe') {
+    throw 'The Windows build script must not create a MasterDesk -install.exe.'
+}
+if ($buildScript -notmatch 'RefreshFlutterAot' -or
+    $buildScript -notmatch 'tool_backend\.bat' -or
+    $buildScript -notmatch "@\('windows-x64', 'Release'\)" -or
+    $buildScript -notmatch "-Filter 'app\.so'") {
+    throw 'The targeted Dart UI path does not refresh only the cached Flutter runner.'
+}
 
 $portablePacker = Get-Content -LiteralPath (Join-Path $ProjectRoot 'libs\portable\src\main.rs') -Raw
 if ($portablePacker -notmatch 'masterdesk_release_runs_portable_by_default') {
@@ -138,8 +279,85 @@ if ($portablePacker -match 'name\.starts_with\("masterdesk-"\)') {
 }
 
 $coreMain = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\core_main.rs') -Raw
-if ($coreMain -notmatch 'should_update_from_masterdesk_package') {
-    throw 'An installed MasterDesk client is not routed to the in-place update path.'
+foreach ($forbiddenStartupUpdate in @(
+    'should_update_from_masterdesk_package',
+    'is_installed_masterdesk_package_launch',
+    'confirm_message_box',
+    'launch_installed_application'
+)) {
+    if ($coreMain -match [regex]::Escape($forbiddenStartupUpdate)) {
+        throw "Portable startup still contains the automatic update path $forbiddenStartupUpdate."
+    }
+}
+if ($coreMain -notmatch 'is_cur_exe_the_installed\(\)' -or
+    $coreMain -notmatch 'remove_var\(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY\)') {
+    throw 'The installed executable does not clear the inherited portable package marker.'
+}
+if ($coreMain -notmatch 'should_use_installed_gui_compat' -or
+    $coreMain -notmatch 'Portable GUI will use the installed MasterDesk server') {
+    throw 'Portable MasterDesk can start a second server instead of attaching to the installed GUI compatibility IPC.'
+}
+
+$ipcSource = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\ipc.rs') -Raw
+if ($ipcSource -notmatch 'POSTFIX_GUI_COMPAT' -or
+    $ipcSource -notmatch 'gui_compat_config_query_allowed' -or
+    $ipcSource -notmatch 'gui_compat_does_not_expose_machine_password_verifier' -or
+    $ipcSource -notmatch 'sanitized_gui_compat_options') {
+    throw 'The installed GUI compatibility IPC is missing its versioned route or security allowlist coverage.'
+}
+
+$commonSource = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\common.rs') -Raw
+if ($commonSource -notmatch 'should_check_software_update_for_runtime' -or
+    $commonSource -notmatch 'is_masterdesk\s*&&\s*!crate::platform::is_cur_exe_the_installed\(\)' -or
+    $commonSource -notmatch 'Skipping the automatic MasterDesk update request') {
+    throw 'Portable MasterDesk startup can still make an automatic update-manifest request.'
+}
+
+$windowsPlatform = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\platform\windows.rs') -Raw
+if ($windowsPlatform -notmatch 'Installation completed; exiting the portable IPC owner') {
+    throw 'The portable installer does not release the IPC pipe after installation.'
+}
+if ($coreMain -notmatch '--wait-for-portable' -or
+    $windowsPlatform -notmatch 'wait_for_process_exit' -or
+    $windowsPlatform -notmatch 'wait_for_current_process') {
+    throw 'The installed GUI does not wait for the portable installer to release IPC.'
+}
+$earlyHandoff = $coreMain.IndexOf('wait_for_portable_handoff_before_initialization();')
+$globalInit = $coreMain.IndexOf('crate::common::global_init()')
+if ($earlyHandoff -lt 0 -or $globalInit -lt 0 -or $earlyHandoff -gt $globalInit) {
+    throw 'The portable handoff wait must happen before global initialization and IPC bootstrap.'
+}
+if ($windowsPlatform -notmatch 'main_window_sessions\.dedup\(\)' -or
+    $windowsPlatform -notmatch 'tray_sessions\.dedup\(\)') {
+    throw 'The updater does not deduplicate Windows sessions before restoring GUI and tray processes.'
+}
+if ($coreMain -notmatch 'Update succeeded; closing the portable updater for GUI handoff' -or
+    $coreMain -match 'text1\(&translate\(text\)\)') {
+    throw 'The successful updater path may remain alive while displaying a notification.'
+}
+$runnerMain = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\windows\runner\main.cpp') -Raw
+if ($runnerMain -notmatch '"--wait-for-portable"') {
+    throw 'The Flutter runner does not allow the installed handoff process to start.'
+}
+$desktopHome = Get-Content -LiteralPath (Join-Path $ProjectRoot 'flutter\lib\desktop\pages\desktop_home_page.dart') -Raw
+if ($desktopHome -notmatch 'Expanded\(\s*child: SingleChildScrollView\(') {
+    throw 'The GUI update card can be clipped below the non-scrollable left pane.'
+}
+if ($windowsPlatform -notmatch 'application_display_version\(\)' -or
+    $windowsPlatform -notmatch 'build_display_version\(\)' -or
+    $windowsPlatform -notmatch 'CUSTOM_BUILD_DATE') {
+    throw 'The installed MasterDesk build number is not persisted for update comparisons.'
+}
+if ($windowsPlatform -notmatch 'No previous main window found; opening the updated application' -or
+    $windowsPlatform -notmatch 'vec!\["--wait-for-portable", &updater_pid\]') {
+    throw 'The updater does not wait for the portable process before reopening the main MasterDesk window.'
+}
+
+$directServer = Get-Content -LiteralPath (Join-Path $ProjectRoot 'libs\hbb_common\src\direct_server.rs') -Raw
+$socketClient = Get-Content -LiteralPath (Join-Path $ProjectRoot 'libs\hbb_common\src\socket_client.rs') -Raw
+if ($directServer -notmatch 'pub fn resolved_target\(' -or
+    $socketClient -notmatch 'compiled IPv4 alias') {
+    throw 'Direct-server hostnames are not resolved through the compiled IPv4 alias.'
 }
 
 $flutterFfi = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.rs') -Raw
@@ -160,58 +378,58 @@ $pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
 if (-not $pythonCommand) {
     throw 'Python is required to test the update-manifest refresh service.'
 }
-& $pythonCommand.Source -m unittest discover `
-    -s (Join-Path $ProjectRoot 'deploy\masterdesk-api') `
-    -p 'test_*.py' `
-    -v
-if ($LASTEXITCODE -ne 0) {
-    throw "Update-manifest tests failed with exit code $LASTEXITCODE."
-}
+Invoke-NativeChecked $pythonCommand.Source @(
+    '-m', 'unittest', 'discover',
+    '-s', (Join-Path $ProjectRoot 'deploy\masterdesk-api'),
+    '-p', 'test_*.py',
+    '-v'
+) 'Update-manifest tests failed'
 
 Push-Location $ProjectRoot
 try {
-    & (Join-Path $CargoBin 'cargo.exe') test `
-        --locked `
-        --offline `
-        --release `
-        --features 'hwcodec,vram,flutter' `
-        custom_defaults `
-        --lib `
-        -- `
-        --nocapture
-    if ($LASTEXITCODE -ne 0) {
-        throw "Custom defaults tests failed with exit code $LASTEXITCODE."
-    }
+    Invoke-NativeChecked (Join-Path $CargoBin 'cargo.exe') @(
+        'test',
+        '--locked',
+        '--offline',
+        '--release',
+        '--features', 'hwcodec,vram,flutter',
+        'custom_defaults',
+        '--lib',
+        '--',
+        '--nocapture'
+    ) 'Custom defaults tests failed'
 
     foreach ($testName in @(
         'masterdesk_release_name_is_a_portable_or_update_package',
-        'clean_computer_runs_release_as_portable_client',
-        'installed_computer_routes_release_to_update',
+        'portable_masterdesk_skips_automatic_update_check',
         'parses_only_the_expected_release_checksum'
     )) {
-        & (Join-Path $CargoBin 'cargo.exe') test `
-            --locked `
-            --offline `
-            --release `
-            --features 'hwcodec,vram,flutter' `
-            $testName `
-            --lib `
-            -- `
-            --nocapture
-        if ($LASTEXITCODE -ne 0) {
-            throw "MasterDesk updater test $testName failed with exit code $LASTEXITCODE."
-        }
+        Invoke-NativeChecked (Join-Path $CargoBin 'cargo.exe') @(
+            'test',
+            '--locked',
+            '--offline',
+            '--release',
+            '--features', 'hwcodec,vram,flutter',
+            $testName,
+            '--lib',
+            '--',
+            '--nocapture'
+        ) "MasterDesk updater test $testName failed"
     }
 
-    & (Join-Path $CargoBin 'cargo.exe') test `
-        --locked `
-        --offline `
-        --manifest-path (Join-Path $ProjectRoot 'libs\portable\Cargo.toml') `
-        masterdesk_release_runs_portable_by_default `
-        -- `
-        --nocapture
-    if ($LASTEXITCODE -ne 0) {
-        throw "Portable-by-default test failed with exit code $LASTEXITCODE."
+    foreach ($portableTestName in @(
+        'masterdesk_release_runs_portable_by_default',
+        'generated_package_has_versioned_extraction_timestamp'
+    )) {
+        Invoke-NativeChecked (Join-Path $CargoBin 'cargo.exe') @(
+            'test',
+            '--locked',
+            '--offline',
+            '--manifest-path', (Join-Path $ProjectRoot 'libs\portable\Cargo.toml'),
+            $portableTestName,
+            '--',
+            '--nocapture'
+        ) "Portable regression test $portableTestName failed"
     }
 
 } finally {
