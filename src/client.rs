@@ -1830,7 +1830,7 @@ fn migrate_masterdesk_windows_keyboard_mode(
 }
 
 /// Login config handler for [`Client`].
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct LoginConfigHandler {
     id: String,
     pub conn_type: ConnType,
@@ -1868,6 +1868,11 @@ pub struct LoginConfigHandler {
     pub enable_trusted_devices: bool,
     pub record_state: bool,
     pub record_permission: bool,
+    // Set only on an internal auxiliary FILE_TRANSFER connection. These
+    // values are never persisted in PeerConfig.
+    parallel_transfer_id: String,
+    parallel_worker: u32,
+    parallel_auth_token: String,
 }
 
 impl Deref for LoginConfigHandler {
@@ -2854,6 +2859,10 @@ impl LoginConfigHandler {
             ConnType::FILE_TRANSFER => lr.set_file_transfer(FileTransfer {
                 dir: self.get_remote_dir(),
                 show_hidden: !self.get_option("remote_show_hidden").is_empty(),
+                parallel_transfer_id: self.parallel_transfer_id.clone(),
+                parallel_worker: self.parallel_worker,
+                parallel_auxiliary: !self.parallel_transfer_id.is_empty(),
+                parallel_auth_token: self.parallel_auth_token.clone(),
                 ..Default::default()
             }),
             ConnType::VIEW_CAMERA => lr.set_view_camera(Default::default()),
@@ -3677,7 +3686,13 @@ pub async fn handle_hash(
 
     let password = if password.is_empty() {
         // login without password, the remote side can click accept
-        interface.msgbox("input-password", "Password Required", "", "");
+        let is_parallel_auxiliary = {
+            let lc = lc.read().unwrap();
+            !lc.parallel_transfer_id.is_empty() && !lc.parallel_auth_token.is_empty()
+        };
+        if !is_parallel_auxiliary {
+            interface.msgbox("input-password", "Password Required", "", "");
+        }
         Vec::new()
     } else {
         let mut hasher = Sha256::new();
@@ -3930,6 +3945,8 @@ pub enum Data {
     ResetDecoder(Option<usize>),
     RenameFile((i32, String, String, bool)),
     TakeScreenshot((i32, String)),
+    ParallelFinalize((i32, i32, String)),
+    ParallelFailed((i32, String, String)),
 }
 
 pub async fn confirm_insecure_connection(

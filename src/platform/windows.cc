@@ -720,8 +720,11 @@ extern "C"
         case VK_LWIN:
         case VK_RWIN:
             win_down = wParam == WM_KEYDOWN;
-        case VK_SNAPSHOT:
             return 1;
+        case VK_SNAPSHOT:
+            // Keep PrintScreen (with or without Alt) on the controller so
+            // local capture tools can capture MasterDesk or the full desktop.
+            return 0;
         case VK_TAB:
             if (GetAsyncKeyState(VK_MENU) & 0x8000)
                 return 1;
@@ -742,7 +745,8 @@ extern "C"
 
             // Grabbing everything seems to mess up some keyboard state that
             // FLTK relies on, so just grab the keys that we normally cannot.
-            if (stop_system_key_propagate && is_system_hotkey(msgInfo->vkCode, wParam))
+            if (stop_system_key_propagate &&
+                is_system_hotkey(msgInfo->vkCode, wParam))
             {
                 PostMessage(target_wnd, wParam, msgInfo->vkCode,
                             (msgInfo->scanCode & 0xff) << 16 |

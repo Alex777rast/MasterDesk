@@ -1580,6 +1580,11 @@ class RustdeskImpl {
     return false;
   }
 
+  String mainSetFileClipboard(
+      {required List<String> paths, dynamic hint}) {
+    return 'File drag and drop is only available on Windows';
+  }
+
   bool mainHasGpuTextureRender({dynamic hint}) {
     return false;
   }

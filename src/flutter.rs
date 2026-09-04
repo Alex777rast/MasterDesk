@@ -54,6 +54,14 @@ fn peer_features_json(pi: &PeerInfo) -> String {
     for ref f in pi.features.iter() {
         features.insert("privacy_mode", f.privacy_mode);
         features.insert("safe_mode_reboot", f.safe_mode_reboot);
+        features.insert(
+            "parallel_file_transfer_v1",
+            f.parallel_file_transfer_v1,
+        );
+        features.insert(
+            "parallel_clipboard_cache_v1",
+            f.parallel_clipboard_cache_v1,
+        );
     }
     // compatible with 1.1.9
     if get_version_number(&pi.version) < get_version_number("1.2.0") {
@@ -857,6 +865,11 @@ impl InvokeUiSession for FlutterHandler {
     }
 
     fn job_progress(&self, id: i32, file_num: i32, speed: f64, finished_size: f64) {
+        let parallel_stats =
+            crate::client::io_loop::parallel_transfer_stats_json(id).unwrap_or_default();
+        if !parallel_stats.is_empty() {
+            log::info!("MD_TRANSFER_TELEMETRY job_id={} {}", id, parallel_stats);
+        }
         self.push_event(
             "job_progress",
             &[
@@ -864,6 +877,7 @@ impl InvokeUiSession for FlutterHandler {
                 ("file_num", &file_num.to_string()),
                 ("speed", &speed.to_string()),
                 ("finished_size", &finished_size.to_string()),
+                ("parallel_stats", &parallel_stats),
             ],
             &[],
         );
@@ -1201,6 +1215,8 @@ mod masterdesk_peer_feature_tests {
             features: Some(Features {
                 privacy_mode: true,
                 safe_mode_reboot: true,
+                parallel_file_transfer_v1: true,
+                parallel_clipboard_cache_v1: true,
                 ..Default::default()
             })
             .into(),
@@ -1209,6 +1225,8 @@ mod masterdesk_peer_feature_tests {
         let parsed: serde_json::Value = serde_json::from_str(&peer_features_json(&pi)).unwrap();
         assert_eq!(parsed["privacy_mode"], true);
         assert_eq!(parsed["safe_mode_reboot"], true);
+        assert_eq!(parsed["parallel_file_transfer_v1"], true);
+        assert_eq!(parsed["parallel_clipboard_cache_v1"], true);
     }
 }
 

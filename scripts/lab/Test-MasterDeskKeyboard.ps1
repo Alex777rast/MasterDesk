@@ -275,8 +275,8 @@ try {
     }
     $config = Import-PowerShellDataFile -LiteralPath $ConfigPath
     $candidate = (Resolve-Path -LiteralPath $ExePath).ProviderPath
-    $runner = Join-Path $repoRoot 'flutter\build\windows\x64\runner\Release\rustdesk.exe'
-    $dll = Join-Path $repoRoot 'flutter\build\windows\x64\runner\Release\librustdesk.dll'
+    $runner = Join-Path $repoRoot 'flutter\build\windows\x64\runner\Release\MasterDesk.exe'
+    $dll = Join-Path $repoRoot 'flutter\build\windows\x64\runner\Release\libmasterdesk.dll'
     $runnerHash = (Get-FileHash -LiteralPath $runner -Algorithm SHA256).Hash
     $dllHash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
     $vmA = @{ Label='A'; Name=[string]$config.VmAName; Vmx=[string]$config.VmA }

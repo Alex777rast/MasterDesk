@@ -15,7 +15,27 @@ use std::{
     boxed::Box,
     ffi::{CStr, CString},
     result::Result,
+    sync::atomic::{AtomicU64, Ordering},
 };
+
+const FILE_CLIPBOARD_PARALLEL_CACHE_FLAG: u64 = 1;
+static FILE_CLIPBOARD_FORMAT_STATE: AtomicU64 = AtomicU64::new(0);
+
+fn encode_file_clipboard_format_state(generation: u64, parallel_cache: bool) -> u64 {
+    (generation << 1) | u64::from(parallel_cache)
+}
+
+fn decode_file_clipboard_format_state(state: u64) -> (u64, bool) {
+    (state >> 1, state & FILE_CLIPBOARD_PARALLEL_CACHE_FLAG != 0)
+}
+
+pub fn file_clipboard_format_state() -> (u64, bool) {
+    decode_file_clipboard_format_state(FILE_CLIPBOARD_FORMAT_STATE.load(Ordering::Acquire))
+}
+
+pub fn file_clipboard_format_generation() -> u64 {
+    file_clipboard_format_state().0
+}
 
 // only used error code will be recorded here
 /// success
@@ -521,6 +541,21 @@ extern "C" {
     pub(crate) fn init_cliprdr(context: *mut CliprdrClientContext) -> BOOL;
     pub(crate) fn uninit_cliprdr(context: *mut CliprdrClientContext) -> BOOL;
     pub(crate) fn empty_cliprdr(context: *mut CliprdrClientContext, connID: UINT32) -> BOOL;
+    pub(crate) fn set_parallel_file_cache_enabled(
+        context: *mut CliprdrClientContext,
+        enabled: BOOL,
+    ) -> BOOL;
+    pub(crate) fn begin_parallel_file_cache(
+        context: *mut CliprdrClientContext,
+        transfer_id: *const ::std::os::raw::c_char,
+        root: *const WCHAR,
+        file_count: UINT32,
+    ) -> BOOL;
+    pub(crate) fn complete_parallel_file_cache(
+        context: *mut CliprdrClientContext,
+        transfer_id: *const ::std::os::raw::c_char,
+        success: BOOL,
+    ) -> BOOL;
 }
 
 unsafe impl Send for CliprdrClientContext {}
@@ -615,6 +650,58 @@ impl CliprdrServiceContext for CliprdrClientContext {
     }
 
     fn cancel(&mut self) {}
+
+    fn set_parallel_file_cache_enabled(&mut self, enabled: bool) -> Result<(), CliprdrError> {
+        let result =
+            unsafe { set_parallel_file_cache_enabled(self, if enabled { TRUE } else { FALSE }) };
+        if result == TRUE {
+            Ok(())
+        } else {
+            Err(CliprdrError::ClipboardInternalError)
+        }
+    }
+
+    fn begin_parallel_file_cache(
+        &mut self,
+        transfer_id: &str,
+        root: &str,
+        file_count: u32,
+    ) -> Result<(), CliprdrError> {
+        use std::os::windows::ffi::OsStrExt;
+        let transfer_id = CString::new(transfer_id).map_err(|_| CliprdrError::CliprdrName)?;
+        let root = std::ffi::OsStr::new(root)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let result = unsafe {
+            begin_parallel_file_cache(self, transfer_id.as_ptr(), root.as_ptr(), file_count)
+        };
+        if result == TRUE {
+            Ok(())
+        } else {
+            Err(CliprdrError::ClipboardInternalError)
+        }
+    }
+
+    fn complete_parallel_file_cache(
+        &mut self,
+        transfer_id: &str,
+        success: bool,
+    ) -> Result<(), CliprdrError> {
+        let transfer_id = CString::new(transfer_id).map_err(|_| CliprdrError::CliprdrName)?;
+        let result = unsafe {
+            complete_parallel_file_cache(
+                self,
+                transfer_id.as_ptr(),
+                if success { TRUE } else { FALSE },
+            )
+        };
+        if result == TRUE {
+            Ok(())
+        } else {
+            Err(CliprdrError::ClipboardInternalError)
+        }
+    }
 }
 
 fn ret_to_result(ret: u32) -> Result<(), CliprdrError> {
@@ -1080,10 +1167,20 @@ extern "C" fn handle_clipboard_files(
 
         ClipboardFile::Files { files }
     };
-    // no need to handle result here
-    allow_err!(send_data(conn_id as _, data));
+    dispatch_local_clipboard_data(conn_id as _, data);
 
     0
+}
+
+fn dispatch_local_clipboard_data(conn_id: i32, data: ClipboardFile) {
+    if conn_id == 0 {
+        let msg_channels = VEC_MSG_CHANNEL.read().unwrap();
+        msg_channels
+            .iter()
+            .for_each(|msg_channel| allow_err!(msg_channel.sender.send(data.clone())));
+    } else {
+        allow_err!(send_data(conn_id, data));
+    }
 }
 
 extern "C" fn client_format_list(
@@ -1119,25 +1216,74 @@ extern "C" fn client_format_list(
         conn_id,
         &format_list
     );
+    let is_file_list = format_list
+        .iter()
+        .any(|(_, name)| name == "FileGroupDescriptorW");
+    let has_parallel_cache = format_list
+        .iter()
+        .any(|(_, name)| name == "MasterDeskParallelFileCacheV1");
     let data = ClipboardFile::FormatList { format_list };
-    // no need to handle result here
-    if conn_id == 0 {
-        // msg_channel is used for debug, VEC_MSG_CHANNEL cannot be inspected by the debugger.
-        let msg_channel = VEC_MSG_CHANNEL.read().unwrap();
-        msg_channel
-            .iter()
-            .for_each(|msg_channel| allow_err!(msg_channel.sender.send(data.clone())));
-    } else {
-        match send_data(conn_id, data) {
-            Ok(_) => {}
-            Err(e) => {
-                log::error!("failed to send format list: {:?}", e);
-                return ERR_CODE_SEND_MSG;
-            }
-        }
+    dispatch_local_clipboard_data(conn_id, data);
+
+    if is_file_list {
+        let _ = FILE_CLIPBOARD_FORMAT_STATE.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |state| {
+                let (generation, _) = decode_file_clipboard_format_state(state);
+                Some(encode_file_clipboard_format_state(
+                    generation.wrapping_add(1),
+                    has_parallel_cache,
+                ))
+            },
+        );
     }
 
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_clipboard_format_state_preserves_cache_requirement() {
+        assert_eq!(
+            decode_file_clipboard_format_state(encode_file_clipboard_format_state(17, false)),
+            (17, false)
+        );
+        assert_eq!(
+            decode_file_clipboard_format_state(encode_file_clipboard_format_state(23, true)),
+            (23, true)
+        );
+    }
+
+    #[test]
+    fn zero_connection_file_manifest_is_broadcast_to_active_viewer() {
+        let peer_id = format!("parallel-clipboard-broadcast-test-{}", std::process::id());
+        let (conn_id, receiver) = crate::get_rx_cliprdr_client(&peer_id);
+        let expected_path = r"C:\source\large.bin".to_owned();
+
+        dispatch_local_clipboard_data(
+            0,
+            ClipboardFile::Files {
+                files: vec![(expected_path.clone(), 512 * 1024 * 1024)],
+            },
+        );
+
+        let received = receiver
+            .try_lock()
+            .expect("test receiver should not be locked")
+            .try_recv()
+            .expect("zero-connection manifest should reach active viewer");
+        match received {
+            ClipboardFile::Files { files } => {
+                assert_eq!(files, vec![(expected_path, 512 * 1024 * 1024)]);
+            }
+            other => panic!("unexpected clipboard event: {other:?}"),
+        }
+        crate::remove_channel_by_conn_id(conn_id);
+    }
 }
 
 extern "C" fn client_format_list_response(

@@ -23,10 +23,10 @@ const wchar_t* getWindowClassName();
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
                       _In_ wchar_t *command_line, _In_ int show_command)
 {
-  HINSTANCE hInstance = LoadLibraryA("librustdesk.dll");
+  HINSTANCE hInstance = LoadLibraryA("libmasterdesk.dll");
   if (!hInstance)
   {
-    std::cout << "Failed to load librustdesk.dll." << std::endl;
+    std::cout << "Failed to load libmasterdesk.dll." << std::endl;
     return EXIT_FAILURE;
   }
   FUNC_RUSTDESK_CORE_MAIN rustdesk_core_main =
@@ -78,7 +78,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE prev,
   if (hwnd != NULL) {
     // Allow multiple flutter instances when being executed by parameters
     // contained in whitelists.
-    bool allow_multiple_instances = false;
+    // The portable packer sets RUSTDESK_APPNAME for its extracted child.
+    // core_main removes it from installed descendants before returning here,
+    // so its presence reliably distinguishes a no-argument portable GUI that
+    // must stay alive to offer the local installed-version update action.
+    wchar_t portable_app_name[2] = {0};
+    bool allow_multiple_instances =
+        command_line_arguments.empty() &&
+        ::GetEnvironmentVariableW(L"RUSTDESK_APPNAME", portable_app_name,
+                                  ARRAYSIZE(portable_app_name)) > 0;
     for (auto& whitelist_param : parameters_white_list) {
       allow_multiple_instances =
           allow_multiple_instances ||

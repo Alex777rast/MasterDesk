@@ -37,6 +37,7 @@ pub type Children = Arc<Mutex<(bool, HashMap<(String, String), Child>)>>;
 #[derive(Clone, Debug, Serialize)]
 pub struct UiStatus {
     pub status_num: i32,
+    pub registration_error: String,
     #[cfg(not(feature = "flutter"))]
     pub key_confirmed: bool,
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -45,6 +46,29 @@ pub struct UiStatus {
     pub id: String,
     #[cfg(feature = "flutter")]
     pub video_conn_count: usize,
+}
+
+fn registration_aware_online_status(mut status: i64, key_confirmed: bool) -> i64 {
+    if status > 0 {
+        status = 1;
+    }
+    if status > 0 && !key_confirmed {
+        0
+    } else {
+        status
+    }
+}
+
+fn registration_error_from_options(options: &HashMap<String, String>) -> String {
+    if options
+        .get("registration-clock-error")
+        .map(|value| value == "Y")
+        .unwrap_or(false)
+    {
+        "clock_mismatch".to_owned()
+    } else {
+        String::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -57,6 +81,7 @@ pub struct LoginDeviceInfo {
 lazy_static::lazy_static! {
     static ref UI_STATUS : Arc<Mutex<UiStatus>> = Arc::new(Mutex::new(UiStatus{
         status_num: 0,
+        registration_error: String::new(),
         #[cfg(not(feature = "flutter"))]
         key_confirmed: false,
         #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -91,9 +116,9 @@ const INIT_ASYNC_JOB_STATUS: &str = " ";
 #[inline]
 pub fn get_id() -> String {
     #[cfg(any(target_os = "android", target_os = "ios"))]
-    return Config::get_id();
+    return Config::get_public_id();
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
-    return ipc::get_id();
+    return ipc::get_public_id();
 }
 
 #[inline]
@@ -106,6 +131,22 @@ pub fn goto_install() {
 pub fn install_me(_options: String, _path: String, _silent: bool, _debug: bool) {
     #[cfg(windows)]
     std::thread::spawn(move || {
+        if _options.split_whitespace().any(|option| option == "uninstall") {
+            let mut args = vec!["--uninstall-confirmed"];
+            if _options
+                .split_whitespace()
+                .any(|option| option == "delete-settings")
+            {
+                args.push("--delete-settings");
+            }
+            match crate::run_me(args) {
+                Ok(_) => std::process::exit(0),
+                Err(err) => {
+                    log::error!("Failed to start uninstaller: {err}");
+                    std::process::exit(1);
+                }
+            }
+        }
         match crate::platform::windows::install_me(&_options, _path, _silent, _debug) {
             Ok(()) => std::process::exit(0),
             Err(err) => {
@@ -122,6 +163,12 @@ pub fn install_me(_options: String, _path: String, _silent: bool, _debug: bool) 
 
 #[inline]
 pub fn update_me(_path: String) {
+    #[cfg(windows)]
+    {
+        allow_err!(crate::run_me(vec!["--update"]));
+        std::process::exit(0);
+    }
+    #[cfg(not(windows))]
     goto_install();
 }
 
@@ -471,6 +518,9 @@ pub fn set_option(key: String, value: String) {
     }
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
+        #[cfg(target_os = "windows")]
+        let refresh_parallel_clipboard_mode =
+            key == config::keys::OPTION_PARALLEL_FILE_TRANSFER_MODE;
         let mut options = OPTIONS.lock().unwrap();
         if value.is_empty() {
             options.remove(&key);
@@ -478,6 +528,11 @@ pub fn set_option(key: String, value: String) {
             options.insert(key.clone(), value.clone());
         }
         ipc::set_options(options.clone()).ok();
+        drop(options);
+        #[cfg(target_os = "windows")]
+        if refresh_parallel_clipboard_mode {
+            crate::client::io_loop::refresh_parallel_clipboard_cache_mode();
+        }
     }
     #[cfg(any(target_os = "android", target_os = "ios"))]
     {
@@ -622,7 +677,9 @@ pub fn check_mouse_time() {
 #[inline]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn get_connect_status() -> UiStatus {
-    UI_STATUS.lock().unwrap().clone()
+    let mut status = UI_STATUS.lock().unwrap().clone();
+    status.registration_error = registration_error_from_options(&OPTIONS.lock().unwrap());
+    status
 }
 
 #[inline]
@@ -1419,15 +1476,14 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
                                 video_conn_count = n;
                             }
                             Ok(Some(ipc::Data::OnlineStatus(Some((mut x, _c))))) => {
-                                if x > 0 {
-                                    x = 1
-                                }
+                                x = registration_aware_online_status(x, _c);
                                 #[cfg(not(feature = "flutter"))]
                                 {
                                     key_confirmed = _c;
                                 }
                                 *UI_STATUS.lock().unwrap() = UiStatus {
                                     status_num: x as _,
+                                    registration_error: String::new(),
                                     #[cfg(not(feature = "flutter"))]
                                     key_confirmed: _c,
                                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1488,6 +1544,7 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
         }
         *UI_STATUS.lock().unwrap() = UiStatus {
             status_num: -1,
+            registration_error: String::new(),
             #[cfg(not(feature = "flutter"))]
             key_confirmed,
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -1498,6 +1555,29 @@ async fn check_connect_status_(reconnect: bool, rx: mpsc::UnboundedReceiver<ipc:
             video_conn_count,
         };
         sleep(1.).await;
+    }
+}
+
+#[cfg(test)]
+mod registration_status_tests {
+    use super::{registration_aware_online_status, registration_error_from_options};
+    use std::collections::HashMap;
+
+    #[test]
+    fn positive_latency_is_not_ready_until_registration_is_confirmed() {
+        assert_eq!(registration_aware_online_status(42_000, false), 0);
+        assert_eq!(registration_aware_online_status(42_000, true), 1);
+        assert_eq!(registration_aware_online_status(-1, false), -1);
+    }
+
+    #[test]
+    fn clock_error_is_exposed_only_for_an_explicit_service_flag() {
+        let mut options = HashMap::new();
+        assert_eq!(registration_error_from_options(&options), "");
+        options.insert("registration-clock-error".to_owned(), "N".to_owned());
+        assert_eq!(registration_error_from_options(&options), "");
+        options.insert("registration-clock-error".to_owned(), "Y".to_owned());
+        assert_eq!(registration_error_from_options(&options), "clock_mismatch");
     }
 }
 

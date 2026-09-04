@@ -1087,7 +1087,7 @@ try {
         }
         if ($Action -eq 'Scenario' -and $Scenario -ne 'Portable') {
             $payloadInput = if ([string]::IsNullOrWhiteSpace($InstalledPayloadPath)) {
-                Join-Path $script:RepoRoot 'flutter\build\windows\x64\runner\Release\rustdesk.exe'
+                Join-Path $script:RepoRoot 'flutter\build\windows\x64\runner\Release\MasterDesk.exe'
             } else {
                 $InstalledPayloadPath
             }

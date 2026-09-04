@@ -66,6 +66,27 @@ pub trait CliprdrServiceContext: Send + Sync {
     fn get_progress_percent(&self) -> Option<ProgressPercent>;
     /// cancel the paste task.
     fn cancel(&mut self);
+    /// Enable the Explorer parallel-cache marker for local file clipboard snapshots.
+    fn set_parallel_file_cache_enabled(&mut self, _enabled: bool) -> Result<(), CliprdrError> {
+        Ok(())
+    }
+    /// Associate the current remote Explorer clipboard generation with a cache transfer.
+    fn begin_parallel_file_cache(
+        &mut self,
+        _transfer_id: &str,
+        _root: &str,
+        _file_count: u32,
+    ) -> Result<(), CliprdrError> {
+        Ok(())
+    }
+    /// Publish or fail a receiver-side Explorer clipboard cache.
+    fn complete_parallel_file_cache(
+        &mut self,
+        _transfer_id: &str,
+        _success: bool,
+    ) -> Result<(), CliprdrError> {
+        Ok(())
+    }
 }
 
 #[derive(Error, Debug)]

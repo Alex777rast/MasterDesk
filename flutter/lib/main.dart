@@ -109,6 +109,8 @@ Future<void> main(List<String> args) async {
     runConnectionManagerScreen();
   } else if (args.contains('--install')) {
     runInstallPage();
+  } else if (args.contains('--uninstall')) {
+    runInstallPage(uninstall: true);
   } else {
     desktopType = DesktopType.main;
     await windowManager.ensureInitialized();
@@ -393,10 +395,10 @@ void _runApp(
   ));
 }
 
-void runInstallPage() async {
+void runInstallPage({bool uninstall = false}) async {
   await windowManager.ensureInitialized();
   await initEnv(kAppTypeMain);
-  _runApp('', const InstallPage(), MyTheme.currentThemeMode());
+  _runApp('', InstallPage(uninstall: uninstall), MyTheme.currentThemeMode());
   WindowOptions windowOptions =
       getHiddenTitleBarWindowOptions(size: Size(800, 600), center: true);
   windowManager.waitUntilReadyToShow(windowOptions, () async {

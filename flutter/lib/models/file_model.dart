@@ -1045,13 +1045,38 @@ class JobController {
   void tryUpdateJobProgress(Map<String, dynamic> evt) {
     try {
       int id = int.parse(evt['id']);
+      final parallelStats = evt['parallel_stats']?.toString() ?? '';
+      ParallelTransferStats? parsedParallelStats;
+      if (parallelStats.isNotEmpty) {
+        parsedParallelStats = ParallelTransferStats.fromJson(
+            jsonDecode(parallelStats) as Map<String, dynamic>);
+      }
       // id = index + 1
-      final jobIndex = getJob(id);
+      var jobIndex = getJob(id);
+      if (jobIndex < 0 && id < 0 && parsedParallelStats != null) {
+        final stats = parsedParallelStats;
+        jobTable.add(JobProgress()
+          ..type = JobType.transfer
+          ..fileName = stats.fileName
+          ..jobName = stats.fileName
+          ..totalSize = stats.fileSize
+          ..fileCount = stats.fileCount
+          ..state = JobState.inProgress
+          ..id = id
+          ..showDiagnostics = true);
+        jobIndex = jobTable.length - 1;
+      }
       if (jobIndex >= 0 && jobTable.length > jobIndex) {
         final job = jobTable[jobIndex];
         job.fileNum = int.parse(evt['file_num']);
         job.speed = double.parse(evt['speed']);
         job.finishedSize = int.parse(evt['finished_size']);
+        if (parsedParallelStats != null) {
+          job.parallelStats = parsedParallelStats;
+          job.recordSpeedSample(job.parallelStats!.totalSpeed);
+        } else {
+          job.recordSpeedSample(job.speed);
+        }
         job.recvJobRes = true;
         jobTable.refresh();
       }
@@ -1100,6 +1125,10 @@ class JobController {
       if (speed != null) job.speed = speed;
       job.state = JobState.done;
     }
+    if (job.state == JobState.done) {
+      job.finishedSize = job.totalSize;
+      job.completedAtMs = DateTime.now().millisecondsSinceEpoch;
+    }
     jobTable.refresh();
     if (job.state == JobState.done || job.state == JobState.error) {
       unregisterTransferConflictJob(id);
@@ -1123,6 +1152,7 @@ class JobController {
       final job = jobTable[jobIndex];
       if (job.state == JobState.done && job.err == "cancel") return;
       job.state = JobState.error;
+      job.completedAtMs = DateTime.now().millisecondsSinceEpoch;
       job.err = err;
       job.recvJobRes = true;
       if (job.type == JobType.transfer) {
@@ -1616,6 +1646,81 @@ extension JobStateDisplay on JobState {
 
 enum JobType { none, transfer, deleteFile, deleteDir }
 
+class ParallelWorkerStats {
+  final int workerId;
+  final int bytesTransferred;
+  final double bytesPerSecond;
+  final String state;
+  final int rangeStart;
+  final int rangeEnd;
+  final int chunksCompleted;
+  final int jobsCompleted;
+
+  ParallelWorkerStats.fromJson(Map<String, dynamic> value)
+      : workerId = (value['worker_id'] as num?)?.toInt() ?? 0,
+        bytesTransferred = (value['bytes_transferred'] as num?)?.toInt() ?? 0,
+        bytesPerSecond = (value['bytes_per_second'] as num?)?.toDouble() ?? 0,
+        state = value['state']?.toString() ?? 'waiting',
+        rangeStart = (value['range_start'] as num?)?.toInt() ?? 0,
+        rangeEnd = (value['range_end'] as num?)?.toInt() ?? 0,
+        chunksCompleted = (value['chunks_completed'] as num?)?.toInt() ?? 0,
+        jobsCompleted = (value['jobs_completed'] as num?)?.toInt() ?? 0;
+}
+
+class ParallelTransferStats {
+  final String transferId;
+  final String mode;
+  final String phase;
+  final int activeWorkers;
+  final int busyWorkers;
+  final int openConnections;
+  final int targetWorkers;
+  final int maxWorkers;
+  final double totalSpeed;
+  final double peakSpeed;
+  final double averageSpeed;
+  final int elapsedMs;
+  final String fileName;
+  final int fileSize;
+  final int fileCount;
+  final int bytesTransferred;
+  final int queuedChunks;
+  final int completedChunks;
+  final int queuedJobs;
+  final int completedJobs;
+  final List<int> scaleHistory;
+  final List<ParallelWorkerStats> workers;
+
+  ParallelTransferStats.fromJson(Map<String, dynamic> value)
+      : transferId = value['transfer_id']?.toString() ?? '',
+        mode = value['mode']?.toString() ?? 'LEGACY',
+        phase = value['phase']?.toString() ?? 'WAITING',
+        activeWorkers = (value['active_workers'] as num?)?.toInt() ?? 0,
+        busyWorkers = (value['busy_workers'] as num?)?.toInt() ?? 0,
+        openConnections = (value['open_connections'] as num?)?.toInt() ?? 0,
+        targetWorkers = (value['target_workers'] as num?)?.toInt() ?? 0,
+        maxWorkers = (value['max_workers'] as num?)?.toInt() ?? 1,
+        totalSpeed = (value['total_speed'] as num?)?.toDouble() ?? 0,
+        peakSpeed = (value['peak_speed'] as num?)?.toDouble() ?? 0,
+        averageSpeed = (value['average_speed'] as num?)?.toDouble() ?? 0,
+        elapsedMs = (value['elapsed_ms'] as num?)?.toInt() ?? 0,
+        fileName = value['file_name']?.toString() ?? '',
+        fileSize = (value['file_size'] as num?)?.toInt() ?? 0,
+        fileCount = (value['file_count'] as num?)?.toInt() ?? 0,
+        bytesTransferred = (value['bytes_transferred'] as num?)?.toInt() ?? 0,
+        queuedChunks = (value['queued_chunks'] as num?)?.toInt() ?? 0,
+        completedChunks = (value['completed_chunks'] as num?)?.toInt() ?? 0,
+        queuedJobs = (value['queued_jobs'] as num?)?.toInt() ?? 0,
+        completedJobs = (value['completed_jobs'] as num?)?.toInt() ?? 0,
+        scaleHistory = (value['scale_history'] as List<dynamic>? ?? const [])
+            .map((item) => (item as num).toInt())
+            .toList(growable: false),
+        workers = (value['workers'] as List<dynamic>? ?? const [])
+            .map((item) =>
+                ParallelWorkerStats.fromJson(item as Map<String, dynamic>))
+            .toList(growable: false);
+}
+
 class JobProgress {
   JobType type = JobType.none;
   JobState state = JobState.none;
@@ -1637,10 +1742,40 @@ class JobProgress {
   var showHidden = false;
   var err = "";
   int lastTransferredSize = 0;
+  ParallelTransferStats? parallelStats;
+  final List<double> speedHistory = <double>[];
+  double smoothedSpeed = 0;
+  bool showDiagnostics = false;
+  int startedAtMs = DateTime.now().millisecondsSinceEpoch;
+  int? completedAtMs;
 
-  double get percent =>
-      totalSize > 0 ? (finishedSize.toDouble() / totalSize) : 0.0;
+  bool get isExplorerClipboardTransfer => id < 0;
+
+  int get elapsedMs {
+    final value =
+        (completedAtMs ?? DateTime.now().millisecondsSinceEpoch) - startedAtMs;
+    return value < 0 ? 0 : value;
+  }
+
+  double get averageSpeed =>
+      elapsedMs > 0 ? finishedSize * 1000 / elapsedMs : 0;
+  double get peakSpeed => speedHistory.fold<double>(
+      speed, (peak, sample) => sample > peak ? sample : peak);
+
+  double get percent => totalSize > 0
+      ? (finishedSize.toDouble() / totalSize).clamp(0.0, 1.0).toDouble()
+      : 0.0;
   String get percentText => '${(percent * 100).toStringAsFixed(0)}%';
+
+  void recordSpeedSample(double sample) {
+    if (!sample.isFinite || sample < 0) return;
+    speedHistory.add(sample);
+    if (speedHistory.length > 60) speedHistory.removeAt(0);
+    if (sample > 0) {
+      smoothedSpeed =
+          smoothedSpeed > 0 ? smoothedSpeed * 0.75 + sample * 0.25 : sample;
+    }
+  }
 
   clear() {
     type = JobType.none;
@@ -1656,6 +1791,12 @@ class JobProgress {
     remote = "";
     to = "";
     err = "";
+    parallelStats = null;
+    speedHistory.clear();
+    smoothedSpeed = 0;
+    showDiagnostics = false;
+    startedAtMs = DateTime.now().millisecondsSinceEpoch;
+    completedAtMs = null;
   }
 
   String display() {

@@ -175,7 +175,14 @@ class _FileManagerPageState extends State<FileManagerPage>
                   flex: 3,
                   child: dropArea(FileManagerView(
                       model.remoteController, _ffi, _mouseFocusScope))),
-              Flexible(flex: 2, child: statusList())
+              Obx(() {
+                final diagnosticsVisible =
+                    jobController.jobTable.any((job) => job.showDiagnostics);
+                return SizedBox(
+                  width: diagnosticsVisible ? 380 : 225,
+                  child: statusList(),
+                );
+              })
             ],
           ),
         ));
@@ -211,6 +218,178 @@ class _FileManagerPageState extends State<FileManagerPage>
   /// transfer status list
   /// watch transfer status
   Widget statusList() {
+    String mbps(double bytesPerSecond) =>
+        '${(bytesPerSecond * 8 / 1000000).toStringAsFixed(1)} Mbps';
+
+    String elapsed(int milliseconds) {
+      final seconds = Duration(milliseconds: milliseconds).inSeconds;
+      final hours = seconds ~/ 3600;
+      final minutes = (seconds % 3600) ~/ 60;
+      final remainingSeconds = seconds % 60;
+      return '${hours.toString().padLeft(2, '0')}:'
+          '${minutes.toString().padLeft(2, '0')}:'
+          '${remainingSeconds.toString().padLeft(2, '0')}';
+    }
+
+    String transferState(String value) {
+      switch (value.toLowerCase()) {
+        case 'connecting':
+          return translate('Connecting');
+        case 'transferring':
+          return translate('Transferring');
+        case 'awaiting_ack':
+          return translate('Awaiting confirmation');
+        case 'complete':
+          return translate('Completed');
+        case 'error':
+          return translate('Error');
+        case 'preparing':
+          return translate('Preparing');
+        case 'legacy fallback':
+          return translate('Legacy fallback');
+        default:
+          return translate('Waiting');
+      }
+    }
+
+    Widget diagnosticPanel(JobProgress job) {
+      final stats = job.parallelStats;
+      final currentSpeed = stats?.totalSpeed ?? job.speed;
+      final averageSpeed = stats?.averageSpeed ?? job.averageSpeed;
+      final peakSpeed = stats?.peakSpeed ?? job.peakSpeed;
+      final elapsedMs = stats?.elapsedMs ?? job.elapsedMs;
+      final totalBytes =
+          stats != null && stats.fileSize > 0 ? stats.fileSize : job.totalSize;
+      final transferredBytes =
+          min(totalBytes, max(0, stats?.bytesTransferred ?? job.finishedSize));
+      final remainingBytes = max(0, totalBytes - transferredBytes);
+      final etaSpeed = job.smoothedSpeed > 0
+          ? job.smoothedSpeed
+          : averageSpeed > 0
+              ? averageSpeed
+              : currentSpeed;
+      final etaMs =
+          etaSpeed > 0 ? (remainingBytes * 1000 / etaSpeed).round() : 0;
+      final copiedFiles = max(1, stats?.fileCount ?? job.fileCount);
+      final active = stats?.activeWorkers ?? 1;
+      final maxWorkers = stats?.maxWorkers ?? 1;
+      final targetWorkers = stats?.targetWorkers ?? maxWorkers;
+      final usedParallelWorkers = stats != null &&
+          (active > 1 ||
+              stats.openConnections > 1 ||
+              stats.scaleHistory.any((workers) => workers > 1));
+      final transferKind = translate(
+          usedParallelWorkers ? 'Parallel streams' : 'Single stream');
+      final mode = stats == null
+          ? translate('Legacy mode')
+          : '${stats.mode} | $transferKind ${stats.busyWorkers}/$targetWorkers';
+      final textStyle = TextStyle(
+          fontSize: 11, color: Theme.of(context).tabBarTheme.labelColor);
+      final workers = stats?.workers ?? const <ParallelWorkerStats>[];
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: Theme.of(context).hoverColor,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('$mode | ${transferState(stats?.phase ?? 'transferring')}',
+                style: textStyle.copyWith(fontWeight: FontWeight.w600)),
+            Text(
+                '${job.fileName} | ${readableFileSize(job.totalSize.toDouble())}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: textStyle),
+            const SizedBox(height: 6),
+            Text(
+                '${translate('Transferred')}: ${readableFileSize(transferredBytes.toDouble())} / ${readableFileSize(totalBytes.toDouble())}',
+                style: textStyle),
+            Text('${translate('Remaining')}: ${readableFileSize(remainingBytes.toDouble())}',
+                style: textStyle),
+            Text('${translate('Current speed')}: ${mbps(currentSpeed)}',
+                style: textStyle),
+            Text('${translate('Average speed')}: ${mbps(averageSpeed)}',
+                style: textStyle),
+            Text('${translate('Peak speed')}: ${mbps(peakSpeed)}',
+                style: textStyle),
+            Text('${translate('Elapsed')}: ${elapsed(elapsedMs)}',
+                style: textStyle),
+            Text(
+                '${translate('Estimated time remaining')}: ${remainingBytes == 0 ? '00:00:00' : etaSpeed > 0 ? elapsed(etaMs) : '--:--:--'}',
+                style: textStyle),
+            Text('${translate('Configured workers')}: $maxWorkers  ${translate('Target workers')}: $targetWorkers',
+                style: textStyle),
+            if (stats != null)
+              Text(
+                  '${translate('Open connections')}: ${stats.openConnections}  ${translate('Active workers')}: ${stats.activeWorkers}  ${translate('Busy workers')}: ${stats.busyWorkers}',
+                  style: textStyle),
+            if (stats != null)
+              Text(
+                  '${translate('Queued jobs')}: ${stats.queuedJobs}  ${translate('Completed jobs')}: ${stats.completedJobs}',
+                  style: textStyle),
+            if (stats != null && stats.scaleHistory.isNotEmpty)
+              Text('${translate('Auto scaling')}: ${stats.scaleHistory.join(' -> ')}',
+                  style: textStyle),
+            if (workers.isNotEmpty) const SizedBox(height: 6),
+            ...workers.map((worker) {
+              final rangeSize = max(1, worker.rangeEnd - worker.rangeStart);
+              final progress =
+                  (worker.bytesTransferred / rangeSize).clamp(0.0, 1.0);
+              return Padding(
+                padding: const EdgeInsets.only(bottom: 4),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                        '#${worker.workerId}  ${mbps(worker.bytesPerSecond)}  ${transferState(worker.state)}  ${translate('Jobs')}: ${worker.jobsCompleted}  ${translate('Chunks')}: ${worker.chunksCompleted}',
+                        style: textStyle),
+                    LinearProgressIndicator(
+                      value: progress,
+                      minHeight: 3,
+                      backgroundColor: Theme.of(context).dividerColor,
+                    ),
+                  ],
+                ),
+              );
+            }),
+            if (job.speedHistory.isNotEmpty)
+              SizedBox(
+                height: 34,
+                width: double.infinity,
+                child: CustomPaint(
+                  painter: _TransferSpeedSparklinePainter(
+                    List<double>.from(job.speedHistory),
+                    MyTheme.accent,
+                  ),
+                ),
+              ),
+            if (job.state == JobState.done)
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(translate('Completed'),
+                      style: textStyle.copyWith(fontWeight: FontWeight.w600)),
+                  Text(
+                      copiedFiles > 1
+                          ? '${translate('Files copied')}: $copiedFiles / ${readableFileSize(totalBytes.toDouble())}'
+                          : '${translate('Copied')}: ${readableFileSize(totalBytes.toDouble())}',
+                      style: textStyle),
+                  Text('${translate('Time')}: ${elapsed(elapsedMs)}',
+                      style: textStyle),
+                  Text('${translate('Average speed')}: ${mbps(averageSpeed)}',
+                      style: textStyle),
+                  Text('${translate('Peak speed')}: ${mbps(peakSpeed)}',
+                      style: textStyle),
+                ],
+              ),
+          ],
+        ),
+      ).marginOnly(left: 10, right: 10, bottom: 10);
+    }
+
     Widget getIcon(JobProgress job) {
       final color = Theme.of(context).tabBarTheme.labelColor;
       switch (job.type) {
@@ -292,6 +471,25 @@ class _FileManagerPageState extends State<FileManagerPage>
                         Row(
                           mainAxisAlignment: MainAxisAlignment.end,
                           children: [
+                            if (item.type == JobType.transfer)
+                              IconButton(
+                                tooltip: translate('Transfer diagnostics'),
+                                visualDensity: VisualDensity.compact,
+                                icon: Icon(
+                                  item.showDiagnostics
+                                      ? Icons.info
+                                      : Icons.info_outline,
+                                  color: item.showDiagnostics
+                                      ? MyTheme.accent
+                                      : Theme.of(context)
+                                          .tabBarTheme
+                                          .labelColor,
+                                ),
+                                onPressed: () {
+                                  item.showDiagnostics = !item.showDiagnostics;
+                                  jobController.jobTable.refresh();
+                                },
+                              ),
                             Offstage(
                               offstage: item.state != JobState.paused,
                               child: MenuButton(
@@ -324,6 +522,7 @@ class _FileManagerPageState extends State<FileManagerPage>
                         ).marginAll(12),
                       ],
                     ),
+                    if (item.showDiagnostics) diagnosticPanel(item),
                   ],
                 ),
               ),
@@ -332,13 +531,15 @@ class _FileManagerPageState extends State<FileManagerPage>
           itemCount: jobController.jobTable.length,
         );
 
-    return PreferredSize(
-      preferredSize: const Size(200, double.infinity),
-      child: Container(
-          margin: const EdgeInsets.only(top: 16.0, bottom: 16.0, right: 16.0),
-          padding: const EdgeInsets.all(8.0),
-          child: Obx(
-            () => jobController.jobTable.isEmpty
+    return Obx(() {
+      final diagnosticsVisible =
+          jobController.jobTable.any((job) => job.showDiagnostics);
+      return PreferredSize(
+        preferredSize: Size(diagnosticsVisible ? 360 : 200, double.infinity),
+        child: Container(
+            margin: const EdgeInsets.only(top: 16.0, bottom: 16.0, right: 16.0),
+            padding: const EdgeInsets.all(8.0),
+            child: jobController.jobTable.isEmpty
                 ? generateCard(
                     Center(
                       child: Column(
@@ -362,9 +563,9 @@ class _FileManagerPageState extends State<FileManagerPage>
                       ),
                     ),
                   )
-                : statusListView(jobController.jobTable),
-          )),
-    );
+                : statusListView(jobController.jobTable)),
+      );
+    });
   }
 
   void handleDragDone(DropDoneDetails details, bool isLocal) {
@@ -383,6 +584,40 @@ class _FileManagerPageState extends State<FileManagerPage>
     final otherSideData = model.localController.directoryData();
     model.remoteController.sendFiles(items, otherSideData);
   }
+}
+
+class _TransferSpeedSparklinePainter extends CustomPainter {
+  final List<double> samples;
+  final Color color;
+
+  _TransferSpeedSparklinePainter(this.samples, this.color);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (samples.length < 2 || size.width <= 0 || size.height <= 0) return;
+    final peak = samples.reduce(max);
+    if (peak <= 0) return;
+    final path = Path();
+    for (var index = 0; index < samples.length; index++) {
+      final x = size.width * index / (samples.length - 1);
+      final y = size.height - size.height * samples[index] / peak;
+      if (index == 0) {
+        path.moveTo(x, y);
+      } else {
+        path.lineTo(x, y);
+      }
+    }
+    canvas.drawPath(
+        path,
+        Paint()
+          ..color = color
+          ..strokeWidth = 2
+          ..style = PaintingStyle.stroke);
+  }
+
+  @override
+  bool shouldRepaint(covariant _TransferSpeedSparklinePainter oldDelegate) =>
+      oldDelegate.samples != samples || oldDelegate.color != color;
 }
 
 class FileManagerView extends StatefulWidget {
@@ -976,6 +1211,24 @@ class _FileManagerViewState extends State<FileManagerView> {
     var menuPos = RelativeRect.fill;
 
     final List<MenuEntryBase<String>> items = [
+      MenuEntrySubRadios<String>(
+        text:
+            '${translate("Transfer file")}: ${parallelFileTransferModeLabel(bind.mainGetOptionSync(key: kOptionParallelFileTransferMode))}',
+        optionsGetter: () => kParallelFileTransferModes
+            .map((mode) => MenuEntryRadioOption(
+                  text: parallelFileTransferModeLabel(mode),
+                  value: mode,
+                  dismissOnClicked: true,
+                ))
+            .toList(),
+        curOptionGetter: () async => normalizeParallelFileTransferMode(
+            bind.mainGetOptionSync(key: kOptionParallelFileTransferMode)),
+        optionSetter: (_, value) async {
+          await bind.mainSetOption(
+              key: kOptionParallelFileTransferMode, value: value);
+        },
+        padding: kDesktopMenuPadding,
+      ),
       MenuEntrySwitch<String>(
         switchType: SwitchType.scheckbox,
         text: translate("Show Hidden Files"),

@@ -2436,6 +2436,21 @@ pub fn main_has_file_clipboard() -> SyncReturn<bool> {
     SyncReturn(ret)
 }
 
+pub fn main_set_file_clipboard(paths: Vec<String>) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        return crate::platform::set_file_clipboard(paths)
+            .err()
+            .map(|error| error.to_string())
+            .unwrap_or_default();
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = paths;
+        "File drag and drop is only available on Windows".to_owned()
+    }
+}
+
 pub fn main_has_gpu_texture_render() -> SyncReturn<bool> {
     SyncReturn(cfg!(feature = "vram"))
 }

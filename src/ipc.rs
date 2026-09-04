@@ -278,6 +278,48 @@ pub enum FS {
         total_size: u64,
         conn_id: i32,
     },
+    ParallelNewWrite {
+        path: String,
+        id: i32,
+        file_num: i32,
+        files: Vec<(String, u64, u64)>,
+        transfer_id: String,
+        resume: bool,
+        clipboard_cache: bool,
+    },
+    ParallelAttach {
+        id: i32,
+        file_num: i32,
+        transfer_id: String,
+        worker: u32,
+        range_start: u64,
+        range_len: u64,
+    },
+    ParallelWriteBlock {
+        id: i32,
+        file_num: i32,
+        transfer_id: String,
+        worker: u32,
+        offset: u64,
+        #[serde(skip)]
+        data: Bytes,
+    },
+    ParallelWorkerDone {
+        id: i32,
+        file_num: i32,
+        transfer_id: String,
+        worker: u32,
+    },
+    ParallelFinalize {
+        id: i32,
+        file_num: i32,
+        transfer_id: String,
+    },
+    ParallelCancel {
+        id: i32,
+        transfer_id: String,
+        keep_partial: bool,
+    },
     CancelWrite {
         id: i32,
     },
@@ -450,6 +492,7 @@ pub enum Data {
         block_input: bool,
         privacy_mode: bool,
         from_switch: bool,
+        parallel_auxiliary: bool,
     },
     ChatMessage {
         text: String,
@@ -732,7 +775,8 @@ pub async fn start(postfix: &str) -> ResultType<()> {
 fn gui_compat_config_query_allowed(name: &str) -> bool {
     matches!(
         name,
-        "id" | "temporary-password"
+        "id" | "public-id"
+            | "temporary-password"
             | "temporary-password-gui"
             | "permanent-password-set"
             | "permanent-password-is-preset"
@@ -1210,6 +1254,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                 let value;
                 if name == "id" {
                     value = Some(Config::get_id());
+                } else if name == "public-id" {
+                    value = Some(Config::get_public_id());
                 } else if name == MACHINE_SESSION_NONCE {
                     #[cfg(windows)]
                     {
@@ -2260,6 +2306,23 @@ pub fn get_id() -> String {
     }
 }
 
+pub fn get_public_id() -> String {
+    if let Ok(Some(value)) = get_config("public-id") {
+        return value;
+    }
+    #[cfg(windows)]
+    if should_use_installed_gui_compat("") {
+        // Installed builds predating the public-id IPC query still expose the
+        // server-owned, already assigned ID through the protected legacy
+        // query. Keep portable GUI updates from those builds usable without
+        // making a local unverified candidate visible.
+        if let Ok(Some(value)) = get_config("id") {
+            return value;
+        }
+    }
+    Config::get_public_id()
+}
+
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
     if let Ok(Some(v)) = get_config_async("rendezvous_server", ms_timeout).await {
         let mut urls = v.split(",");
@@ -2727,6 +2790,7 @@ mod test {
     fn gui_compat_does_not_expose_machine_password_verifier() {
         assert!(!should_allow_everyone_create_on_windows(POSTFIX_GUI_COMPAT));
         assert!(gui_compat_config_query_allowed("id"));
+        assert!(gui_compat_config_query_allowed("public-id"));
         assert!(gui_compat_config_query_allowed("permanent-password-set"));
         assert!(!gui_compat_config_query_allowed(
             "permanent-password-storage-and-salt"

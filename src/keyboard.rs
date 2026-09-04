@@ -927,6 +927,15 @@ fn should_pass_windows_modifier_to_platform(key: &Key) -> bool {
     )
 }
 
+/// Print Screen belongs to capture tools on the Windows controller. Unlike
+/// layout modifiers, it must be passed to Windows without first being sent to
+/// the peer, for both key-down and key-up.
+#[cfg(target_os = "windows")]
+#[inline]
+fn should_keep_windows_key_local(key: &Key) -> bool {
+    matches!(key, Key::PrintScreen)
+}
+
 fn start_grab_loop() {
     std::env::set_var("KEYBOARD_ONLY", "y");
     #[cfg(any(target_os = "windows", target_os = "macos"))]
@@ -934,6 +943,11 @@ fn start_grab_loop() {
         let try_handle_keyboard = move |event: Event, key: Key, is_press: bool| -> Option<Event> {
             // fix #2211：CAPS LOCK don't work
             if key == Key::CapsLock || key == Key::NumLock {
+                return Some(event);
+            }
+
+            #[cfg(target_os = "windows")]
+            if should_keep_windows_key_local(&key) {
                 return Some(event);
             }
 
@@ -1062,6 +1076,15 @@ mod tests {
 
         for key in [Key::KeyA, Key::F4, Key::Tab, Key::MetaLeft] {
             assert!(!should_pass_windows_modifier_to_platform(&key));
+        }
+    }
+
+    #[test]
+    fn windows_native_grab_keeps_print_screen_local_only() {
+        assert!(should_keep_windows_key_local(&Key::PrintScreen));
+
+        for key in [Key::Print, Key::KeyA, Key::F12] {
+            assert!(!should_keep_windows_key_local(&key));
         }
     }
 

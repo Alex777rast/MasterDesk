@@ -269,6 +269,12 @@ if ($buildScript -notmatch 'RefreshFlutterAot' -or
     $buildScript -notmatch "-Filter 'app\.so'") {
     throw 'The targeted Dart UI path does not refresh only the cached Flutter runner.'
 }
+if ($buildScript -notmatch 'Test-FlutterReleaseAssetBundle' -or
+    $buildScript -notmatch 'AssetManifest\.bin' -or
+    $buildScript -notmatch 'FontManifest\.json' -or
+    $buildScript -notmatch 'MaterialIcons-Regular\.otf') {
+    throw 'The Windows build script does not reject an incomplete Flutter asset bundle.'
+}
 
 $portablePacker = Get-Content -LiteralPath (Join-Path $ProjectRoot 'libs\portable\src\main.rs') -Raw
 if ($portablePacker -notmatch 'masterdesk_release_runs_portable_by_default') {

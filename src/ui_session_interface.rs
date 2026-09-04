@@ -53,6 +53,53 @@ use crate::{client::Data, client::Interface};
 
 const CHANGE_RESOLUTION_VALID_TIMEOUT_SECS: u64 = 15;
 
+#[cfg(target_os = "windows")]
+const WINDOWS_LEFT_CONTROL_SCAN_CODE: u32 = 0x1D;
+#[cfg(target_os = "windows")]
+const WINDOWS_V_SCAN_CODE: u32 = 0x2F;
+
+#[cfg(target_os = "windows")]
+fn windows_viewer_drop_paste_events() -> [KeyEvent; 4] {
+    let scan_event = |scan_code, down| {
+        let mut event = KeyEvent {
+            mode: KeyboardMode::Map.into(),
+            down,
+            ..Default::default()
+        };
+        event.set_chr(scan_code);
+        event
+    };
+
+    [
+        scan_event(WINDOWS_LEFT_CONTROL_SCAN_CODE, true),
+        scan_event(WINDOWS_V_SCAN_CODE, true),
+        scan_event(WINDOWS_V_SCAN_CODE, false),
+        scan_event(WINDOWS_LEFT_CONTROL_SCAN_CODE, false),
+    ]
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod viewer_drop_paste_tests {
+    use super::*;
+
+    #[test]
+    fn paste_shortcut_uses_layout_independent_windows_scan_codes() {
+        let events = windows_viewer_drop_paste_events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].chr(), WINDOWS_LEFT_CONTROL_SCAN_CODE);
+        assert_eq!(events[1].chr(), WINDOWS_V_SCAN_CODE);
+        assert_eq!(events[2].chr(), WINDOWS_V_SCAN_CODE);
+        assert_eq!(events[3].chr(), WINDOWS_LEFT_CONTROL_SCAN_CODE);
+        assert_eq!(
+            events.iter().map(|event| event.down).collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        assert!(events.iter().all(|event| {
+            event.mode.enum_value_or(KeyboardMode::Legacy) == KeyboardMode::Map
+        }));
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Session<T: InvokeUiSession> {
     pub password: String,
@@ -928,6 +975,18 @@ impl<T: InvokeUiSession> Session<T> {
         shift: bool,
         command: bool,
     ) {
+        #[cfg(target_os = "windows")]
+        let viewer_drop_paste =
+            if name == "VK_V" && press && ctrl && !alt && !shift && !command {
+                crate::platform::take_viewer_drop_paste()
+            } else {
+                false
+            };
+        #[cfg(target_os = "windows")]
+        if viewer_drop_paste {
+            self.send_windows_viewer_drop_paste();
+            return;
+        }
         let chars: Vec<char> = name.chars().collect();
         if chars.len() == 1 {
             let key = Key::_Raw(chars[0] as _);
@@ -936,6 +995,18 @@ impl<T: InvokeUiSession> Session<T> {
             if let Some(key) = KEY_MAP.get(name) {
                 self._input_key(key.clone(), down, press, alt, ctrl, shift, command);
             }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn send_windows_viewer_drop_paste(&self) {
+        for event in windows_viewer_drop_paste_events() {
+            // This is a Windows Explorer command, not a user keyboard event.
+            // Keep its physical Ctrl scan code even when the session's
+            // Ctrl/Command swap option is enabled.
+            let mut message = Message::new();
+            message.set_key_event(event);
+            self.send(Data::Message(message));
         }
     }
 

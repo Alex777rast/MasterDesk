@@ -3,6 +3,38 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:flutter_hbb/models/input_modifier_utils.dart';
 
 void main() {
+  group('shouldKeepPrintScreenLocal', () {
+    test('keeps Print Screen on the Windows controller', () {
+      expect(
+        shouldKeepPrintScreenLocal(
+          isWindows: true,
+          physicalKey: PhysicalKeyboardKey.printScreen,
+        ),
+        isTrue,
+      );
+    });
+
+    test('does not keep ordinary Windows keys locally', () {
+      expect(
+        shouldKeepPrintScreenLocal(
+          isWindows: true,
+          physicalKey: PhysicalKeyboardKey.keyA,
+        ),
+        isFalse,
+      );
+    });
+
+    test('does not change Print Screen routing on other platforms', () {
+      expect(
+        shouldKeepPrintScreenLocal(
+          isWindows: false,
+          physicalKey: PhysicalKeyboardKey.printScreen,
+        ),
+        isFalse,
+      );
+    });
+  });
+
   group('shouldPassWindowsModifierToPlatform', () {
     test('passes both sides of ctrl alt and shift on Windows', () {
       for (final key in [

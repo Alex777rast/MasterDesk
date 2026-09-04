@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -20,6 +21,7 @@ import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
 import '../../utils/image.dart';
 import '../widgets/remote_toolbar.dart';
+import '../widgets/explorer_transfer_panel.dart';
 import '../widgets/kb_layout_type_chooser.dart';
 import '../widgets/tabbar_widget.dart';
 
@@ -104,6 +106,7 @@ class _RemotePageState extends State<RemotePage>
   Worker? _waylandKeyboardModeWorker;
   bool _waylandKeyboardModeNormalized = false;
   bool _waylandKeyboardModeNormalizing = false;
+  bool _viewerFileDropInProgress = false;
 
   SessionID get sessionId => _ffi.sessionId;
 
@@ -480,6 +483,19 @@ class _RemotePageState extends State<RemotePage>
                           OverlayEntry(builder: remoteToolbar)
                         ])
                       : remoteToolbar(context)),
+              Obx(() => widget.toolbarState.transferPanelVisible.isTrue
+                  ? Positioned(
+                      top: 56,
+                      right: 12,
+                      bottom: 12,
+                      width: 390,
+                      child: ExplorerTransferPanel(
+                        controller: _ffi.fileModel.jobController,
+                        onClose: () => widget
+                            .toolbarState.transferPanelVisible.value = false,
+                      ),
+                    )
+                  : const SizedBox.shrink()),
               _ffi.ffiModel.pi.isSet.isFalse ? emptyOverlay() : Offstage(),
             ],
           ),
@@ -673,9 +689,49 @@ class _RemotePageState extends State<RemotePage>
             QualityMonitor(_ffi.qualityMonitorModel), null, null),
       ),
     );
-    return Stack(
-      children: paints,
+    return DropTarget(
+      enable: isWindows && !isWeb && _ffi.ffiModel.pi.isSet.isTrue,
+      onDragDone: _handleViewerFileDrop,
+      child: Stack(
+        children: paints,
+      ),
     );
+  }
+
+  Future<void> _handleViewerFileDrop(DropDoneDetails details) async {
+    final paths = details.files
+        .map((file) => file.path)
+        .where((path) => path.isNotEmpty)
+        .toList(growable: false);
+    if (paths.isEmpty) return;
+
+    // Windows exposes one process-wide clipboard. Keep separate drop gestures
+    // from replacing its virtual-file manifest while the previous gesture is
+    // still filling the parallel cache and waiting for the remote paste.
+    if (_viewerFileDropInProgress) {
+      showToast(translate('Preparing'));
+      return;
+    }
+
+    _viewerFileDropInProgress = true;
+    showToast(translate('Preparing'));
+    try {
+      final error = await bind.mainSetFileClipboard(paths: paths);
+      if (error.isNotEmpty) {
+        debugPrint('Failed to prepare Viewer file drop: $error');
+        showToast(translate('Failed to transfer dropped files'));
+        return;
+      }
+
+      if (!mounted) return;
+      final pasted =
+          await _ffi.inputModel.pasteClipboardFilesAt(details.globalPosition);
+      if (!pasted) {
+        showToast(translate('Failed to transfer dropped files'));
+      }
+    } finally {
+      _viewerFileDropInProgress = false;
+    }
   }
 
   @override

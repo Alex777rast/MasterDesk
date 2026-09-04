@@ -1,5 +1,15 @@
 import 'package:flutter/services.dart';
 
+/// Keeps the physical Print Screen key on the Windows controller. Alt state is
+/// intentionally irrelevant: both Print Screen and Alt+Print Screen belong to
+/// local capture tools and must not be forwarded to the remote peer.
+bool shouldKeepPrintScreenLocal({
+  required bool isWindows,
+  required PhysicalKeyboardKey physicalKey,
+}) {
+  return isWindows && physicalKey == PhysicalKeyboardKey.printScreen;
+}
+
 /// Returns true for Windows modifier events which must reach the native
 /// platform after MasterDesk has forwarded them to the remote peer.
 ///

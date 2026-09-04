@@ -23,16 +23,37 @@ macro_rules! my_println{
 }
 
 #[cfg(windows)]
-fn wait_for_portable_handoff_before_initialization() {
+fn complete_portable_handoff_before_initialization() -> bool {
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         if argument == "--wait-for-portable" {
             if let Some(process_id) = arguments.next().and_then(|value| value.parse::<u32>().ok()) {
                 crate::platform::wait_for_process_exit(process_id, 30_000);
+            } else {
+                log::warn!("Missing or invalid PID for --wait-for-portable.");
             }
-            break;
+            // This process is only a handoff helper. Starting Flutter here
+            // would leave the helper command line alive for the lifetime of
+            // the GUI and, when launched by an elevated updater, could put the
+            // window in Session 0. Relaunch once in the helper's already
+            // selected user session, then exit this process.
+            std::env::remove_var(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY);
+            match std::env::current_exe() {
+                Ok(exe) => {
+                    if let Err(err) = crate::platform::run_exe_direct(
+                        exe.to_string_lossy().as_ref(),
+                        Vec::new(),
+                        true,
+                    ) {
+                        log::error!("Failed to complete portable GUI handoff: {err}");
+                    }
+                }
+                Err(err) => log::error!("Failed to locate installed executable for GUI handoff: {err}"),
+            }
+            return true;
         }
     }
+    false
 }
 
 /// shared by flutter and sciter main function
@@ -43,7 +64,17 @@ fn wait_for_portable_handoff_before_initialization() {
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
     #[cfg(windows)]
-    wait_for_portable_handoff_before_initialization();
+    if complete_portable_handoff_before_initialization() {
+        return None;
+    }
+    #[cfg(windows)]
+    if std::env::args().nth(1).as_deref() == Some("--purge-masterdesk-settings") {
+        if let Err(err) = crate::platform::purge_masterdesk_settings() {
+            eprintln!("Failed to remove MasterDesk settings: {err}");
+            std::process::exit(1);
+        }
+        return None;
+    }
 
     if !crate::common::global_init() {
         return None;
@@ -183,6 +214,10 @@ pub fn core_main() -> Option<Vec<String>> {
             return None;
         }
     }
+    #[cfg(all(windows, feature = "flutter"))]
+    if args.first().map(String::as_str) == Some("--uninstall") {
+        flutter_args.push("--uninstall".to_owned());
+    }
     #[cfg(windows)]
     {
         _is_quick_support |= !crate::platform::is_installed()
@@ -276,11 +311,23 @@ pub fn core_main() -> Option<Vec<String>> {
         #[cfg(windows)]
         {
             use crate::platform;
-            if args[0] == "--uninstall" {
-                if let Err(err) = platform::uninstall_me(true) {
+            if args[0] == "--uninstall-confirmed" {
+                let delete_settings = args
+                    .get(1)
+                    .map(|arg| arg == "--delete-settings")
+                    .unwrap_or(false);
+                if let Err(err) = platform::uninstall_me(true, delete_settings) {
                     log::error!("Failed to uninstall: {}", err);
                 }
                 return None;
+            } else if args[0] == "--uninstall" {
+                #[cfg(not(feature = "flutter"))]
+                {
+                    if let Err(err) = platform::uninstall_me(true, false) {
+                        log::error!("Failed to uninstall: {}", err);
+                    }
+                    return None;
+                }
             } else if args[0] == "--update" {
                 if config::is_disable_installation() {
                     return None;

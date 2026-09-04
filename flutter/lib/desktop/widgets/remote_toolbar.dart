@@ -21,6 +21,7 @@ import 'package:window_size/window_size.dart' as window_size;
 
 import '../../common.dart';
 import '../../models/model.dart';
+import '../../models/file_model.dart';
 import '../../models/platform_model.dart';
 import '../../common/shared_state.dart';
 import './popup_menu.dart';
@@ -247,6 +248,7 @@ class ToolbarState {
 
   RxBool collapse = false.obs;
   RxBool hide = false.obs;
+  final RxBool transferPanelVisible = false.obs;
 
   // Track initialization state to prevent flickering
   final RxBool initialized = false.obs;
@@ -853,6 +855,12 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       toolbarItems.add(_VoiceCallMenu(id: widget.id, ffi: widget.ffi));
     }
     if (!isWeb) toolbarItems.add(_RecordMenu());
+    if (!isWeb) {
+      toolbarItems.add(_ExplorerTransferMenu(
+        ffi: widget.ffi,
+        state: widget.state,
+      ));
+    }
     toolbarItems.add(_CloseMenu(id: widget.id, ffi: widget.ffi));
     final toolbarBorderRadius = BorderRadius.all(Radius.circular(4.0));
     // innerAxis: how the toolbar icons themselves flow.
@@ -931,6 +939,51 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
               backgroundColor:
                   Theme.of(context).menuBarTheme.style?.backgroundColor)),
     );
+  }
+}
+
+class _ExplorerTransferMenu extends StatelessWidget {
+  final FFI ffi;
+  final ToolbarState state;
+
+  const _ExplorerTransferMenu({required this.ffi, required this.state});
+
+  @override
+  Widget build(BuildContext context) {
+    return Obx(() {
+      final visible = state.transferPanelVisible.value;
+      final active = ffi.fileModel.jobController.jobTable.any((job) =>
+          job.isExplorerClipboardTransfer && job.state == JobState.inProgress);
+      return Stack(
+        clipBehavior: Clip.none,
+        children: [
+          _IconMenuButton(
+            assetName: 'assets/transfer.svg',
+            tooltip: translate('Transfer diagnostics'),
+            onPressed: () => state.transferPanelVisible.toggle(),
+            color: visible || active
+                ? _ToolbarTheme.blueColor
+                : _ToolbarTheme.inactiveColor,
+            hoverColor: visible || active
+                ? _ToolbarTheme.hoverBlueColor
+                : _ToolbarTheme.hoverInactiveColor,
+          ),
+          if (active && !visible)
+            Positioned(
+              right: 2,
+              top: 2,
+              child: Container(
+                width: 7,
+                height: 7,
+                decoration: const BoxDecoration(
+                  color: Colors.greenAccent,
+                  shape: BoxShape.circle,
+                ),
+              ),
+            ),
+        ],
+      );
+    });
   }
 }
 

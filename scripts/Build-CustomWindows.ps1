@@ -178,12 +178,31 @@ function Initialize-Flutter {
     Invoke-Checked $FlutterExe @('precache', '--windows')
 
     $patchPath = Join-Path $ProjectRoot '.github\patches\flutter_3.24.4_dropdown_menu_enableFilter.diff'
-    & git -C $FlutterRoot apply --check $patchPath 2>$null
-    if ($LASTEXITCODE -eq 0) {
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        # A non-zero exit is expected when the patch is already present. Windows
+        # PowerShell promotes native stderr to a terminating error under Stop,
+        # so probe both directions with native failures temporarily non-fatal.
+        $ErrorActionPreference = 'Continue'
+        & git -C $FlutterRoot apply --check $patchPath 2>$null
+        $patchCanApply = $LASTEXITCODE -eq 0
+    }
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($patchCanApply) {
         Invoke-Checked 'git' @('-C', $FlutterRoot, 'apply', $patchPath)
     } else {
-        & git -C $FlutterRoot apply --reverse --check $patchPath 2>$null
-        if ($LASTEXITCODE -ne 0) {
+        $previousErrorActionPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            & git -C $FlutterRoot apply --reverse --check $patchPath 2>$null
+            $patchIsApplied = $LASTEXITCODE -eq 0
+        }
+        finally {
+            $ErrorActionPreference = $previousErrorActionPreference
+        }
+        if (-not $patchIsApplied) {
             throw 'The upstream Flutter dropdown patch can neither be applied nor identified as already applied.'
         }
         Write-Host 'Flutter dropdown patch is already applied.'
@@ -252,17 +271,145 @@ function Invoke-FlutterPubGetWithRetry {
     }
 }
 
-function Initialize-FlutterBridge {
+function Initialize-DesktopDropWindowsPatch {
+    $packageConfigPath = Join-Path $ProjectRoot 'flutter\.dart_tool\package_config.json'
+    if (-not (Test-Path -LiteralPath $packageConfigPath)) {
+        Push-Location (Join-Path $ProjectRoot 'flutter')
+        try {
+            Invoke-FlutterPubGetWithRetry
+        } finally {
+            Pop-Location
+        }
+    }
+
+    $packageConfig = Get-Content -LiteralPath $packageConfigPath -Raw | ConvertFrom-Json
+    $desktopDrop = @($packageConfig.packages | Where-Object { $_.name -eq 'desktop_drop' })
+    if ($desktopDrop.Count -ne 1) {
+        throw 'Expected exactly one desktop_drop package in Flutter package_config.json.'
+    }
+
+    $packageConfigUri = [Uri](Get-Item -LiteralPath $packageConfigPath).FullName
+    $packageRootUri = [Uri]::new($packageConfigUri, [string]$desktopDrop[0].rootUri)
+    $pluginSource = Join-Path $packageRootUri.LocalPath 'windows\desktop_drop_plugin.cpp'
+    if (-not (Test-Path -LiteralPath $pluginSource)) {
+        throw "desktop_drop Windows source not found: $pluginSource"
+    }
+
+    $source = [System.IO.File]::ReadAllText($pluginSource)
+    $newline = if ($source.Contains("`r`n")) { "`r`n" } else { "`n" }
+    $normalized = $source.Replace("`r`n", "`n")
+    $signatures = @(
+        'HRESULT DesktopDropTarget::DragEnter(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {',
+        'HRESULT DesktopDropTarget::DragOver(DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {',
+        'HRESULT DesktopDropTarget::Drop(IDataObject *pDataObj, DWORD grfKeyState, POINTL pt, DWORD *pdwEffect) {'
+    )
+    $effectSelection = @'
+    if (pdwEffect != nullptr) {
+        *pdwEffect = (*pdwEffect & DROPEFFECT_COPY) != 0
+                         ? DROPEFFECT_COPY
+                         : DROPEFFECT_NONE;
+    }
+'@
+
+    $changed = $false
+    $patchedCount = ([regex]::Matches(
+        $normalized,
+        [regex]::Escape('(*pdwEffect & DROPEFFECT_COPY) != 0')
+    )).Count
+    if ($patchedCount -eq 0) {
+        foreach ($signature in $signatures) {
+            if (([regex]::Matches($normalized, [regex]::Escape($signature))).Count -ne 1) {
+                throw "desktop_drop Windows source signature changed: $signature"
+            }
+            $normalized = $normalized.Replace(
+                $signature,
+                "$signature`n$effectSelection"
+            )
+        }
+        $changed = $true
+    } elseif ($patchedCount -ne $signatures.Count) {
+        throw "desktop_drop Windows copy-effect patch is partial ($patchedCount/$($signatures.Count))."
+    }
+
+    $hdropOld = @'
+                // we asked for the data as a HGLOBAL, so access it appropriately
+                PVOID data = GlobalLock(stgmed.hGlobal);
+                if (data != nullptr) {
+                    auto files = DragQueryFile(reinterpret_cast<HDROP>(data), 0xFFFFFFFF, nullptr, 0);
+                    for (unsigned int i = 0; i < files; ++i) {
+                        TCHAR filename[MAX_PATH];
+                        DragQueryFile(reinterpret_cast<HDROP>(data), i, filename, sizeof(TCHAR) * MAX_PATH);
+                        std::wstring wide(filename);
+                        std::string path = ws2s(wide);
+                        std::cout << "done: " << path << std::endl;
+                        list.push_back(flutter::EncodableValue(path));
+                    }
+                    GlobalUnlock(stgmed.hGlobal);
+                }
+'@
+    $hdropNew = @'
+                const auto drop = reinterpret_cast<HDROP>(stgmed.hGlobal);
+                const auto files = DragQueryFile(drop, 0xFFFFFFFF, nullptr, 0);
+                for (unsigned int i = 0; i < files; ++i) {
+                    const auto length = DragQueryFile(drop, i, nullptr, 0);
+                    std::wstring filename(length + 1, L'\0');
+                    if (DragQueryFile(drop, i, filename.data(),
+                                      static_cast<UINT>(filename.size())) > 0) {
+                        filename.resize(length);
+                        list.push_back(flutter::EncodableValue(ws2s(filename)));
+                    }
+                }
+'@
+    $oldHdropCount = ([regex]::Matches($normalized, [regex]::Escape($hdropOld))).Count
+    $newHdropCount = ([regex]::Matches($normalized, [regex]::Escape($hdropNew))).Count
+    if ($oldHdropCount -eq 1 -and $newHdropCount -eq 0) {
+        $normalized = $normalized.Replace($hdropOld, $hdropNew)
+        $changed = $true
+    } elseif ($oldHdropCount -ne 0 -or $newHdropCount -ne 1) {
+        throw "desktop_drop Windows CF_HDROP patch state is invalid (old=$oldHdropCount new=$newHdropCount)."
+    }
+
+    if (-not $changed) {
+        Write-Host 'desktop_drop Windows copy-effect and CF_HDROP patches are already applied.'
+        return
+    }
+    [System.IO.File]::WriteAllText(
+        $pluginSource,
+        $normalized.Replace("`n", $newline),
+        [System.Text.UTF8Encoding]::new($false)
+    )
+    Write-Host "Applied desktop_drop Windows copy-effect/CF_HDROP patches: $pluginSource"
+}
+
+function Test-FlutterBridgeNeedsGeneration {
     $bridgeOutputs = @(
         (Join-Path $ProjectRoot 'src\bridge_generated.rs'),
         (Join-Path $ProjectRoot 'src\bridge_generated.io.rs'),
         (Join-Path $ProjectRoot 'flutter\lib\generated_bridge.dart'),
-        (Join-Path $ProjectRoot 'flutter\lib\generated_bridge.freezed.dart')
+        (Join-Path $ProjectRoot 'flutter\lib\generated_bridge.freezed.dart'),
+        (Join-Path $ProjectRoot 'flutter\macos\Runner\bridge_generated.h')
     )
     $missingBridgeOutputs = @(
         $bridgeOutputs | Where-Object { -not (Test-Path -LiteralPath $_) }
     )
-    if ($missingBridgeOutputs.Count -eq 0) {
+    if ($missingBridgeOutputs.Count -gt 0) {
+        return $true
+    }
+
+    $bridgeInput = Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.rs')
+    $generatedCore = @(
+        'src\bridge_generated.rs',
+        'src\bridge_generated.io.rs',
+        'flutter\lib\generated_bridge.dart',
+        'flutter\macos\Runner\bridge_generated.h'
+    ) | ForEach-Object { Get-Item -LiteralPath (Join-Path $ProjectRoot $_) }
+    return @($generatedCore | Where-Object {
+        $_.LastWriteTimeUtc -lt $bridgeInput.LastWriteTimeUtc
+    }).Count -gt 0
+}
+
+function Initialize-FlutterBridge {
+    if (-not (Test-FlutterBridgeNeedsGeneration)) {
         Write-Host 'Flutter bridge files are already generated.'
         return
     }
@@ -298,7 +445,8 @@ function Initialize-FlutterBridge {
         Invoke-Checked $FlutterRustBridgeCodegen @(
             '--rust-input', (Join-Path $ProjectRoot 'src\flutter_ffi.rs'),
             '--dart-output', (Join-Path $ProjectRoot 'flutter\lib\generated_bridge.dart'),
-            '--c-output', (Join-Path $ProjectRoot 'flutter\macos\Runner\bridge_generated.h')
+            '--c-output', (Join-Path $ProjectRoot 'flutter\macos\Runner\bridge_generated.h'),
+            '--llvm-path', (Split-Path -Parent $LlvmBin)
         )
     } finally {
         [Environment]::SetEnvironmentVariable('RUST_LOG', $previousRustLog, 'Process')
@@ -307,6 +455,77 @@ function Initialize-FlutterBridge {
         -LiteralPath (Join-Path $ProjectRoot 'flutter\macos\Runner\bridge_generated.h') `
         -Destination (Join-Path $ProjectRoot 'flutter\ios\Runner\bridge_generated.h') `
         -Force
+}
+
+function Remove-LegacyWindowsBundleNames {
+    foreach ($legacyName in @(
+        'rustdesk.exe',
+        'librustdesk.dll',
+        'RuntimeBroker_rustdesk.exe'
+    )) {
+        $legacyPath = Join-Path $ReleaseDirectory $legacyName
+        if (Test-Path -LiteralPath $legacyPath) {
+            Remove-Item -LiteralPath $legacyPath -Force
+        }
+    }
+
+    $remainingLegacyNames = @(Get-ChildItem -LiteralPath $ReleaseDirectory -Recurse -Force |
+        Where-Object { $_.Name -match '(?i)rustdesk' })
+    if ($remainingLegacyNames.Count -gt 0) {
+        throw "Legacy RustDesk-named bundle entries remain: $($remainingLegacyNames.FullName -join '; ')"
+    }
+}
+
+function Test-FlutterReleaseAssetBundle {
+    param(
+        [string]$AssetRoot = (Join-Path $ReleaseDirectory 'data\flutter_assets'),
+        [switch]$ThrowOnFailure
+    )
+
+    $assetManifest = Join-Path $AssetRoot 'AssetManifest.bin'
+    $fontManifest = Join-Path $AssetRoot 'FontManifest.json'
+    $materialIcons = Join-Path $AssetRoot 'fonts\MaterialIcons-Regular.otf'
+    $problems = [System.Collections.Generic.List[string]]::new()
+
+    foreach ($requiredFile in @($assetManifest, $fontManifest, $materialIcons)) {
+        if (-not (Test-Path -LiteralPath $requiredFile)) {
+            [void]$problems.Add("missing $requiredFile")
+        } elseif ((Get-Item -LiteralPath $requiredFile).Length -le 0) {
+            [void]$problems.Add("empty $requiredFile")
+        }
+    }
+
+    if ($problems.Count -eq 0) {
+        try {
+            $fonts = Get-Content -LiteralPath $fontManifest -Raw | ConvertFrom-Json
+            $materialFamilyCount = 0
+            $materialAssetFound = $false
+            foreach ($fontFamily in $fonts) {
+                if ($fontFamily.family -ne 'MaterialIcons') {
+                    continue
+                }
+                $materialFamilyCount++
+                foreach ($fontEntry in $fontFamily.fonts) {
+                    if ($fontEntry.asset -eq 'fonts/MaterialIcons-Regular.otf') {
+                        $materialAssetFound = $true
+                    }
+                }
+            }
+            if ($materialFamilyCount -ne 1 -or -not $materialAssetFound) {
+                [void]$problems.Add('FontManifest.json does not register MaterialIcons-Regular.otf')
+            }
+        } catch {
+            [void]$problems.Add("invalid FontManifest.json: $($_.Exception.Message)")
+        }
+    }
+
+    if ($problems.Count -gt 0) {
+        if ($ThrowOnFailure) {
+            throw "BUILD FAIL: Flutter release asset bundle is incomplete: $($problems -join '; ')"
+        }
+        return $false
+    }
+    return $true
 }
 
 function Build-PortableExecutable {
@@ -324,12 +543,17 @@ function Build-PortableExecutable {
             '--vram'
         )
 
-        if (-not (Test-Path -LiteralPath (Join-Path $ReleaseDirectory 'rustdesk.exe'))) {
+        if (-not (Test-Path -LiteralPath (Join-Path $ReleaseDirectory 'MasterDesk.exe'))) {
             throw "Flutter release executable not found in $ReleaseDirectory"
         }
+        if (-not (Test-Path -LiteralPath (Join-Path $ReleaseDirectory 'libmasterdesk.dll'))) {
+            throw "Branded Rust library not found in $ReleaseDirectory"
+        }
+        Remove-LegacyWindowsBundleNames
 
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENCE') -Destination $ReleaseDirectory -Force
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'CUSTOM_BUILD.md') -Destination $ReleaseDirectory -Force
+        Write-BuildConsistencyManifest
 
         Push-Location (Join-Path $ProjectRoot 'libs\portable')
         try {
@@ -338,7 +562,7 @@ function Build-PortableExecutable {
                 '.\generate.py',
                 '-f', '..\..\flutter\build\windows\x64\runner\Release',
                 '-o', '.',
-                '-e', '..\..\flutter\build\windows\x64\runner\Release\rustdesk.exe'
+                '-e', '..\..\flutter\build\windows\x64\runner\Release\MasterDesk.exe'
             )
         } finally {
             Pop-Location
@@ -363,6 +587,30 @@ function Build-PortableExecutable {
     }
 }
 
+function Stop-ProcessTree {
+    param([Parameter(Mandatory)] [int]$RootProcessId)
+
+    $processes = @(Get-CimInstance Win32_Process)
+    $targets = [System.Collections.Generic.List[object]]::new()
+    $pending = [System.Collections.Generic.Queue[object]]::new()
+    $pending.Enqueue([pscustomobject]@{ Id = $RootProcessId; Depth = 0 })
+    while ($pending.Count -gt 0) {
+        $item = $pending.Dequeue()
+        $process = $processes | Where-Object { $_.ProcessId -eq $item.Id } | Select-Object -First 1
+        if (-not $process) {
+            continue
+        }
+        [void]$targets.Add([pscustomobject]@{ Id = [int]$process.ProcessId; Depth = $item.Depth })
+        foreach ($child in ($processes | Where-Object { $_.ParentProcessId -eq $process.ProcessId })) {
+            $pending.Enqueue([pscustomobject]@{ Id = [int]$child.ProcessId; Depth = $item.Depth + 1 })
+        }
+    }
+
+    foreach ($target in ($targets | Sort-Object Depth -Descending)) {
+        Stop-Process -Id $target.Id -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Invoke-IncrementalFlutterAotBuild {
     param(
         [Parameter(Mandatory)] [string]$FlutterBackend,
@@ -375,20 +623,36 @@ function Invoke-IncrementalFlutterAotBuild {
     $stdoutLog = Join-Path $logDirectory "flutter-aot-$stamp.stdout.log"
     $stderrLog = Join-Path $logDirectory "flutter-aot-$stamp.stderr.log"
     $startedUtc = [DateTime]::UtcNow
-    $commandLine = "/d /s /c `"`"$FlutterBackend`" windows-x64 Release`""
-    $process = Start-Process `
-        -FilePath $env:ComSpec `
-        -ArgumentList $commandLine `
-        -WorkingDirectory $FlutterProject `
-        -WindowStyle Hidden `
-        -RedirectStandardOutput $stdoutLog `
-        -RedirectStandardError $stderrLog `
-        -PassThru
+    $aotInputs = @(
+        Get-ChildItem -LiteralPath (Join-Path $FlutterProject 'lib') -Recurse -File -Filter '*.dart'
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\bridge_generated.rs') -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\bridge_generated.io.rs') -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\flutter.rs') -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.rs') -ErrorAction SilentlyContinue
+    ) | Where-Object { $_ }
+    $newestAotInput = $aotInputs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    # Redirect inside cmd.exe and use System.Diagnostics.Process directly.
+    # Windows PowerShell's Start-Process can wait while descendant Dart
+    # processes retain handles, preventing the watchdog from observing the PID.
+    $commandLine = "/d /s /c `"`"$FlutterBackend`" windows-x64 Release 1>`"$stdoutLog`" 2>`"$stderrLog`"`""
+    $startInfo = [System.Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $env:ComSpec
+    $startInfo.Arguments = $commandLine
+    $startInfo.WorkingDirectory = $FlutterProject
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $process = [System.Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw 'Failed to start the Flutter AOT backend.'
+    }
+    Write-Host "Flutter AOT wrapper started: PID $($process.Id)"
 
     $deadline = [DateTime]::UtcNow.AddMinutes(10)
     $lastSignature = $null
     $stableSince = $null
     $latestAot = $null
+    $lastProbeUtc = [DateTime]::MinValue
     while ([DateTime]::UtcNow -lt $deadline) {
         $process.Refresh()
         $latestAot = Get-ChildItem `
@@ -397,18 +661,54 @@ function Invoke-IncrementalFlutterAotBuild {
             Sort-Object LastWriteTimeUtc -Descending |
             Select-Object -First 1
 
-        if ($latestAot -and $latestAot.LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2)) {
-            $signature = "$($latestAot.Length):$($latestAot.LastWriteTimeUtc.Ticks)"
+        $generatedAssetRoot = Join-Path $FlutterProject 'build\flutter_assets'
+        $generatedAssetsReady = Test-FlutterReleaseAssetBundle -AssetRoot $generatedAssetRoot
+        $generatedAssetManifest = Join-Path $generatedAssetRoot 'AssetManifest.bin'
+        $generatedFontManifest = Join-Path $generatedAssetRoot 'FontManifest.json'
+        $freshOutput = $latestAot -and (
+            $latestAot.LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2) -or
+            ((Test-Path -LiteralPath $generatedAssetManifest) -and
+                (Get-Item -LiteralPath $generatedAssetManifest).LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2)) -or
+            ((Test-Path -LiteralPath $generatedFontManifest) -and
+                (Get-Item -LiteralPath $generatedFontManifest).LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2))
+        )
+        $aotAlreadyCurrent = $latestAot -and (
+            -not $newestAotInput -or
+            $latestAot.LastWriteTimeUtc -ge $newestAotInput.LastWriteTimeUtc
+        )
+        if ([DateTime]::UtcNow.Subtract($lastProbeUtc).TotalSeconds -ge 10) {
+            Write-Host (
+                'Flutter AOT probe: app={0} fresh={1} current={2} assets={3}' -f
+                [bool]$latestAot,
+                [bool]$freshOutput,
+                [bool]$aotAlreadyCurrent,
+                [bool]$generatedAssetsReady
+            )
+            $lastProbeUtc = [DateTime]::UtcNow
+        }
+        if ($latestAot -and
+            ($freshOutput -or $aotAlreadyCurrent) -and
+            $generatedAssetsReady) {
+            $assetSignature = @(
+                'AssetManifest.bin',
+                'FontManifest.json',
+                'fonts\MaterialIcons-Regular.otf'
+            ) | ForEach-Object {
+                $asset = Get-Item -LiteralPath (Join-Path $generatedAssetRoot $_)
+                "$($asset.Length):$($asset.LastWriteTimeUtc.Ticks)"
+            }
+            $signature = "$($latestAot.Length):$($latestAot.LastWriteTimeUtc.Ticks):$($assetSignature -join ':')"
             if ($signature -ne $lastSignature) {
                 $lastSignature = $signature
                 $stableSince = [DateTime]::UtcNow
+                Write-Host 'Flutter AOT and asset bundle are ready; verifying stability.'
             } elseif ($stableSince -and
                 [DateTime]::UtcNow.Subtract($stableSince).TotalSeconds -ge 15) {
                 if (-not $process.HasExited) {
                     # Flutter 3.24 can leave tool_backend.bat waiting after the
                     # final app.so is complete. Stop only that exact hidden
-                    # wrapper after the artifact has remained stable.
-                    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+                    # wrapper tree after the artifacts have remained stable.
+                    Stop-ProcessTree -RootProcessId $process.Id
                     $process.WaitForExit(5000) | Out-Null
                     Write-Host "Flutter AOT wrapper stopped after stable output: $($latestAot.FullName)"
                 }
@@ -417,29 +717,117 @@ function Invoke-IncrementalFlutterAotBuild {
         }
 
         if ($process.HasExited) {
-            if ($process.ExitCode -ne 0) {
+            # Redirected Start-Process streams are finalized asynchronously.
+            # Wait before reading ExitCode; otherwise PowerShell can expose
+            # $null and falsely report a successful short backend run as failed.
+            $process.WaitForExit()
+            $process.Refresh()
+            $exitCode = $process.ExitCode
+            if ($null -eq $exitCode) {
+                $stderrLength = if (Test-Path -LiteralPath $stderrLog) {
+                    (Get-Item -LiteralPath $stderrLog).Length
+                } else {
+                    0
+                }
+                if ($latestAot -and $stderrLength -eq 0 -and
+                    (Test-FlutterReleaseAssetBundle -AssetRoot $generatedAssetRoot)) {
+                    return $latestAot
+                }
+                throw "Flutter AOT backend ended without an exit code. Logs: $stdoutLog ; $stderrLog"
+            }
+            if ($exitCode -ne 0) {
                 Write-Host "Flutter AOT stderr log: $stderrLog"
                 if (Test-Path -LiteralPath $stderrLog) {
                     Get-Content -LiteralPath $stderrLog -Tail 25
                 }
-                throw "Flutter AOT backend failed with exit code $($process.ExitCode)."
+                throw "Flutter AOT backend failed with exit code $exitCode."
             }
             if (-not $latestAot) {
                 throw 'Flutter AOT backend completed without producing app.so.'
             }
+            Test-FlutterReleaseAssetBundle `
+                -AssetRoot $generatedAssetRoot `
+                -ThrowOnFailure | Out-Null
             return $latestAot
         }
         Start-Sleep -Seconds 1
     }
 
-    Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+    Stop-ProcessTree -RootProcessId $process.Id
     throw "Flutter AOT backend timed out. Logs: $stdoutLog ; $stderrLog"
+}
+
+function Write-BuildConsistencyManifest {
+    $rustLibrary = Join-Path $ReleaseDirectory 'libmasterdesk.dll'
+    $flutterAot = Join-Path $ReleaseDirectory 'data\app.so'
+    if (-not (Test-Path -LiteralPath $rustLibrary)) {
+        throw "Build consistency check: Rust library not found: $rustLibrary"
+    }
+    if (-not (Test-Path -LiteralPath $flutterAot)) {
+        throw "Build consistency check: Flutter AOT not found: $flutterAot"
+    }
+    Test-FlutterReleaseAssetBundle -ThrowOnFailure | Out-Null
+    if (Test-FlutterBridgeNeedsGeneration) {
+        throw 'BUILD FAIL: Flutter/Rust bridge outputs are stale.'
+    }
+
+    $aotInputs = @(
+        Get-ChildItem -LiteralPath (Join-Path $ProjectRoot 'flutter\lib') -Recurse -File -Filter '*.dart'
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\bridge_generated.rs') -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\bridge_generated.io.rs') -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\flutter.rs') -ErrorAction SilentlyContinue
+        Get-Item -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.rs') -ErrorAction SilentlyContinue
+    ) | Where-Object { $_ }
+    $newestInput = $aotInputs | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+    $aotFile = Get-Item -LiteralPath $flutterAot
+    if ($newestInput -and $aotFile.LastWriteTimeUtc -lt $newestInput.LastWriteTimeUtc) {
+        throw "BUILD FAIL: Flutter app.so is older than $($newestInput.FullName). Rebuild Flutter AOT."
+    }
+
+    $bridgeHashes = [ordered]@{}
+    foreach ($relativePath in @(
+        'src\bridge_generated.rs',
+        'src\bridge_generated.io.rs',
+        'flutter\lib\generated_bridge.dart',
+        'flutter\lib\generated_bridge.freezed.dart'
+    )) {
+        $path = Join-Path $ProjectRoot $relativePath
+        if (Test-Path -LiteralPath $path) {
+            $bridgeHashes[$relativePath] = (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash
+        }
+    }
+
+    $manifest = [ordered]@{
+        Schema = 1
+        Version = $BuildBaseVersion
+        Beta = $BetaNumber
+        BuildDate = $BuildDate
+        RustDllSha256 = (Get-FileHash -LiteralPath $rustLibrary -Algorithm SHA256).Hash
+        FlutterAotSha256 = (Get-FileHash -LiteralPath $flutterAot -Algorithm SHA256).Hash
+        FlutterAotLastWriteUtc = $aotFile.LastWriteTimeUtc.ToString('o')
+        NewestFlutterInput = if ($newestInput) { $newestInput.FullName } else { '' }
+        NewestFlutterInputLastWriteUtc = if ($newestInput) { $newestInput.LastWriteTimeUtc.ToString('o') } else { '' }
+        BridgeSha256 = $bridgeHashes
+    }
+    $manifestPath = Join-Path $ReleaseDirectory 'data\masterdesk-build-manifest.json'
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $manifestPath -Encoding UTF8
+
+    $verified = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+    if ($verified.Beta -ne $BetaNumber -or
+        $verified.BuildDate -ne $BuildDate -or
+        $verified.RustDllSha256 -ne $manifest.RustDllSha256 -or
+        $verified.FlutterAotSha256 -ne $manifest.FlutterAotSha256) {
+        throw 'BUILD FAIL: Rust/Flutter build consistency manifest verification failed.'
+    }
+    Write-Host "Build consistency manifest: $manifestPath"
+    Write-Host "RUST_DLL_SHA256=$($manifest.RustDllSha256)"
+    Write-Host "FLUTTER_AOT_SHA256=$($manifest.FlutterAotSha256)"
 }
 
 function Build-IncrementalRustPortableExecutable {
     Push-Location $ProjectRoot
     try {
-        $runnerExe = Join-Path $ReleaseDirectory 'rustdesk.exe'
+        $runnerExe = Join-Path $ReleaseDirectory 'MasterDesk.exe'
         if (-not (Test-Path -LiteralPath $runnerExe)) {
             throw "Existing Flutter runner not found: $runnerExe"
         }
@@ -465,6 +853,15 @@ function Build-IncrementalRustPortableExecutable {
                     -FlutterProject $flutterProject
                 $releaseAot = Join-Path $ReleaseDirectory 'data\app.so'
                 Copy-Item -LiteralPath $aotOutput.FullName -Destination $releaseAot -Force
+                $generatedAssetRoot = Join-Path $flutterProject 'build\flutter_assets'
+                $releaseAssetRoot = Join-Path $ReleaseDirectory 'data\flutter_assets'
+                New-Item -ItemType Directory -Path $releaseAssetRoot -Force | Out-Null
+                Copy-Item `
+                    -Path (Join-Path $generatedAssetRoot '*') `
+                    -Destination $releaseAssetRoot `
+                    -Recurse `
+                    -Force
+                Test-FlutterReleaseAssetBundle -ThrowOnFailure | Out-Null
                 Write-Host "Flutter AOT refreshed: $($aotOutput.FullName)"
             } finally {
                 Pop-Location
@@ -500,9 +897,14 @@ function Build-IncrementalRustPortableExecutable {
             Write-Host "SHA256=$diagnosticHash"
             return
         }
-        Copy-Item -LiteralPath $rustLibrary -Destination $ReleaseDirectory -Force
+        Copy-Item `
+            -LiteralPath $rustLibrary `
+            -Destination (Join-Path $ReleaseDirectory 'libmasterdesk.dll') `
+            -Force
+        Remove-LegacyWindowsBundleNames
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENCE') -Destination $ReleaseDirectory -Force
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'CUSTOM_BUILD.md') -Destination $ReleaseDirectory -Force
+        Write-BuildConsistencyManifest
 
         Push-Location (Join-Path $ProjectRoot 'libs\portable')
         try {
@@ -510,7 +912,7 @@ function Build-IncrementalRustPortableExecutable {
                 '.\generate.py',
                 '-f', '..\..\flutter\build\windows\x64\runner\Release',
                 '-o', '.',
-                '-e', '..\..\flutter\build\windows\x64\runner\Release\rustdesk.exe'
+                '-e', '..\..\flutter\build\windows\x64\runner\Release\MasterDesk.exe'
             )
         } finally {
             Pop-Location
@@ -599,7 +1001,10 @@ Invoke-Checked $FlutterExe @('--version')
 
 if (-not $SkipFlutterSetup) {
     Initialize-Flutter
+} elseif (Test-FlutterBridgeNeedsGeneration) {
+    Initialize-FlutterBridge
 }
+Initialize-DesktopDropWindowsPatch
 if (-not $SkipVcpkg) {
     Install-VcpkgDependencies
 }

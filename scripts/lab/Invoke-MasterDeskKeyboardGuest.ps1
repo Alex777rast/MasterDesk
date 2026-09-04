@@ -104,8 +104,9 @@ function Save-Result([hashtable]$Value) {
 }
 
 function Get-InstalledPath {
-    $service = Get-CimInstance Win32_Service -Filter "Name='MasterDesk'" -ErrorAction Stop
-    $pathName = [string]$service.PathName
+    $pathName = [string](Get-ItemPropertyValue `
+        -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Services\MasterDesk' `
+        -Name ImagePath -ErrorAction Stop)
     if ($pathName -match '^\s*"([^"]+)"') { return $matches[1] }
     if ($pathName -match '^\s*(\S+)') { return $matches[1] }
     throw 'Cannot parse MasterDesk service path.'
@@ -293,7 +294,7 @@ try {
                 $needsInstall = $true
                 try {
                     $current = Get-InstalledPath
-                    $currentDll = Join-Path (Split-Path -Parent $current) 'librustdesk.dll'
+                    $currentDll = Join-Path (Split-Path -Parent $current) 'libmasterdesk.dll'
                     $needsInstall = (Get-FileHash $current -Algorithm SHA256).Hash -ne $ExpectedRunnerSha256 -or
                         (Get-FileHash $currentDll -Algorithm SHA256).Hash -ne $ExpectedDllSha256
                 } catch { $needsInstall = $true }
@@ -311,11 +312,11 @@ try {
                 }
             }
             $installed = Get-InstalledPath
-            $dll = Join-Path (Split-Path -Parent $installed) 'librustdesk.dll'
+            $dll = Join-Path (Split-Path -Parent $installed) 'libmasterdesk.dll'
             $runnerHash = (Get-FileHash -LiteralPath $installed -Algorithm SHA256).Hash
             $dllHash = (Get-FileHash -LiteralPath $dll -Algorithm SHA256).Hash
             if ($runnerHash -ne $ExpectedRunnerSha256) { throw 'Installed runner SHA256 mismatch.' }
-            if ($dllHash -ne $ExpectedDllSha256) { throw 'Installed librustdesk.dll SHA256 mismatch.' }
+            if ($dllHash -ne $ExpectedDllSha256) { throw 'Installed libmasterdesk.dll SHA256 mismatch.' }
             [void](Invoke-ClientCli $installed @('--option','allow-websocket','N') 'disable-wss')
             $id = Invoke-ClientCli $installed @('--get-id') 'get-id'
             if (-not $id) { throw 'MasterDesk ID is empty.' }
@@ -638,17 +639,37 @@ try {
                 'C:\Program Files\totalcmd\TOTALCMD64.EXE',
                 'C:\Program Files (x86)\totalcmd\TOTALCMD.EXE'
             ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf }
-            $result.TestDisk = @(Get-ChildItem -Path 'C:\' -Filter 'testdisk*.exe' `
-                -File -Recurse -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
-            $result.Logs = @(
-                Get-ChildItem -Path @(
-                    'C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\MasterDesk\log',
-                    'C:\Windows\ServiceProfiles\LocalSystem\AppData\Roaming\MasterDesk\log',
-                    'C:\Users\MasterDeskTest\AppData\Roaming\MasterDesk\log'
-                ) -File -Recurse -ErrorAction SilentlyContinue |
-                    Sort-Object LastWriteTimeUtc -Descending |
-                    Select-Object -First 20 FullName, Length, LastWriteTimeUtc
-            )
+            # A recursive scan from C:\ can take minutes and leave the Runtime
+            # probe looking hung. TestDisk distributions normally live in a
+            # top-level testdisk* directory or in the lab user's Downloads.
+            $testDiskRoots = @(
+                'C:\MasterDeskLab',
+                (Join-Path $env:USERPROFILE 'Downloads')
+            ) + @(Get-ChildItem -LiteralPath 'C:\' -Directory -Filter 'testdisk*' `
+                -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName)
+            $result.TestDisk = @($testDiskRoots |
+                Where-Object { Test-Path -LiteralPath $_ -PathType Container } |
+                ForEach-Object {
+                    Get-ChildItem -LiteralPath $_ -Filter 'testdisk*.exe' -File -Recurse `
+                        -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+                } | Select-Object -Unique)
+            $logFiles = foreach ($logRoot in @(
+                'C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\MasterDesk\log',
+                'C:\Windows\ServiceProfiles\LocalSystem\AppData\Roaming\MasterDesk\log',
+                'C:\Users\MasterDeskTest\AppData\Roaming\MasterDesk\log'
+            )) {
+                if (-not [System.IO.Directory]::Exists($logRoot)) { continue }
+                try {
+                    Get-ChildItem -LiteralPath $logRoot -File -Recurse `
+                        -ErrorAction SilentlyContinue
+                } catch {
+                    # Interactive lab probes can run without access to service
+                    # profile logs. Runtime state remains useful without them.
+                }
+            }
+            $result.Logs = @($logFiles |
+                Sort-Object LastWriteTimeUtc -Descending |
+                Select-Object -First 20 FullName, Length, LastWriteTimeUtc)
         }
         'Identity' {
             $installed = 'C:\Program Files\MasterDesk\MasterDesk.exe'
@@ -701,12 +722,12 @@ try {
             }
             $installed = Get-InstalledPath
             $installedDirectory = Split-Path -Parent $installed
-            $installedDll = Join-Path $installedDirectory 'librustdesk.dll'
+            $installedDll = Join-Path $installedDirectory 'libmasterdesk.dll'
             if (-not (Test-Path -LiteralPath $installedDll -PathType Leaf)) {
-                throw "Installed librustdesk.dll was not found: $installedDll"
+                throw "Installed libmasterdesk.dll was not found: $installedDll"
             }
-            $backup = 'C:\MasterDeskLab\librustdesk-beta18-original.dll'
             $beforeHash = (Get-FileHash -LiteralPath $installedDll -Algorithm SHA256).Hash
+            $backup = "C:\MasterDeskLab\libmasterdesk-before-diagnostic-$($beforeHash.Substring(0, 12)).dll"
             if (-not (Test-Path -LiteralPath $backup -PathType Leaf)) {
                 Copy-Item -LiteralPath $installedDll -Destination $backup -Force
             }

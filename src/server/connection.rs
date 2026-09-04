@@ -54,10 +54,10 @@ use scrap::android::{call_main_service_key_event, call_main_service_pointer_inpu
 use scrap::camera;
 use serde_derive::Serialize;
 use serde_json::{json, value::Value};
-#[cfg(not(any(target_os = "android", target_os = "ios")))]
-use std::sync::atomic::Ordering;
 #[cfg(target_os = "windows")]
 use std::sync::atomic::AtomicU64;
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+use std::sync::atomic::Ordering;
 use std::{
     collections::HashSet,
     net::Ipv6Addr,
@@ -81,6 +81,7 @@ static WINDOWS_LAYOUT_INPUT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 lazy_static::lazy_static! {
     static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
     static ref SESSIONS: Arc::<Mutex<HashMap<SessionKey, Session>>> = Default::default();
+    static ref PARALLEL_TRANSFER_AUTH: Arc::<Mutex<HashMap<String, ParallelTransferAuth>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
     pub static ref CONTROL_PERMISSIONS_ARRAY: Arc::<Mutex<Vec<(i32, ControlPermissions)>>> = Default::default();
@@ -97,6 +98,26 @@ lazy_static::lazy_static! {
 
 #[cfg(target_os = "windows")]
 const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
+
+fn allow_parallel_clipboard_cache_on_control_session(
+    file_permission: bool,
+    clipboard_permission: bool,
+    action: &FileAction,
+) -> bool {
+    if !(file_permission && clipboard_permission) {
+        return false;
+    }
+
+    matches!(
+        action.union.as_ref(),
+        Some(file_action::Union::Receive(receive))
+            if receive.parallel_initialize
+                && receive.parallel_clipboard_cache
+                && !receive.parallel_transfer_id.is_empty()
+                && !receive.parallel_auth_token.is_empty()
+                && !receive.files.is_empty()
+    )
+}
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -261,6 +282,55 @@ struct Session {
     tfa: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ParallelTransferAuth {
+    session_key: SessionKey,
+    auth_token: String,
+    created_at: Instant,
+}
+
+const PARALLEL_TRANSFER_AUTH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+fn register_parallel_transfer_auth(
+    transfer_id: &str,
+    session_key: SessionKey,
+    auth_token: &str,
+) -> bool {
+    if transfer_id.is_empty() || auth_token.is_empty() {
+        return false;
+    }
+    let mut auth = PARALLEL_TRANSFER_AUTH.lock().unwrap();
+    auth.retain(|_, value| value.created_at.elapsed() < PARALLEL_TRANSFER_AUTH_TIMEOUT);
+    auth.insert(
+        transfer_id.to_owned(),
+        ParallelTransferAuth {
+            session_key,
+            auth_token: auth_token.to_owned(),
+            created_at: Instant::now(),
+        },
+    );
+    true
+}
+
+fn validate_parallel_transfer_auth(
+    transfer_id: &str,
+    session_key: &SessionKey,
+    auth_token: &str,
+) -> bool {
+    let mut auth = PARALLEL_TRANSFER_AUTH.lock().unwrap();
+    auth.retain(|_, value| value.created_at.elapsed() < PARALLEL_TRANSFER_AUTH_TIMEOUT);
+    auth.get(transfer_id)
+        .map(|value| {
+            value.session_key == *session_key
+                && constant_time_eq(value.auth_token.as_bytes(), auth_token.as_bytes())
+        })
+        .unwrap_or(false)
+}
+
+fn remove_parallel_transfer_auth(transfer_id: &str) {
+    PARALLEL_TRANSFER_AUTH.lock().unwrap().remove(transfer_id);
+}
+
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 struct StartCmIpcPara {
     rx_to_cm: mpsc::UnboundedReceiver<ipc::Data>,
@@ -348,6 +418,10 @@ pub struct Connection {
     timer: crate::RustDeskInterval,
     file_timer: crate::RustDeskInterval,
     file_transfer: Option<(String, bool)>,
+    parallel_transfer_id: String,
+    parallel_worker: u32,
+    parallel_auth_token: String,
+    parallel_primary_transfers: HashSet<String>,
     view_camera: bool,
     terminal: bool,
     port_forward_socket: Option<Framed<TcpStream, BytesCodec>>,
@@ -549,6 +623,10 @@ impl Connection {
             timer: crate::rustdesk_interval(time::interval(SEC30)),
             file_timer: crate::rustdesk_interval(time::interval(SEC30)),
             file_transfer: None,
+            parallel_transfer_id: String::new(),
+            parallel_worker: 0,
+            parallel_auth_token: String::new(),
+            parallel_primary_transfers: HashSet::new(),
             view_camera: false,
             terminal: false,
             port_forward_socket: None,
@@ -1901,6 +1979,8 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
             safe_mode_reboot,
+            parallel_file_transfer_v1: cfg!(target_os = "windows"),
+            parallel_clipboard_cache_v1: cfg!(target_os = "windows"),
             ..Default::default()
         })
         .into();
@@ -2173,6 +2253,7 @@ impl Connection {
             block_input: self.block_input,
             privacy_mode: self.privacy_mode,
             from_switch: self.from_switch,
+            parallel_auxiliary: !self.parallel_transfer_id.is_empty(),
         });
     }
 
@@ -2530,6 +2611,10 @@ impl Connection {
 
     fn reset_session_scope_for_login(&mut self) {
         self.file_transfer = None;
+        self.parallel_transfer_id.clear();
+        self.parallel_worker = 0;
+        self.parallel_auth_token.clear();
+        self.parallel_primary_transfers.clear();
         self.view_camera = false;
         self.terminal = false;
         self.port_forward_address.clear();
@@ -2629,6 +2714,17 @@ impl Connection {
                         sleep(1.).await;
                         return false;
                     }
+                    self.parallel_transfer_id = if ft.parallel_auxiliary {
+                        ft.parallel_transfer_id.clone()
+                    } else {
+                        String::new()
+                    };
+                    self.parallel_worker = ft.parallel_worker;
+                    self.parallel_auth_token = if ft.parallel_auxiliary {
+                        ft.parallel_auth_token
+                    } else {
+                        String::new()
+                    };
                     self.file_transfer = Some((ft.dir, ft.show_hidden));
                 }
                 Some(login_request::Union::ViewCamera(_vc)) => {
@@ -2763,7 +2859,23 @@ impl Connection {
                 crate::get_builtin_option(keys::OPTION_ALLOW_LOGON_SCREEN_PASSWORD) == "Y"
                     && is_logon();
 
-            if (password::approve_mode() == ApproveMode::Click && !allow_logon_screen_password)
+            if !self.parallel_transfer_id.is_empty() {
+                if !validate_parallel_transfer_auth(
+                    &self.parallel_transfer_id,
+                    &self.session_key(),
+                    &self.parallel_auth_token,
+                ) {
+                    self.send_login_error("Parallel file transfer authorization expired")
+                        .await;
+                    return false;
+                }
+                self.parallel_auth_token.clear();
+                if !self.send_logon_response_and_keep_alive().await {
+                    return false;
+                }
+                self.try_start_cm(lr.my_id.clone(), lr.my_name.clone(), self.authorized);
+            } else if (password::approve_mode() == ApproveMode::Click
+                && !allow_logon_screen_password)
                 || password::approve_mode() == ApproveMode::Both && !password::has_valid_password()
             {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -3235,7 +3347,13 @@ impl Connection {
                     }
                 }
                 Some(message::Union::FileAction(fa)) => {
-                    let mut handle_fa = self.file_transfer.is_some();
+                    let mut handle_fa = self.file_transfer.is_some()
+                        || (self.file_transfer.is_none()
+                            && allow_parallel_clipboard_cache_on_control_session(
+                                self.file,
+                                self.clipboard,
+                                &fa,
+                            ));
                     if !handle_fa {
                         if let Some(file_action::Union::Send(s)) = fa.union.as_ref() {
                             if JobType::from_proto(s.file_type) == JobType::Printer {
@@ -3390,26 +3508,128 @@ impl Connection {
                                 let od = can_enable_overwrite_detection(get_version_number(
                                     &self.lr.version,
                                 ));
-                                self.send_fs(ipc::FS::NewWrite {
-                                    path: r.path.clone(),
-                                    id: r.id,
-                                    file_num: r.file_num,
-                                    files: r
-                                        .files
-                                        .to_vec()
-                                        .drain(..)
-                                        .map(|f| (f.name, f.modified_time))
-                                        .collect(),
-                                    overwrite_detection: od,
-                                    total_size: r.total_size,
-                                    conn_id: self.inner.id(),
-                                });
-                                self.post_file_audit(
-                                    FileAuditType::RemoteReceive,
-                                    &r.path,
-                                    Self::get_files_for_audit(fs::JobType::Generic, r.files),
-                                    json!({}),
-                                );
+                                if r.parallel_initialize
+                                    && !r.parallel_transfer_id.is_empty()
+                                    && self.parallel_transfer_id.is_empty()
+                                    && !r.files.is_empty()
+                                {
+                                    if !register_parallel_transfer_auth(
+                                        &r.parallel_transfer_id,
+                                        self.session_key(),
+                                        &r.parallel_auth_token,
+                                    ) {
+                                        let mut response = FileResponse::new();
+                                        response.set_error(FileTransferError {
+                                            id: r.id,
+                                            file_num: r.file_num,
+                                            error: "invalid parallel transfer authorization"
+                                                .to_owned(),
+                                            parallel_transfer_id: r.parallel_transfer_id,
+                                            ..Default::default()
+                                        });
+                                        let mut message = Message::new();
+                                        message.set_file_response(response);
+                                        self.send(message).await;
+                                        return true;
+                                    }
+                                    self.parallel_primary_transfers
+                                        .insert(r.parallel_transfer_id.clone());
+                                    self.send_fs(ipc::FS::ParallelNewWrite {
+                                        path: r.path.clone(),
+                                        id: r.id,
+                                        file_num: r.file_num,
+                                        files: r
+                                            .files
+                                            .iter()
+                                            .map(|file| {
+                                                (file.name.clone(), file.size, file.modified_time)
+                                            })
+                                            .collect(),
+                                        transfer_id: r.parallel_transfer_id.clone(),
+                                        resume: r.parallel_resume,
+                                        clipboard_cache: r.parallel_clipboard_cache,
+                                    });
+                                } else if !r.parallel_transfer_id.is_empty()
+                                    && !self.parallel_transfer_id.is_empty()
+                                    && r.parallel_transfer_id != self.parallel_transfer_id
+                                    && r.parallel_worker == self.parallel_worker
+                                    && r.range_len > 0
+                                {
+                                    if !validate_parallel_transfer_auth(
+                                        &r.parallel_transfer_id,
+                                        &self.session_key(),
+                                        &r.parallel_auth_token,
+                                    ) {
+                                        let mut response = FileResponse::new();
+                                        response.set_error(FileTransferError {
+                                            id: r.id,
+                                            file_num: r.file_num,
+                                            error: "invalid parallel transfer authorization"
+                                                .to_owned(),
+                                            parallel_transfer_id: r.parallel_transfer_id,
+                                            ..Default::default()
+                                        });
+                                        let mut message = Message::new();
+                                        message.set_file_response(response);
+                                        self.send(message).await;
+                                        return true;
+                                    }
+                                    self.parallel_transfer_id = r.parallel_transfer_id.clone();
+                                    self.send_fs(ipc::FS::ParallelAttach {
+                                        id: r.id,
+                                        file_num: r.file_num,
+                                        transfer_id: r.parallel_transfer_id,
+                                        worker: r.parallel_worker,
+                                        range_start: r.range_start,
+                                        range_len: r.range_len,
+                                    });
+                                    return true;
+                                } else if !r.parallel_transfer_id.is_empty()
+                                    && r.parallel_transfer_id == self.parallel_transfer_id
+                                    && r.parallel_worker == self.parallel_worker
+                                    && r.range_len > 0
+                                {
+                                    log::debug!(
+                                        "parallel file transfer {} worker {} attaching file {} range [{}, {})",
+                                        r.parallel_transfer_id,
+                                        r.parallel_worker,
+                                        r.file_num,
+                                        r.range_start,
+                                        r.range_start.saturating_add(r.range_len)
+                                    );
+                                    self.send_fs(ipc::FS::ParallelAttach {
+                                        id: r.id,
+                                        file_num: r.file_num,
+                                        transfer_id: r.parallel_transfer_id.clone(),
+                                        worker: r.parallel_worker,
+                                        range_start: r.range_start,
+                                        range_len: r.range_len,
+                                    });
+                                    return true;
+                                } else {
+                                    self.send_fs(ipc::FS::NewWrite {
+                                        path: r.path.clone(),
+                                        id: r.id,
+                                        file_num: r.file_num,
+                                        files: r
+                                            .files
+                                            .to_vec()
+                                            .drain(..)
+                                            .map(|f| (f.name, f.modified_time))
+                                            .collect(),
+                                        overwrite_detection: od,
+                                        total_size: r.total_size,
+                                        conn_id: self.inner.id(),
+                                    });
+                                }
+                                if !r.parallel_clipboard_cache {
+                                    self.post_file_audit(
+                                        FileAuditType::RemoteReceive,
+                                        &r.path,
+                                        Self::get_files_for_audit(fs::JobType::Generic, r.files),
+                                        json!({}),
+                                    );
+                                }
                                 self.file_transferred = true;
                             }
                             Some(file_action::Union::RemoveDir(d)) => {
@@ -3445,6 +3665,19 @@ impl Connection {
                                 )));
                             }
                             Some(file_action::Union::Cancel(c)) => {
+                                if !c.parallel_transfer_id.is_empty()
+                                    && self
+                                        .parallel_primary_transfers
+                                        .remove(&c.parallel_transfer_id)
+                                {
+                                    remove_parallel_transfer_auth(&c.parallel_transfer_id);
+                                    self.send_fs(ipc::FS::ParallelCancel {
+                                        id: c.id,
+                                        transfer_id: c.parallel_transfer_id,
+                                        keep_partial: c.keep_partial,
+                                    });
+                                    return true;
+                                }
                                 self.send_fs(ipc::FS::CancelWrite { id: c.id });
                                 let _ = self.cm_read_job_ids.remove(&c.id);
                                 self.send_fs(ipc::FS::CancelRead {
@@ -3498,18 +3731,75 @@ impl Connection {
                 }
                 Some(message::Union::FileResponse(fr)) => match fr.union {
                     Some(file_response::Union::Block(block)) => {
-                        self.send_fs(ipc::FS::WriteBlock {
-                            id: block.id,
-                            file_num: block.file_num,
-                            data: block.data,
-                            compressed: block.compressed,
-                        });
+                        if !block.parallel_transfer_id.is_empty()
+                            && block.parallel_transfer_id == self.parallel_transfer_id
+                            && block.parallel_worker == self.parallel_worker
+                        {
+                            self.send_fs(ipc::FS::ParallelWriteBlock {
+                                id: block.id,
+                                file_num: block.file_num,
+                                transfer_id: block.parallel_transfer_id,
+                                worker: block.parallel_worker,
+                                offset: block.offset,
+                                data: block.data,
+                            });
+                        } else {
+                            self.send_fs(ipc::FS::WriteBlock {
+                                id: block.id,
+                                file_num: block.file_num,
+                                data: block.data,
+                                compressed: block.compressed,
+                            });
+                        }
                     }
                     Some(file_response::Union::Done(d)) => {
-                        self.send_fs(ipc::FS::WriteDone {
-                            id: d.id,
-                            file_num: d.file_num,
-                        });
+                        if !d.parallel_transfer_id.is_empty()
+                            && d.worker_ack == false
+                            && d.finalize == false
+                            && d.parallel_transfer_id == self.parallel_transfer_id
+                            && d.parallel_worker == self.parallel_worker
+                        {
+                            log::debug!(
+                                "parallel file transfer {} worker {} completed range for file {}; forwarding to CM",
+                                d.parallel_transfer_id,
+                                d.parallel_worker,
+                                d.file_num
+                            );
+                            self.send_fs(ipc::FS::ParallelWorkerDone {
+                                id: d.id,
+                                file_num: d.file_num,
+                                transfer_id: d.parallel_transfer_id,
+                                worker: d.parallel_worker,
+                            });
+                        } else if d.finalize
+                            && self
+                                .parallel_primary_transfers
+                                .remove(&d.parallel_transfer_id)
+                        {
+                            remove_parallel_transfer_auth(&d.parallel_transfer_id);
+                            self.send_fs(ipc::FS::ParallelFinalize {
+                                id: d.id,
+                                file_num: d.file_num,
+                                transfer_id: d.parallel_transfer_id,
+                            });
+                        } else {
+                            if !d.parallel_transfer_id.is_empty() {
+                                log::warn!(
+                                    "parallel file transfer {} worker {} rejected range completion for file {}: worker_ack={} finalize={} connection_transfer={} connection_worker={}",
+                                    d.parallel_transfer_id,
+                                    d.parallel_worker,
+                                    d.file_num,
+                                    d.worker_ack,
+                                    d.finalize,
+                                    self.parallel_transfer_id,
+                                    self.parallel_worker
+                                );
+                            }
+                            self.send_fs(ipc::FS::WriteDone {
+                                id: d.id,
+                                file_num: d.file_num,
+                            });
+                        }
                     }
                     Some(file_response::Union::Digest(d)) => self.send_fs(ipc::FS::CheckDigest {
                         id: d.id,
@@ -4938,6 +5228,15 @@ impl Connection {
         // But it's not necessary now and we have to consider two audio services(client, server).
         crate::audio_service::set_voice_call_input_device(None, true);
         log::info!("#{} Connection closed: {}", self.inner.id(), reason);
+        let parallel_transfers = self.parallel_primary_transfers.drain().collect::<Vec<_>>();
+        for transfer_id in parallel_transfers {
+            remove_parallel_transfer_auth(&transfer_id);
+            self.send_fs(ipc::FS::ParallelCancel {
+                id: 0,
+                transfer_id,
+                keep_partial: true,
+            });
+        }
         if lock && self.lock_after_session_end && self.keyboard {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             lock_screen().await;
@@ -6158,14 +6457,44 @@ async fn start_ipc(
             res = rx_to_cm.recv() => {
                 match res {
                     Some(data) => {
-                        if let Data::FS(ipc::FS::WriteBlock{id,
-                            file_num,
-                            data,
-                            compressed}) = data {
-                                stream.send(&Data::FS(ipc::FS::WriteBlock{id, file_num, data: Bytes::new(), compressed})).await?;
+                        match data {
+                            Data::FS(ipc::FS::WriteBlock {
+                                id,
+                                file_num,
+                                data,
+                                compressed,
+                            }) => {
+                                stream
+                                    .send(&Data::FS(ipc::FS::WriteBlock {
+                                        id,
+                                        file_num,
+                                        data: Bytes::new(),
+                                        compressed,
+                                    }))
+                                    .await?;
                                 stream.send_raw(data).await?;
-                        } else {
-                            stream.send(&data).await?;
+                            }
+                            Data::FS(ipc::FS::ParallelWriteBlock {
+                                id,
+                                file_num,
+                                transfer_id,
+                                worker,
+                                offset,
+                                data,
+                            }) => {
+                                stream
+                                    .send(&Data::FS(ipc::FS::ParallelWriteBlock {
+                                        id,
+                                        file_num,
+                                        transfer_id,
+                                        worker,
+                                        offset,
+                                        data: Bytes::new(),
+                                    }))
+                                    .await?;
+                                stream.send_raw(data).await?;
+                            }
+                            data => stream.send(&data).await?,
                         }
                     }
                     None => {
@@ -6858,6 +7187,109 @@ mod test {
         assert!(Ipv6Addr::from_str("::1").is_ok());
         assert!(Ipv6Addr::from_str("127.0.0.1").is_err());
         assert!(Ipv6Addr::from_str("0").is_err());
+    }
+
+    #[test]
+    fn parallel_file_transfer_auth_is_secret_and_session_scoped() {
+        let transfer_id = "parallel-auth-test-transfer";
+        let token = "parallel-auth-test-secret";
+        let session = SessionKey {
+            peer_id: "peer-a".to_owned(),
+            name: "controller".to_owned(),
+            session_id: 42,
+        };
+        let other_session = SessionKey {
+            session_id: 43,
+            ..session.clone()
+        };
+
+        remove_parallel_transfer_auth(transfer_id);
+        assert!(!register_parallel_transfer_auth("", session.clone(), token));
+        assert!(!register_parallel_transfer_auth(
+            transfer_id,
+            session.clone(),
+            ""
+        ));
+        assert!(register_parallel_transfer_auth(
+            transfer_id,
+            session.clone(),
+            token
+        ));
+        assert!(!validate_parallel_transfer_auth(
+            transfer_id,
+            &session,
+            "wrong-secret"
+        ));
+        assert!(!validate_parallel_transfer_auth(
+            transfer_id,
+            &other_session,
+            token
+        ));
+        assert!(validate_parallel_transfer_auth(
+            transfer_id,
+            &session,
+            token
+        ));
+        remove_parallel_transfer_auth(transfer_id);
+        assert!(!validate_parallel_transfer_auth(
+            transfer_id,
+            &session,
+            token
+        ));
+    }
+
+    fn parallel_clipboard_cache_action() -> FileAction {
+        let mut action = FileAction::new();
+        action.set_receive(FileTransferReceiveRequest {
+            parallel_initialize: true,
+            parallel_transfer_id: "clipboard-cache-transfer".to_owned(),
+            parallel_auth_token: "clipboard-cache-secret".to_owned(),
+            parallel_clipboard_cache: true,
+            files: vec![FileEntry {
+                name: "00000000.mdclip".to_owned(),
+                size: 1024,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        action
+    }
+
+    #[test]
+    fn control_session_only_accepts_authorized_parallel_clipboard_cache_initialization() {
+        let action = parallel_clipboard_cache_action();
+        assert!(allow_parallel_clipboard_cache_on_control_session(
+            true, true, &action
+        ));
+        assert!(!allow_parallel_clipboard_cache_on_control_session(
+            false, true, &action
+        ));
+        assert!(!allow_parallel_clipboard_cache_on_control_session(
+            true, false, &action
+        ));
+
+        let mut ordinary_receive = FileAction::new();
+        ordinary_receive.set_receive(FileTransferReceiveRequest {
+            files: vec![FileEntry {
+                name: "ordinary.bin".to_owned(),
+                size: 1024,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(!allow_parallel_clipboard_cache_on_control_session(
+            true,
+            true,
+            &ordinary_receive
+        ));
+
+        let mut missing_secret = parallel_clipboard_cache_action();
+        missing_secret.mut_receive().parallel_auth_token.clear();
+        assert!(!allow_parallel_clipboard_cache_on_control_session(
+            true,
+            true,
+            &missing_secret
+        ));
     }
 
     fn msg(set: impl FnOnce(&mut Message)) -> Message {

@@ -280,8 +280,8 @@ function Invoke-Install {
         [switch]$UseCurrentState
     )
 
-    $runner = Join-Path $script:RepoRoot 'flutter\build\windows\x64\runner\Release\rustdesk.exe'
-    $dll = Join-Path $script:RepoRoot 'flutter\build\windows\x64\runner\Release\librustdesk.dll'
+    $runner = Join-Path $script:RepoRoot 'flutter\build\windows\x64\runner\Release\MasterDesk.exe'
+    $dll = Join-Path $script:RepoRoot 'flutter\build\windows\x64\runner\Release\libmasterdesk.dll'
     if (-not (Test-Path -LiteralPath $runner) -or -not (Test-Path -LiteralPath $dll)) {
         throw 'Installed-payload references are missing; run the normal candidate build first.'
     }
@@ -354,11 +354,13 @@ try {
         }
         'Install' {
             $candidatePath = Resolve-CandidatePath
-            Invoke-Install -Config $config -Definitions $definitions -CandidatePath $candidatePath
+            Invoke-Install -Config $config -Definitions $definitions -CandidatePath $candidatePath `
+                -UseCurrentState:$UseCurrentPreparedState
         }
         'Prepare' {
             $candidatePath = Resolve-CandidatePath
-            Invoke-Install -Config $config -Definitions $definitions -CandidatePath $candidatePath
+            Invoke-Install -Config $config -Definitions $definitions -CandidatePath $candidatePath `
+                -UseCurrentState:$UseCurrentPreparedState
             & (Join-Path $PSScriptRoot 'Open-MasterDeskLabRdp.ps1') -Vm $Vm `
                 -ConfigPath $ConfigPath -NoLaunch:$NoRdpLaunch
         }

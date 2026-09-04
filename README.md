@@ -59,10 +59,10 @@ pwsh -File .\scripts\Test-CustomDefaults.ps1
 `dist/MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe`.
 
 Текущий проверенный пакет:
-`dist/MasterDesk-1.4.9-10-beta-19-2026-08-21-RDS-x86_64.exe`, SHA-256
-`D3061D886448B8A1C37AD290CEE948AA8B5A61AF02042345EDF612D0BE9B0355`.
+`dist/MasterDesk-1.4.9-10-beta-60-2026-09-04-RDS-x86_64.exe`, SHA-256
+`A26D047CFB37ED33CAB9284ADCB826B5751A85720AC74824D76DE2B536B54339`.
 Это неподписанная portable-сборка, опубликованная без переименования как
-`v1.4.9-masterdesk.10-beta.19`.
+`v1.4.9-masterdesk.10-beta.60`.
 
 Зависимость `libs/hbb_common` публикуется отдельно как видимый fork:
 <https://github.com/Alex777rast/MasterDesk-hbb-common>.
@@ -120,8 +120,11 @@ live UI tree, so Viewer size changes do not invalidate clicks. Beta 16 passed
 the clean-baseline identity/password/input matrix. Beta 19 additionally passed
 installation on both live VMs, full Flutter-payload verification, temporary-
 password authentication, remembered-password reconnect and B → A attachment to
-the active RDP session. The user accepted the physical EN/RU synchronization
-result. Compact evidence is in `artifacts/beta19-upgrade-vm/result.txt`.
+the active RDP session. Beta 60 additionally passed clean installation on both
+VMs, exact runner/DLL/Flutter payload attribution and a host-driven RDP check of
+the repaired Material Icons bundle. The user accepted the physical EN/RU
+synchronization result. Current evidence is summarized in
+`docs/current-state.md`.
 
 Артефакты сохраняются в `artifacts/gui-runs/<timestamp>/`. Пароль RDP и разные
 bearer-токены VM-A/VM-B не хранятся в репозитории, конфигурации или артефактах;

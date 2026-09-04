@@ -19,7 +19,7 @@ use hbb_common::{
 };
 use std::{
     collections::HashMap,
-    ffi::{CString, OsString},
+    ffi::{CString, OsStr, OsString},
     fs,
     io::{self, prelude::*},
     mem,
@@ -32,7 +32,10 @@ use std::{
     },
     path::*,
     ptr::null_mut,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Condvar, Mutex,
+    },
     time::{Duration, Instant},
 };
 use wallpaper;
@@ -64,10 +67,10 @@ use winapi::{
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, HANDLE, PROCESS_ALL_ACCESS, PROCESS_QUERY_LIMITED_INFORMATION,
-            PSID, SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
-            EVENT_MODIFY_STATE, SYNCHRONIZE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY,
-            TOKEN_TYPE,
+            ES_SYSTEM_REQUIRED, EVENT_MODIFY_STATE, HANDLE, PROCESS_ALL_ACCESS,
+            PROCESS_QUERY_LIMITED_INFORMATION, PSID, SECURITY_BUILTIN_DOMAIN_RID,
+            SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, SYNCHRONIZE, TOKEN_ELEVATION,
+            TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -122,8 +125,7 @@ pub const REG_NAME_INSTALL_PRINTER: &str = "PRINTER";
 const SERVER_HANDOFF_ARG: &str = "--handoff-events";
 const SERVER_HANDOFF_READY_TIMEOUT_MS: DWORD = 5_000;
 const SERVER_HANDOFF_GO_TIMEOUT_MS: DWORD = 10_000;
-const SAFE_MODE_NETWORK_REG_PATH: &str =
-    r"SYSTEM\CurrentControlSet\Control\SafeBoot\Network";
+const SAFE_MODE_NETWORK_REG_PATH: &str = r"SYSTEM\CurrentControlSet\Control\SafeBoot\Network";
 const SAFE_MODE_REBOOT_MARKER_PATH: &str = r"SOFTWARE\MasterDesk\SafeModeReboot";
 const SAFE_MODE_REBOOT_PHASE_ARMED: u32 = 1;
 const SAFE_MODE_REBOOT_PHASE_STARTED: u32 = 2;
@@ -166,6 +168,275 @@ pub fn set_cursor_pos(x: i32, y: i32) -> bool {
         }
         true
     }
+}
+
+#[repr(C)]
+struct ClipboardDropFiles {
+    files_offset: DWORD,
+    drop_point: POINT,
+    non_client: BOOL,
+    wide: BOOL,
+}
+
+struct ViewerDropCacheWait {
+    serial: u64,
+    transfer_id: Option<String>,
+    result: Option<bool>,
+}
+
+static NEXT_VIEWER_DROP_CACHE_SERIAL: AtomicU64 = AtomicU64::new(1);
+
+lazy_static::lazy_static! {
+    static ref VIEWER_DROP_CACHE_WAIT: (Mutex<Option<ViewerDropCacheWait>>, Condvar) =
+        (Mutex::new(None), Condvar::new());
+}
+
+struct ViewerDropCacheGuard {
+    serial: u64,
+}
+
+impl ViewerDropCacheGuard {
+    fn register() -> ResultType<Self> {
+        let (state, changed) = &*VIEWER_DROP_CACHE_WAIT;
+        let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+        if state.is_some() {
+            bail!("Another Viewer file drop is already being prepared");
+        }
+        let serial = NEXT_VIEWER_DROP_CACHE_SERIAL.fetch_add(1, Ordering::Relaxed);
+        *state = Some(ViewerDropCacheWait {
+            serial,
+            transfer_id: None,
+            result: None,
+        });
+        changed.notify_all();
+        Ok(Self { serial })
+    }
+
+    fn wait(&self) -> ResultType<()> {
+        let deadline = Instant::now() + Duration::from_secs(30 * 60);
+        let (state, changed) = &*VIEWER_DROP_CACHE_WAIT;
+        let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+        loop {
+            let Some(pending) = state.as_ref() else {
+                bail!("Viewer file drop cache wait was cancelled");
+            };
+            if pending.serial != self.serial {
+                bail!("Viewer file drop was superseded by another drop");
+            }
+            if let Some(success) = pending.result {
+                if success {
+                    return Ok(());
+                }
+                bail!("Viewer file drop cache transfer failed");
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                bail!("Viewer file drop cache transfer timed out");
+            }
+            let timeout = deadline.saturating_duration_since(now);
+            let waited = changed
+                .wait_timeout(state, timeout)
+                .unwrap_or_else(|err| err.into_inner());
+            state = waited.0;
+        }
+    }
+}
+
+impl Drop for ViewerDropCacheGuard {
+    fn drop(&mut self) {
+        let (state, changed) = &*VIEWER_DROP_CACHE_WAIT;
+        let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+        if state.as_ref().map(|pending| pending.serial) == Some(self.serial) {
+            *state = None;
+            changed.notify_all();
+        }
+    }
+}
+
+pub fn begin_viewer_drop_cache(transfer_id: &str) {
+    let (state, changed) = &*VIEWER_DROP_CACHE_WAIT;
+    let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(pending) = state.as_mut() {
+        if pending.transfer_id.is_none() {
+            pending.transfer_id = Some(transfer_id.to_owned());
+            changed.notify_all();
+        }
+    }
+}
+
+pub fn complete_viewer_drop_cache(transfer_id: &str, success: bool) {
+    let (state, changed) = &*VIEWER_DROP_CACHE_WAIT;
+    let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(pending) = state.as_mut() {
+        if pending.transfer_id.as_deref() == Some(transfer_id) {
+            pending.result = Some(success);
+            changed.notify_all();
+        }
+    }
+}
+
+pub fn fail_pending_viewer_drop_cache() {
+    let (state, changed) = &*VIEWER_DROP_CACHE_WAIT;
+    let mut state = state.lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(pending) = state.as_mut() {
+        if pending.transfer_id.is_none() {
+            pending.result = Some(false);
+            changed.notify_all();
+        }
+    }
+}
+
+static VIEWER_DROP_PASTE_PENDING: AtomicBool = AtomicBool::new(false);
+
+fn arm_viewer_drop_paste() {
+    VIEWER_DROP_PASTE_PENDING.store(true, Ordering::Release);
+}
+
+pub fn take_viewer_drop_paste() -> bool {
+    VIEWER_DROP_PASTE_PENDING.swap(false, Ordering::AcqRel)
+}
+
+#[cfg(test)]
+mod viewer_drop_cache_tests {
+    use super::*;
+
+    #[test]
+    fn viewer_drop_wait_matches_the_registered_transfer() {
+        let completed = ViewerDropCacheGuard::register().unwrap();
+        assert!(ViewerDropCacheGuard::register().is_err());
+        begin_viewer_drop_cache("completed-transfer");
+        complete_viewer_drop_cache("different-transfer", false);
+        complete_viewer_drop_cache("completed-transfer", true);
+        assert!(completed.wait().is_ok());
+        drop(completed);
+
+        let failed = ViewerDropCacheGuard::register().unwrap();
+        begin_viewer_drop_cache("failed-transfer");
+        complete_viewer_drop_cache("failed-transfer", false);
+        assert!(failed.wait().is_err());
+    }
+
+    #[test]
+    fn viewer_drop_paste_is_armed_for_exactly_one_shortcut() {
+        arm_viewer_drop_paste();
+        assert!(take_viewer_drop_paste());
+        assert!(!take_viewer_drop_paste());
+    }
+}
+
+/// Put local files on the Windows clipboard as a standard CF_HDROP payload.
+///
+/// The active clipboard channel observes the resulting clipboard update and
+/// advertises the files through the same CLIPRDR path used by Explorer
+/// Ctrl+C/Ctrl+V. Ownership of the global allocation is transferred to the
+/// system only after SetClipboardData succeeds.
+pub fn set_file_clipboard(paths: Vec<String>) -> ResultType<()> {
+    if paths.is_empty() {
+        bail!("No files were dropped");
+    }
+
+    // A drop can be the first file-clipboard generation after login or after
+    // the user changed the global stream selector. Apply the current selector
+    // before SetClipboardData triggers the synchronous native format snapshot.
+    crate::client::io_loop::refresh_parallel_clipboard_cache_mode();
+
+    let mut encoded_paths = Vec::with_capacity(paths.len());
+    let mut utf16_units = 1usize; // final list terminator
+    for value in paths {
+        let path = Path::new(&value);
+        if !path.is_absolute() || !path.exists() {
+            bail!("Dropped path is not an existing absolute path: {}", value);
+        }
+        let encoded: Vec<u16> = OsStr::new(&value).encode_wide().collect();
+        if encoded.is_empty() || encoded.contains(&0) {
+            bail!("Dropped path is not valid for the Windows clipboard");
+        }
+        utf16_units = utf16_units
+            .checked_add(encoded.len() + 1)
+            .ok_or_else(|| anyhow!("Dropped file list is too large"))?;
+        encoded_paths.push(encoded);
+    }
+
+    let payload_bytes = utf16_units
+        .checked_mul(mem::size_of::<u16>())
+        .and_then(|size| size.checked_add(mem::size_of::<ClipboardDropFiles>()))
+        .ok_or_else(|| anyhow!("Dropped file list is too large"))?;
+
+    let drop_cache = ViewerDropCacheGuard::register()?;
+    let format_generation = clipboard::platform::windows::file_clipboard_format_generation();
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, payload_bytes);
+        if memory.is_null() {
+            bail!("GlobalAlloc failed: {}", GetLastError());
+        }
+
+        let locked = GlobalLock(memory);
+        if locked.is_null() {
+            let error = GetLastError();
+            GlobalFree(memory);
+            bail!("GlobalLock failed: {}", error);
+        }
+
+        let drop_files = locked as *mut ClipboardDropFiles;
+        (*drop_files).files_offset = mem::size_of::<ClipboardDropFiles>() as DWORD;
+        (*drop_files).wide = TRUE;
+        let mut target = (locked as *mut u8).add(mem::size_of::<ClipboardDropFiles>()) as *mut u16;
+        for encoded in &encoded_paths {
+            std::ptr::copy_nonoverlapping(encoded.as_ptr(), target, encoded.len());
+            target = target.add(encoded.len());
+            *target = 0;
+            target = target.add(1);
+        }
+        *target = 0;
+        GlobalUnlock(memory);
+
+        let mut clipboard_open = false;
+        for _ in 0..20 {
+            if OpenClipboard(null_mut()) != FALSE {
+                clipboard_open = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if !clipboard_open {
+            let error = GetLastError();
+            GlobalFree(memory);
+            bail!("OpenClipboard failed: {}", error);
+        }
+
+        if EmptyClipboard() == FALSE {
+            let error = GetLastError();
+            CloseClipboard();
+            GlobalFree(memory);
+            bail!("EmptyClipboard failed: {}", error);
+        }
+        if SetClipboardData(CF_HDROP, memory).is_null() {
+            let error = GetLastError();
+            CloseClipboard();
+            GlobalFree(memory);
+            bail!("SetClipboardData failed: {}", error);
+        }
+        if CloseClipboard() == FALSE {
+            bail!("CloseClipboard failed: {}", GetLastError());
+        }
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while clipboard::platform::windows::file_clipboard_format_generation() == format_generation {
+        if Instant::now() >= deadline {
+            bail!("Clipboard file channel did not advertise the dropped files");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let (_, parallel_cache_required) = clipboard::platform::windows::file_clipboard_format_state();
+    if parallel_cache_required {
+        drop_cache.wait()?;
+    }
+
+    arm_viewer_drop_paste();
+
+    Ok(())
 }
 
 /// Clip cursor to a rectangle. Pass None to unclip.
@@ -1011,7 +1282,9 @@ async fn replace_server_process(h_process: &mut HANDLE, session_id: DWORD) -> Re
         false
     } else {
         let mut exit_code: DWORD = 0;
-        unsafe { GetExitCodeProcess(*h_process, &mut exit_code) == TRUE && exit_code == STILL_ACTIVE }
+        unsafe {
+            GetExitCodeProcess(*h_process, &mut exit_code) == TRUE && exit_code == STILL_ACTIVE
+        }
     };
     if !old_process_running {
         stop_server_process(h_process).await;
@@ -1042,8 +1315,8 @@ async fn replace_server_process(h_process: &mut HANDLE, session_id: DWORD) -> Re
         (NULL, NULL)
     };
 
-    let handoff_names = old_process_running
-        .then_some((ready_event_name.as_str(), go_event_name.as_str()));
+    let handoff_names =
+        old_process_running.then_some((ready_event_name.as_str(), go_event_name.as_str()));
     let new_process = match launch_server(session_id, false, handoff_names).await {
         Ok(process) => process,
         Err(err) => {
@@ -1817,6 +2090,7 @@ pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String
         if cfg!(feature = "flutter") {
             format!(
                 r#"if not exist "{root}\flutter_windows.dll" exit /b 1
+if not exist "{root}\libmasterdesk.dll" exit /b 1
 if not exist "{root}\data\app.so" exit /b 1
 if not exist "{root}\data\icudtl.dat" exit /b 1
 if not exist "{root}\data\flutter_assets\AssetManifest.bin" exit /b 1"#
@@ -1827,13 +2101,68 @@ if not exist "{root}\data\flutter_assets\AssetManifest.bin" exit /b 1"#
     };
     let main_raw = format!(
         r#"{source_checks}
-XCOPY "{source_dir}" "{_path}" /Y /E /H /I /K /R /Z
-if errorlevel 1 exit /b 1
+set "MASTERDESK_COPY_OK="
+for /L %%I in (1,1,15) do (
+    XCOPY "{source_dir}" "{_path}" /Y /E /H /I /K /R /Z
+    if not errorlevel 1 (
+        set "MASTERDESK_COPY_OK=1"
+        goto masterdesk_copy_complete
+    )
+    ping 127.0.0.1 -n 2 >nul
+)
+:masterdesk_copy_complete
+if not defined MASTERDESK_COPY_OK exit /b 1
 {destination_checks}"#,
         source_checks = runtime_checks(&source_dir),
         destination_checks = runtime_checks(_path),
     );
     return Ok(main_raw);
+}
+
+fn wait_for_application_exit_cmd(app_name: &str, filter: &str, label: &str) -> String {
+    format!(
+        r#"
+for /L %%I in (1,1,20) do (
+    tasklist /FI "IMAGENAME eq {app_name}.exe"{filter} /NH | find /I "{app_name}.exe" >nul
+    if errorlevel 1 goto masterdesk_{label}_processes_stopped
+    taskkill /F /IM {app_name}.exe{filter} >nul 2>&1
+    ping 127.0.0.1 -n 2 >nul
+)
+tasklist /FI "IMAGENAME eq {app_name}.exe"{filter} /NH | find /I "{app_name}.exe" >nul
+if not errorlevel 1 exit /b 1
+:masterdesk_{label}_processes_stopped
+"#
+    )
+}
+
+fn wait_for_service_stop_cmd(app_name: &str) -> String {
+    format!(
+        r#"
+ powershell.exe -NoProfile -NonInteractive -Command "$service = Get-Service -Name '{app_name}' -ErrorAction SilentlyContinue; if ($null -eq $service) {{ exit 0 }}; $service.WaitForStatus('Stopped', [TimeSpan]::FromSeconds(30)); if ($service.Status -ne 'Stopped') {{ exit 1 }}; exit 0"
+if errorlevel 1 exit /b 1
+"#
+    )
+}
+
+fn wait_for_process_exit_cmd(app_name: &str, pid: u32, label: &str) -> String {
+    format!(
+        r#"
+for /L %%I in (1,1,30) do (
+    tasklist /FI "PID eq {pid}" /NH | find /I "{app_name}.exe" >nul
+    if errorlevel 1 goto masterdesk_{label}_launcher_stopped
+    ping 127.0.0.1 -n 2 >nul
+)
+exit /b 1
+:masterdesk_{label}_launcher_stopped
+"#
+    )
+}
+
+fn detached_batch_launcher(batch_path: &Path) -> String {
+    format!(
+        r#"start "" /B cmd.exe /D /C call "{}""#,
+        batch_path.to_string_lossy()
+    )
 }
 
 pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> {
@@ -1943,7 +2272,7 @@ fn get_after_install(
 
 pub fn install_me(options: &str, path: String, silent: bool, debug: bool) -> ResultType<()> {
     clear_stale_stop_service_for_portable();
-    let uninstall_str = get_uninstall(false, false);
+    let uninstall_str = get_uninstall(false, false, false);
     let mut path = path.trim_end_matches('\\').to_owned();
     let (subkey, _path, start_menu, exe) = get_default_install_info();
     let mut exe = exe;
@@ -2169,18 +2498,32 @@ pub fn run_before_uninstall() -> ResultType<()> {
 fn get_before_uninstall(kill_self: bool) -> String {
     let app_name = crate::get_app_name();
     let ext = app_name.to_lowercase();
+    let current_pid = get_current_pid();
     let filter = if kill_self {
         "".to_string()
     } else {
-        format!(" /FI \"PID ne {}\"", get_current_pid())
+        format!(" /FI \"PID ne {}\"", current_pid)
     };
+    let other_process_filter = format!(" /FI \"PID ne {}\"", current_pid);
+    let kill_current = if kill_self {
+        format!("taskkill /F /PID {current_pid} >nul 2>&1")
+    } else {
+        String::new()
+    };
+    let wait_for_service = wait_for_service_stop_cmd(&app_name);
+    let wait_for_processes = wait_for_application_exit_cmd(&app_name, &filter, "uninstall");
     format!(
         "
     chcp 65001
+    sc config {app_name} start= disabled
+    sc failure {app_name} reset= 0 actions= \"\"
     sc stop {app_name}
+    {wait_for_service}
     sc delete {app_name}
     taskkill /F /IM {broker_exe}
-    taskkill /F /IM {app_name}.exe{filter}
+    taskkill /F /T /IM {app_name}.exe{other_process_filter} >nul 2>&1
+    {kill_current}
+    {wait_for_processes}
     reg delete HKEY_CLASSES_ROOT\\.{ext} /f
     reg delete HKEY_CLASSES_ROOT\\{ext} /f
     netsh advfirewall firewall delete rule name=\"{app_name} Service\"
@@ -2201,7 +2544,7 @@ fn get_before_uninstall(kill_self: bool) -> String {
 /// The `uninstall_printer` parameter determines whether the command to uninstall the remote printer
 /// is included in the generated uninstall script. If `uninstall_printer` is `false`, the printer
 /// related command is omitted from the script.
-fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
+fn get_uninstall(kill_self: bool, uninstall_printer: bool, delete_settings: bool) -> String {
     let reg_uninstall_string = get_reg("UninstallString");
     if reg_uninstall_string.to_lowercase().contains("msiexec.exe") {
         return reg_uninstall_string;
@@ -2218,11 +2561,23 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
         }
     }
     let (subkey, path, start_menu, _) = get_install_info();
+    let purge_settings_cmd = if delete_settings {
+        std::env::current_exe()
+            .ok()
+            .and_then(|path| path.to_str().map(|path| path.to_owned()))
+            .map(|path| {
+                format!("\"{path}\" --purge-masterdesk-settings\nif errorlevel 1 exit /b 1")
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     format!(
         "
     {before_uninstall}
     {uninstall_printer_cmd}
     {uninstall_cert_cmd}
+    {purge_settings_cmd}
     reg delete {subkey} /f
     {uninstall_amyuni_idd}
     if exist \"{path}\" rd /s /q \"{path}\"
@@ -2236,9 +2591,166 @@ fn get_uninstall(kill_self: bool, uninstall_printer: bool) -> String {
     )
 }
 
-pub fn uninstall_me(kill_self: bool) -> ResultType<()> {
+pub fn uninstall_me(kill_self: bool, delete_settings: bool) -> ResultType<()> {
     Config::set_option("stop-service".into(), "".into());
-    run_cmds(get_uninstall(kill_self, true), true, "uninstall")
+    if !kill_self {
+        return run_cmds(
+            get_uninstall(false, true, delete_settings),
+            true,
+            "uninstall",
+        );
+    }
+
+    let current_pid = get_current_pid();
+    let cleanup = format!(
+        "{}\n{}",
+        wait_for_process_exit_cmd(&crate::get_app_name(), current_pid, "uninstall"),
+        get_uninstall(true, true, delete_settings)
+    );
+    let cleanup_path = write_cmds(cleanup, "bat", "uninstall_cleanup")?;
+    run_cmds(
+        detached_batch_launcher(&cleanup_path),
+        false,
+        "uninstall_launcher",
+    )
+}
+
+fn owned_masterdesk_state_path_is_safe(base: &Path, target: &Path, app_name: &str) -> bool {
+    target
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.eq_ignore_ascii_case(app_name))
+        .unwrap_or(false)
+        && target.parent() == Some(base)
+}
+
+fn remove_owned_masterdesk_state_dir(base: &Path, app_name: &str) -> ResultType<bool> {
+    let target = base.join(app_name);
+    if !target.exists() {
+        return Ok(false);
+    }
+    if !owned_masterdesk_state_path_is_safe(base, &target, app_name) {
+        bail!(
+            "Refusing unsafe MasterDesk state path: {}",
+            target.display()
+        );
+    }
+
+    let canonical_base = fs::canonicalize(base)?;
+    let canonical_target = fs::canonicalize(&target)?;
+    if canonical_target.parent() != Some(canonical_base.as_path()) {
+        bail!(
+            "Refusing reparse-point MasterDesk state path outside {}: {}",
+            canonical_base.display(),
+            canonical_target.display()
+        );
+    }
+    if !fs::symlink_metadata(&target)?.is_dir() {
+        bail!(
+            "MasterDesk state path is not a directory: {}",
+            target.display()
+        );
+    }
+
+    fs::remove_dir_all(&target)?;
+    if target.exists() {
+        bail!(
+            "MasterDesk state directory still exists: {}",
+            target.display()
+        );
+    }
+    log::info!("Removed MasterDesk state directory: {}", target.display());
+    Ok(true)
+}
+
+pub fn purge_masterdesk_settings() -> ResultType<()> {
+    let app_name = crate::get_app_name();
+    if !app_name.eq_ignore_ascii_case("MasterDesk") {
+        bail!("Refusing to purge settings for unexpected application {app_name}");
+    }
+
+    let mut bases = Vec::<PathBuf>::new();
+    let config_path = Config::path("");
+    if let Some(app_root) = config_path.parent() {
+        if app_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case(&app_name))
+            .unwrap_or(false)
+        {
+            if let Some(base) = app_root.parent() {
+                bases.push(base.to_path_buf());
+            }
+        }
+    }
+    for variable in ["APPDATA", "LOCALAPPDATA", "PROGRAMDATA"] {
+        if let Ok(value) = std::env::var(variable) {
+            let base = PathBuf::from(value);
+            if base.exists() && !bases.iter().any(|known| known == &base) {
+                bases.push(base);
+            }
+        }
+    }
+
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_owned());
+    for relative in [
+        r"System32\config\systemprofile\AppData\Roaming",
+        r"System32\config\systemprofile\AppData\Local",
+    ] {
+        let base = PathBuf::from(&system_root).join(relative);
+        if base.exists() && !bases.iter().any(|known| known == &base) {
+            bases.push(base);
+        }
+    }
+
+    let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_owned());
+    let users_root = PathBuf::from(format!(r"{}\Users", system_drive));
+    if let Ok(entries) = fs::read_dir(&users_root) {
+        for entry in entries.flatten() {
+            let profile = entry.path();
+            if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            for relative in [r"AppData\Roaming", r"AppData\Local"] {
+                let base = profile.join(relative);
+                if base.exists() && !bases.iter().any(|known| known == &base) {
+                    bases.push(base);
+                }
+            }
+        }
+    }
+
+    let mut failures = Vec::new();
+    for base in bases {
+        if let Err(err) = remove_owned_masterdesk_state_dir(&base, &app_name) {
+            log::error!(
+                "Failed to remove MasterDesk state under {}: {err}",
+                base.display()
+            );
+            failures.push(format!("{}: {err}", base.display()));
+        }
+    }
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    for key in [
+        r"SOFTWARE\MasterDesk",
+        r"SYSTEM\CurrentControlSet\Control\SafeBoot\Network\MasterDesk",
+    ] {
+        match hklm.delete_subkey_all(key) {
+            Ok(()) => log::info!("Removed MasterDesk registry state: HKLM\\{key}"),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => failures.push(format!("HKLM\\{key}: {err}")),
+        }
+    }
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "MasterDesk settings cleanup was incomplete: {}",
+            failures.join("; ")
+        )
+    }
 }
 
 fn write_cmds(cmds: String, ext: &str, tip: &str) -> ResultType<std::path::PathBuf> {
@@ -2556,10 +3068,8 @@ fn validate_safe_mode_reboot_service() -> ResultType<()> {
     if !is_cur_exe_the_installed() {
         bail!("Safe Mode restart requires the installed MasterDesk service");
     }
-    let services = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(
-        r"SYSTEM\CurrentControlSet\Services",
-        KEY_READ,
-    )?;
+    let services = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Services", KEY_READ)?;
     let service = services.open_subkey_with_flags(crate::get_app_name(), KEY_READ)?;
     let image_path = service.get_value::<String, _>("ImagePath")?;
     let (_, _, _, installed_executable) = get_install_info();
@@ -3894,7 +4404,10 @@ fn current_thread_desktop_name() -> String {
         {
             return "unknown".to_owned();
         }
-        let length = buffer.iter().position(|value| *value == 0).unwrap_or(buffer.len());
+        let length = buffer
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(buffer.len());
         OsString::from_wide(&buffer[..length])
             .to_string_lossy()
             .into_owned()
@@ -4252,6 +4765,7 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         .collect::<Vec<_>>();
     main_window_sessions.sort_unstable();
     main_window_sessions.dedup();
+    main_window_sessions.retain(|session_id| *session_id != 0);
     kill_process_by_pids(&app_exe_name, main_window_pids)?;
     let tray_pids = crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
     let mut tray_sessions = tray_pids
@@ -4349,6 +4863,8 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
+    let wait_for_service = wait_for_service_stop_cmd(&app_name);
+    let wait_for_processes = wait_for_application_exit_cmd(&app_name, &filter, "update");
     let restore_service_cmd = if is_service_running {
         format!("sc start {}", &app_name)
     } else {
@@ -4383,7 +4899,9 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
         "
 chcp 65001
 sc stop {app_name}
+{wait_for_service}
 taskkill /F /IM {app_name}.exe{filter}
+{wait_for_processes}
 {reg_cmd}
 {copy_exe}
 {rename_exe}
@@ -4400,10 +4918,13 @@ taskkill /F /IM {app_name}.exe{filter}
         sleep = if debug { "timeout 300" } else { "" },
     );
 
+    let update_completed = Arc::new(AtomicBool::new(false));
+    let update_completed_for_restore = update_completed.clone();
     let _restore_session_guard = crate::common::SimpleCallOnReturn {
         b: true,
         f: Box::new(move || {
             let is_root = is_root();
+            let use_portable_handoff = update_completed_for_restore.load(Ordering::Acquire);
             if tray_sessions.is_empty() {
                 log::info!("No tray process found.");
             } else {
@@ -4436,11 +4957,29 @@ taskkill /F /IM {app_name}.exe{filter}
             if main_window_sessions.is_empty() {
                 log::info!("No previous main window found; opening the updated application.");
                 let updater_pid = get_current_pid().to_string();
-                allow_err!(run_exe_in_cur_session(
-                    &exe,
-                    vec!["--wait-for-portable", &updater_pid],
-                    true
-                ));
+                if is_root {
+                    let available_sessions = get_available_sessions(false);
+                    if let Some(session_id) =
+                        preferred_update_gui_session(&tray_sessions, &available_sessions)
+                    {
+                        allow_err!(run_exe_in_session(
+                            &exe,
+                            update_restore_arguments(use_portable_handoff, &updater_pid),
+                            session_id,
+                            true
+                        ));
+                    } else {
+                        log::warn!(
+                            "No interactive Windows session is available for the updated GUI."
+                        );
+                    }
+                } else {
+                    allow_err!(run_exe_direct(
+                        &exe,
+                        update_restore_arguments(use_portable_handoff, &updater_pid),
+                        true
+                    ));
+                }
             } else {
                 log::info!("Try to restore the main window process...");
                 // When not running as root, only spawn once since run_exe_direct
@@ -4452,7 +4991,7 @@ taskkill /F /IM {app_name}.exe{filter}
                         if is_root {
                             allow_err!(run_exe_in_session(
                                 &exe,
-                                vec!["--wait-for-portable", &updater_pid],
+                                update_restore_arguments(use_portable_handoff, &updater_pid),
                                 s,
                                 true
                             ));
@@ -4460,7 +4999,7 @@ taskkill /F /IM {app_name}.exe{filter}
                             // Only spawn once for non-root since run_exe_direct doesn't take session parameter
                             allow_err!(run_exe_direct(
                                 &exe,
-                                vec!["--wait-for-portable", &updater_pid],
+                                update_restore_arguments(use_portable_handoff, &updater_pid),
                                 false
                             ));
                             spawned_non_root_main = true;
@@ -4473,11 +5012,36 @@ taskkill /F /IM {app_name}.exe{filter}
     };
 
     run_cmds(cmds, debug, "update")?;
+    update_completed.store(true, Ordering::Release);
 
     std::thread::sleep(std::time::Duration::from_millis(2000));
     log::info!("Update completed.");
 
     Ok(())
+}
+
+fn preferred_update_gui_session(
+    tray_sessions: &[u32],
+    available_sessions: &[WindowsSession],
+) -> Option<u32> {
+    tray_sessions
+        .iter()
+        .copied()
+        .find(|session_id| *session_id != 0)
+        .or_else(|| {
+            available_sessions
+                .iter()
+                .map(|session| session.sid)
+                .find(|session_id| *session_id != 0)
+        })
+}
+
+fn update_restore_arguments(update_completed: bool, updater_pid: &str) -> Vec<&str> {
+    if update_completed {
+        vec!["--wait-for-portable", updater_pid]
+    } else {
+        Vec::new()
+    }
 }
 
 fn get_reg_msi_key(subkey: &str, is_msi: Option<bool>) -> Option<String> {
@@ -5638,6 +6202,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_gui_handoff_never_selects_session_zero() {
+        let available = vec![
+            WindowsSession {
+                sid: 0,
+                ..Default::default()
+            },
+            WindowsSession {
+                sid: 3,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(preferred_update_gui_session(&[0, 2], &available), Some(2));
+        assert_eq!(preferred_update_gui_session(&[0], &available), Some(3));
+        assert_eq!(
+            preferred_update_gui_session(
+                &[0],
+                &[WindowsSession {
+                    sid: 0,
+                    ..Default::default()
+                }]
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn failed_update_restores_legacy_gui_without_new_handoff_argument() {
+        assert!(update_restore_arguments(false, "42").is_empty());
+        assert_eq!(
+            update_restore_arguments(true, "42"),
+            vec!["--wait-for-portable", "42"]
+        );
+    }
+
+    #[test]
+    fn settings_cleanup_accepts_only_exact_masterdesk_child_directory() {
+        let base = Path::new(r"C:\Users\User\AppData\Roaming");
+        assert!(owned_masterdesk_state_path_is_safe(
+            base,
+            Path::new(r"C:\Users\User\AppData\Roaming\MasterDesk"),
+            "MasterDesk"
+        ));
+        assert!(!owned_masterdesk_state_path_is_safe(
+            base,
+            Path::new(r"C:\Users\User\AppData\Roaming\RustDesk"),
+            "MasterDesk"
+        ));
+        assert!(!owned_masterdesk_state_path_is_safe(
+            base,
+            Path::new(r"C:\Users\Other\AppData\Roaming\MasterDesk"),
+            "MasterDesk"
+        ));
+    }
+
     // Test-only reusable Win32 HANDLE RAII helper.
     // If a future non-test path needs the same pattern, move it out of this test module.
     //
@@ -5843,8 +6462,43 @@ mod tests {
                 "missing payload check: {required}"
             );
         }
-        assert!(command.contains("if errorlevel 1 exit /b 1"));
+        assert!(command.contains("for /L %%I in (1,1,15)"));
+        assert!(command.contains("if not defined MASTERDESK_COPY_OK exit /b 1"));
         assert!(!command.contains(" /C "));
+    }
+
+    #[test]
+    fn test_update_waits_for_old_processes_before_copying_runtime() {
+        let command = wait_for_application_exit_cmd("MasterDesk", " /FI \"PID ne 42\"", "update");
+        assert!(command.contains("IMAGENAME eq MasterDesk.exe"));
+        assert!(command.contains("PID ne 42"));
+        assert!(command.contains("taskkill /F /IM MasterDesk.exe"));
+        assert!(command.contains(":masterdesk_update_processes_stopped"));
+        assert!(command.contains("if not errorlevel 1 exit /b 1"));
+
+        let service = wait_for_service_stop_cmd("MasterDesk");
+        assert!(service.contains("Get-Service -Name 'MasterDesk'"));
+        assert!(service.contains("if ($null -eq $service) { exit 0 }"));
+        assert!(service.contains("WaitForStatus('Stopped'"));
+        assert!(service.contains("if errorlevel 1 exit /b 1"));
+    }
+
+    #[test]
+    fn test_uninstall_disables_service_and_kills_process_trees_before_waiting() {
+        let command = get_before_uninstall(false);
+        assert!(command.contains("sc config MasterDesk start= disabled"));
+        assert!(command.contains("sc failure MasterDesk reset= 0 actions= \"\""));
+        assert!(command.contains("taskkill /F /T /IM MasterDesk.exe /FI \"PID ne "));
+        assert!(command.contains(":masterdesk_uninstall_processes_stopped"));
+
+        let parent_wait = wait_for_process_exit_cmd("MasterDesk", 42, "uninstall");
+        assert!(parent_wait.contains("PID eq 42"));
+        assert!(parent_wait.contains(":masterdesk_uninstall_launcher_stopped"));
+        assert!(parent_wait.contains("exit /b 1"));
+
+        let launcher = detached_batch_launcher(Path::new(r"C:\Temp\MasterDesk cleanup.bat"));
+        assert!(launcher.contains("start \"\" /B cmd.exe /D /C call"));
+        assert!(launcher.contains(r#""C:\Temp\MasterDesk cleanup.bat""#));
     }
 
     #[cfg(not(target_pointer_width = "64"))]

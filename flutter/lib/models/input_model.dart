@@ -331,6 +331,8 @@ class ToReleaseKeys {
 }
 
 class InputModel {
+  static const viewerFilePasteKey = 'VK_V';
+
   // Side mouse button support for Linux.
   // Flutter's Linux embedder drops X11 button 8/9 events, so we capture them
   // natively via GDK and forward through the platform channel.
@@ -830,6 +832,12 @@ class InputModel {
         return KeyEventResult.ignored;
       }
     }
+    if (shouldKeepPrintScreenLocal(
+      isWindows: isWindows,
+      physicalKey: e.physicalKey,
+    )) {
+      return KeyEventResult.skipRemainingHandlers;
+    }
     if (isWindows || isLinux) {
       // Ignore meta keys. Because flutter window will loose focus if meta key is pressed.
       if (e.physicalKey == PhysicalKeyboardKey.metaLeft ||
@@ -1047,6 +1055,50 @@ class InputModel {
         ctrl: ctrl,
         shift: shift,
         command: command);
+  }
+
+  /// Focus the remote point selected by a desktop file drop and invoke the
+  /// normal remote Ctrl+V path. The position is global because desktop mouse
+  /// mapping is window-based, just like physical pointer events.
+  Future<bool> pasteClipboardFilesAt(Offset globalPosition) async {
+    if (!keyboardPerm || isViewOnly || isViewCamera) return false;
+    if (_relativeMouse.enabled.value) return false;
+
+    final cursorModel = parent.target!.cursorModel;
+    if (cursorModel.isPeerControlProtected) return false;
+    cursorModel.gotMouseControl = true;
+
+    handleMouse(
+      {'type': _kMouseEventMove, 'buttons': 0},
+      globalPosition,
+      moveCanvas: false,
+    );
+    final down = handleMouse(
+      {'type': _kMouseEventDown, 'buttons': kPrimaryMouseButton},
+      globalPosition,
+      moveCanvas: false,
+    );
+    final up = handleMouse(
+      {'type': _kMouseEventUp, 'buttons': kPrimaryMouseButton},
+      globalPosition,
+      moveCanvas: false,
+    );
+    if (down == null || up == null) return false;
+
+    await Future.delayed(const Duration(milliseconds: 150));
+    bind.sessionInputKey(
+      sessionId: sessionId,
+      // Match the physical-key path. Passing uppercase `V` would make the
+      // Windows legacy mapper synthesize Shift and turn this into Ctrl+Shift+V.
+      name: viewerFilePasteKey,
+      down: false,
+      press: true,
+      alt: false,
+      ctrl: true,
+      shift: false,
+      command: false,
+    );
+    return true;
   }
 
   static Map<String, dynamic> getMouseEventMove() => {

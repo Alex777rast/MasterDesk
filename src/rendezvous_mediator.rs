@@ -378,8 +378,16 @@ impl RendezvousMediator {
                 update_latency();
                 match rpr.result.enum_value() {
                     Ok(register_pk_response::Result::OK) => {
+                        if !rpr.assigned_id.is_empty()
+                            && !Config::accept_server_assigned_id(&rpr.assigned_id)
+                        {
+                            Config::set_key_confirmed(false);
+                            Config::set_host_key_confirmed(&self.host_prefix, false);
+                            return Ok(());
+                        }
                         Config::set_key_confirmed(true);
                         Config::set_host_key_confirmed(&self.host_prefix, true);
+                        Config::set_option("registration-clock-error".to_owned(), String::new());
                         *SOLVING_PK_MISMATCH.lock().await = "".to_owned();
                         NEEDS_DEPLOY.store(false, Ordering::SeqCst);
                         IDENTITY_ROTATION_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -388,6 +396,15 @@ impl RendezvousMediator {
                     }
                     Ok(register_pk_response::Result::UUID_MISMATCH) => {
                         self.handle_uuid_mismatch(sink).await?;
+                    }
+                    Ok(register_pk_response::Result::CLOCK_MISMATCH) => {
+                        log::warn!("Registration rejected because the system clock is incorrect");
+                        Config::set_key_confirmed(false);
+                        Config::set_host_key_confirmed(&self.host_prefix, false);
+                        Config::set_option(
+                            "registration-clock-error".to_owned(),
+                            "Y".to_owned(),
+                        );
                     }
                     Ok(register_pk_response::Result::NOT_DEPLOYED) => {
                         if !NEEDS_DEPLOY.load(Ordering::SeqCst) {
@@ -821,6 +838,8 @@ impl RendezvousMediator {
             uuid: uuid.into(),
             pk: pk.into(),
             no_register_device: Config::no_register_device(),
+            request_id_allocation: crate::common::is_custom_client()
+                && Config::is_id_allocation_pending(),
             ..Default::default()
         };
         if let Some(lease) = Self::new_device_lease(&register_pk.id) {

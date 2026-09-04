@@ -12,16 +12,19 @@ import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
 
 class InstallPage extends StatefulWidget {
-  const InstallPage({Key? key}) : super(key: key);
+  final bool uninstall;
+
+  const InstallPage({Key? key, this.uninstall = false}) : super(key: key);
 
   @override
-  State<InstallPage> createState() => _InstallPageState();
+  State<InstallPage> createState() => _InstallPageState(uninstall);
 }
 
 class _InstallPageState extends State<InstallPage> {
   final tabController = DesktopTabController(tabType: DesktopTabType.main);
+  final bool uninstall;
 
-  _InstallPageState() {
+  _InstallPageState(this.uninstall) {
     Get.put<DesktopTabController>(tabController);
     const label = "install";
     tabController.add(TabInfo(
@@ -30,6 +33,7 @@ class _InstallPageState extends State<InstallPage> {
         closable: false,
         page: _InstallPageBody(
           key: const ValueKey(label),
+          uninstall: uninstall,
         )));
   }
 
@@ -54,7 +58,9 @@ class _InstallPageState extends State<InstallPage> {
 }
 
 class _InstallPageBody extends StatefulWidget {
-  const _InstallPageBody({Key? key}) : super(key: key);
+  final bool uninstall;
+
+  const _InstallPageBody({Key? key, this.uninstall = false}) : super(key: key);
 
   @override
   State<_InstallPageBody> createState() => _InstallPageBodyState();
@@ -66,6 +72,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   final RxBool startmenu = true.obs;
   final RxBool desktopicon = true.obs;
   final RxBool printer = false.obs;
+  final RxBool deleteSettings = false.obs;
   final RxBool showProgress = false.obs;
   final RxBool btnEnabled = true.obs;
 
@@ -128,6 +135,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
 
   @override
   Widget build(BuildContext context) {
+    if (widget.uninstall) {
+      return buildUninstall(context);
+    }
     final double em = 13;
     final isDarkTheme = MyTheme.currentThemeMode() == ThemeMode.dark;
     return Scaffold(
@@ -248,6 +258,63 @@ class _InstallPageBodyState extends State<_InstallPageBody>
             ],
           ).paddingSymmetric(horizontal: 4 * em, vertical: 3 * em),
         ));
+  }
+
+  Widget buildUninstall(BuildContext context) {
+    const double em = 13;
+    return Scaffold(
+      backgroundColor: null,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('${translate('Uninstall')} MasterDesk',
+              style: Theme.of(context).textTheme.headlineMedium),
+          Option(deleteSettings, label: 'Delete program settings')
+              .marginOnly(top: 3 * em, bottom: em),
+          Obx(() => deleteSettings.value
+              ? Container(
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Theme.of(context).colorScheme.errorContainer,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(translate(
+                      'The ID and settings will be deleted. The next clean installation will be registered as a new device.')),
+                )
+              : const SizedBox.shrink()),
+          const Spacer(),
+          Row(
+            mainAxisAlignment: MainAxisAlignment.end,
+            children: [
+              Obx(() => OutlinedButton.icon(
+                    icon: const Icon(Icons.close_rounded, size: 16),
+                    label: Text(translate('Cancel')),
+                    onPressed:
+                        btnEnabled.value ? () => windowManager.close() : null,
+                    style: buttonStyle,
+                  ).marginOnly(right: 10)),
+              Obx(() => ElevatedButton.icon(
+                    icon: const Icon(Icons.delete_outline, size: 16),
+                    label: Text(translate('Uninstall')),
+                    onPressed: btnEnabled.value ? uninstall : null,
+                    style: buttonStyle,
+                  )),
+            ],
+          ),
+          Obx(() => showProgress.value
+              ? const LinearProgressIndicator().marginOnly(top: em)
+              : const SizedBox.shrink()),
+        ],
+      ).paddingSymmetric(horizontal: 4 * em, vertical: 3 * em),
+    );
+  }
+
+  void uninstall() {
+    btnEnabled.value = false;
+    showProgress.value = true;
+    var options = 'uninstall';
+    if (deleteSettings.value) options += ' delete-settings';
+    bind.installInstallMe(options: options, path: '');
   }
 
   void install() {

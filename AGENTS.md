@@ -1,154 +1,72 @@
-# RustDesk Guide
+# MasterDesk project guide
 
-Before changing or building MasterDesk, read `CODEX_START_HERE.md` completely.
-It is the compact current-state handoff and tells you which detailed section to
-open for the task. Do not read `CODEX_HANDOFF.md`, `CODEX_NEXT_PLAN.md` and
-`PROJECT_CONTEXT.md` in full by default; use the routing table and targeted
-`rg`/line reads from `CODEX_START_HERE.md`. This keeps context usage small while
-retaining detailed history when it is actually needed.
+MasterDesk is a Windows-focused RustDesk fork for branded remote support. Its
+main parts are the Rust core/protocol/service, the Flutter desktop UI, Windows
+capture/input/clipboard integrations, and the self-hosted ID/relay deployment.
 
-## Current Production Safety Invariant
+## Read first
 
-* Production runs the WSS registration plus authenticated-installation lease-fix
-  image
-  `sha256:bada4754be4c41e5fef6cc9ce8540c7c13d19a93a36eb44969df569d3f2049a1`
-  in compatibility mode `N/N`. The fresh backup, stopped recovery containers on
-  the prior exact image and canary evidence are recorded in `CODEX_HANDOFF.md`.
-* Never deploy the known failed image
-  `sha256:7d6bc23de9290baa3404c248b671b5dab89e797d5198a3f73167ebda8aa3707f`
-  or enable strict relay on production.
-* Generic TCP/TLS/WebSocket endpoint success is not proof of MasterDesk registration or relay operation.
-* Any production mutation requires a new explicit user instruction, a fresh verified backup, exact image/key/config attribution, a tested rollback, and real direct/relay canaries.
-* Keep direct TCP 21118/21119 blocked externally; WSS is exposed only through Caddy/HTTPS 443.
-* External application-level WSS registration/reconnect/routing and relay
-  canaries pass. Until a real MasterDesk client-to-client WSS session is
-  confirmed, keep ordinary client validation on native transport and enable
-  **Use WebSocket** only for the controlled WSS runtime check.
+1. Read [docs/current-state.md](docs/current-state.md) before touching the tree.
+   It is the volatile handoff and names the exact unfinished task and candidate.
+2. Then read only the document relevant to the work:
+   - component or protocol changes: [docs/architecture.md](docs/architecture.md)
+   - build, packaging, install or update: [docs/build-and-run.md](docs/build-and-run.md)
+   - validation and evidence: [docs/testing.md](docs/testing.md)
+   - Windows sessions/capture/headless display: [docs/rdp-display.md](docs/rdp-display.md)
+   - VMware/RDP/Windows-MCP: [docs/lab-environment.md](docs/lab-environment.md)
+   - settled technical policy: [docs/decisions.md](docs/decisions.md)
 
-## Portable Update Invariant
+`CODEX_START_HERE.md`, `CODEX_HANDOFF.md`, `CODEX_NEXT_PLAN.md` and
+`PROJECT_CONTEXT.md` are historical records. Do not read them in full or treat
+their old beta/current-state statements as authoritative.
 
-* A no-argument `MasterDesk-*.exe` launch is always portable, including when MasterDesk is already installed.
-* Portable startup must never query the MasterDesk update manifest, show an automatic/modal update prompt, or route automatically to `--install`/`--update`.
-* A newer portable build must compare its embedded beta/date identity with the installed MasterDesk locally and show the standard **Update** button in its already-open GUI. Updating starts only after the user explicitly clicks that button.
-* Never create or distribute a `MasterDesk-*-install.exe`; packages remain portable-by-default and update an older installed copy only through the standard GUI flow.
-* Installed descendants must not inherit the portable `RUSTDESK_APPNAME` marker.
-* When an installed MasterDesk exists, a portable main GUI must attach to the
-  single installed `--server` through the versioned `_gui_compat` IPC channel;
-  it must not start a second host server or register the same ID twice.
-* Keep the exact-executable check on main IPC. `_gui_compat` is a separate,
-  protected same-Windows-account pipe with an explicit GUI command allowlist;
-  it must never expose the machine password verifier or protected API/key values.
-* The first transition from beta 7 to beta 8 is necessarily limited: beta 7
-  does not implement `_gui_compat`. The beta 8 portable remains portable and
-  offers GUI Update without starting a second server; full attachment is
-  available after beta 8 is installed and for later portable builds.
-* Keep regression coverage for portable-by-default and the skipped automatic portable update check. Never reintroduce the `.5`/`.6` startup chain that created multiple argument-less GUI processes.
+## Mandatory working rules
 
-## Build Identity Invariant
+- Preserve the dirty worktree. Never reset, clean, discard, or overwrite
+  unrelated user changes. Change only the files required by the active task.
+- Start from current files and current evidence, not from Git history. Inspect
+  history only when it answers a concrete question.
+- Use the smallest valid diff. No unrelated refactors or formatting-only edits.
+- Never store passwords, bearer tokens, private keys, or reusable verifiers in
+  the repository, command logs, config files, or artifacts.
+- A production mutation needs a fresh explicit user instruction, verified
+  backup, exact image/config attribution, tested rollback, and real direct and
+  relay canaries. Never infer production authority from a client task.
+- A no-argument Windows package is always portable. It must not auto-install or
+  auto-update. Updating an installed copy starts only from the GUI **Update**
+  action. Never create a `*-install.exe` package.
+- Every changed EXE gets the next positive beta and the exact filename/embedded
+  identity described in [docs/build-and-run.md](docs/build-and-run.md). Never
+  rename an older binary to create a new identity.
+- Rust production code must avoid `unwrap()`/`expect()` except tests or poisoned
+  lock handling. Do not create nested Tokio runtimes, call `block_on()` inside
+  async code, hold locks across `.await`, or sleep a Tokio task with
+  `std::thread::sleep()`.
+- In `src/lang/*.rs`, do not edit `template.rs` for translation work. Fill only
+  empty values, preserve placeholders/escapes, and leave brand/protocol tokens
+  untranslated.
 
-* Every newly built or changed EXE has a monotonically increasing positive numeric beta and build date in its filename: `MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe`.
-* `scripts/Build-CustomWindows.ps1` injects the same beta number and `YYYY-MM-DD HH:mm` build date into the Rust DLL, including incremental Rust-only builds.
-* The **About MasterDesk** page must always show the full branded build version (`<version> beta <N>`) and exact build date.
-* Never hand-rename an EXE to simulate another build identity or installer mode. Rebuild/package through the script so filename, embedded identity, registry version, About page, and GUI upgrade comparison agree.
+## MasterDesk GUI/RDP testing
 
-## Economical Validation Workflow
+- For VMware/RDP, UAC, Windows GUI, clipboard and drag-and-drop runtime tests,
+  use the `$masterdesk-rdp-lab` skill.
+- Drive tested mouse and keyboard input through the visible host `mstsc` window.
+  Use VM10-B for active B-to-A input and keep VM10-A observation-only unless the
+  scenario explicitly requires otherwise.
+- When the skill can perform an expected lab action autonomously, do not ask the
+  user to confirm UAC or supply the drag, click or keypress manually.
+- Store host screenshots, input traces, VM observations and verification results
+  under `artifacts/`. A plus cursor or size-only request is not a Drag&Drop PASS.
+- Identify automated input as `host-driven RDP mouse/keyboard` evidence; never
+  describe it as a manual physical action.
 
-Use this sequence for MasterDesk changes:
+## Build and test discipline
 
-`FAST → INCREMENTAL BUILD → TARGETED VM RUNTIME → FINAL CANDIDATE → FULL REGRESSION / CLEAN BUILD only when required`
+Use: targeted checks -> cached incremental build -> applicable VM runtime ->
+one final candidate. Do not run `cargo clean`, clear caches, rebuild Flutter for
+a Rust-only edit, or run the full VM matrix without a diagnosed reason.
 
-* Start with targeted tests for only the components changed in the task.
-* During one task, do not run a full Windows build after every edit.
-* Use incremental component builds and only the relevant VMware lab runtime scenario while iterating; do not run the full VM matrix after every small edit.
-* Build one full local candidate EXE only after the complete change set passes its targeted tests and applicable VM runtime tests.
-* Do not run `cargo clean`, clear Flutter/vcpkg/build caches, or force a full rebuild without a specific diagnosed reason.
-* A Rust-only change must not automatically rebuild Flutter AOT.
-* A server-only change must not start a Windows client build.
-* Do not reread successful verbose build/test logs; retain them as artifacts and report only the compact result.
-* The PROJECT_CONTEXT rule requiring a local EXE means one final candidate after the internal edit/test cycle, never one EXE per attempted fix.
-* Run full regression or a clean build only for a release/final candidate that requires it, a substantial build-system/toolchain change, proven cache corruption/incompatibility, or an explicit user request.
-
-## Project Layout
-
-### Directory Structure
-* `src/` Rust app
-* `src/server/` audio / clipboard / input / video / network
-* `src/platform/` platform-specific code
-* `src/ui/` legacy Sciter UI (deprecated)
-* `flutter/` current UI
-* `libs/hbb_common/` config / proto / shared utils
-* `libs/scrap/` screen capture
-* `libs/enigo/` input control
-* `libs/clipboard/` clipboard
-* `libs/hbb_common/src/config.rs` all options
-
-### Key Components
-- **Remote Desktop Protocol**: Custom protocol implemented in `src/rendezvous_mediator.rs` for communicating with rustdesk-server
-- **Screen Capture**: Platform-specific screen capture in `libs/scrap/`
-- **Input Handling**: Cross-platform input simulation in `libs/enigo/`
-- **Audio/Video Services**: Real-time audio/video streaming in `src/server/`
-- **File Transfer**: Secure file transfer implementation in `libs/hbb_common/`
-
-### UI Architecture
-- **Legacy UI**: Sciter-based (deprecated) - files in `src/ui/`
-- **Modern UI**: Flutter-based - files in `flutter/`
-  - Desktop: `flutter/lib/desktop/`
-  - Mobile: `flutter/lib/mobile/`
-  - Shared: `flutter/lib/common/` and `flutter/lib/models/`
-
-## Rust Rules
-
-* Avoid `unwrap()` / `expect()` in production code.
-* Exceptions:
-
-  * tests;
-  * lock acquisition where failure means poisoning, not normal control flow.
-* Otherwise prefer `Result` + `?` or explicit handling.
-* Do not ignore errors silently.
-* Avoid unnecessary `.clone()`.
-* Prefer borrowing when practical.
-* Do not add dependencies unless needed.
-* Keep code simple and idiomatic.
-
-## Tokio Rules
-
-* Assume a Tokio runtime already exists.
-* Never create nested runtimes.
-* Never call `Runtime::block_on()` inside Tokio / async code.
-* Do not hide runtime creation inside helpers or libraries.
-* Do not hold locks across `.await`.
-* Prefer `.await`, `tokio::spawn`, channels.
-* Use `spawn_blocking` or dedicated threads for blocking work.
-* Do not use `std::thread::sleep()` in async code.
-
-## Editing Hygiene
-
-* Change only what is required.
-* Prefer the smallest valid diff.
-* Do not refactor unrelated code.
-* Do not make formatting-only changes.
-* Keep naming/style consistent with nearby code.
-
-## Localization (`src/lang/*.rs`)
-
-Each file is a `HashMap<key, translation>`. Layout:
-
-* `template.rs` is the master list of every key. **Never edit it** as part of translation work.
-* `en.rs` holds only the keys whose English display text differs from the key itself.
-* Every other file (`de.rs`, `fr.rs`, …) carries the full key set; an untranslated entry has an empty value: `("key", "")`.
-
-### Finding the English source for a key
-
-When filling an empty entry, determine the source English text with this rule:
-
-* If `key` exists in `en.rs` **with a non-empty value**, that value is the source text (look it up in `en.rs`).
-* Otherwise the **key string itself is the source text** (the key is already plain English).
-
-Then translate that source into the file's target language (infer the language from the file's existing non-empty entries / filename).
-
-### Translation hygiene
-
-* Only fill empty values. Never change keys, and never touch existing non-empty translations.
-* Preserve placeholders (`{}`) and escape sequences (`\n`, `\"`) exactly as in the source.
-* Do not translate brand or technical tokens: `RustDesk`, `Socks5`, `TLS`, `UAC`, `Wayland`, `X11`, `TCP`, `UDP`, `2FA`, `RDP`, `D3D`, etc.
-* Copy URL values (e.g. `doc_*` keys) verbatim from `en.rs`.
+Before handing off a code change, run the narrow tests for the changed path,
+the required runtime check from [docs/testing.md](docs/testing.md), PowerShell
+syntax checks for edited scripts, and `git diff --check`. Keep verbose output in
+`artifacts/` and report compact results and exact hashes.

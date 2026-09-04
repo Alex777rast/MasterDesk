@@ -33,6 +33,7 @@ class ServerModel with ChangeNotifier {
   bool _showElevation = false;
   bool hideCm = false;
   int _connectStatus = 0; // Rendezvous Server status
+  String _registrationError = '';
   String _verificationMethod = "";
   String _temporaryPasswordLength = "";
   bool _allowNumericOneTimePassword = false;
@@ -131,7 +132,7 @@ class ServerModel with ChangeNotifier {
   WeakReference<FFI> parent;
 
   ServerModel(this.parent) {
-    _emptyIdShow = translate("Generating ...");
+    _emptyIdShow = '—';
     _serverId = IDTextEditingController(text: _emptyIdShow);
 
     /*
@@ -151,6 +152,35 @@ class ServerModel with ChangeNotifier {
       final connectionStatus =
           jsonDecode(await bind.mainGetConnectStatus()) as Map<String, dynamic>;
       final statusNum = connectionStatus['status_num'] as int;
+      final registrationError =
+          connectionStatus['registration_error'] as String? ?? '';
+      if (registrationError != _registrationError) {
+        _registrationError = registrationError;
+        if (registrationError == 'clock_mismatch') {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            if (_registrationError != 'clock_mismatch') return;
+            parent.target?.dialogManager.show(
+              (setState, close, context) => CustomAlertDialog(
+                title: null,
+                content: SelectionArea(
+                  child: msgboxContent(
+                    'warning',
+                    'Prompt',
+                    translate(
+                        'Possibly incorrect date and time on the PC. Please check.'),
+                  ),
+                ),
+                actions: [dialogButton('OK', onPressed: close)],
+                onSubmit: close,
+                onCancel: close,
+              ),
+              tag: 'registration-clock-error',
+            );
+          });
+        } else {
+          parent.target?.dialogManager.dismissByTag('registration-clock-error');
+        }
+      }
       if (statusNum != _connectStatus) {
         _connectStatus = statusNum;
         notifyListeners();
@@ -473,8 +503,9 @@ class ServerModel with ChangeNotifier {
 
   fetchID() async {
     final id = await bind.mainGetMyId();
-    if (id != _serverId.id) {
-      _serverId.id = id;
+    final displayId = id.isEmpty ? _emptyIdShow : id;
+    if (displayId != _serverId.id) {
+      _serverId.id = displayId;
       notifyListeners();
     }
   }

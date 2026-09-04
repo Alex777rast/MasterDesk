@@ -11,7 +11,7 @@ use hbb_common::fs::serialize_transfer_job;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::unbounded_channel;
 use hbb_common::{
-    allow_err, bail,
+    allow_err,
     config::{
         keys::{OPTION_ENABLE_PERM_CHANGE_IN_ACCEPT_WINDOW, OPTION_FILE_TRANSFER_MAX_FILES},
         option2bool, Config,
@@ -34,16 +34,186 @@ use serde_derive::Serialize;
 use std::iter::FromIterator;
 #[cfg(not(any(target_os = "ios")))]
 use std::path::PathBuf;
-#[cfg(target_os = "windows")]
-use std::sync::Arc;
 use std::{
     collections::HashMap,
+    fs::{File as StdFile, OpenOptions},
     ops::{Deref, DerefMut},
     sync::{
         atomic::{AtomicI64, Ordering},
-        RwLock,
+        Arc, Mutex as StdMutex, RwLock,
     },
 };
+
+#[cfg(not(any(target_os = "ios")))]
+#[derive(Debug)]
+struct ParallelRangeState {
+    start: u64,
+    end: u64,
+    next: u64,
+    done: bool,
+}
+
+#[cfg(not(any(target_os = "ios")))]
+struct ParallelFileWriteState {
+    file_size: u64,
+    modified_time: u64,
+    final_path: PathBuf,
+    download_path: PathBuf,
+    file: Arc<StdFile>,
+    received: u64,
+    ranges: HashMap<u32, ParallelRangeState>,
+    completed_ranges: Vec<(u64, u64)>,
+}
+
+#[cfg(not(any(target_os = "ios")))]
+struct ParallelWriteState {
+    id: i32,
+    transfer_id: String,
+    clipboard_cache: bool,
+    files: HashMap<i32, ParallelFileWriteState>,
+    primary_tx: UnboundedSender<Data>,
+}
+
+#[cfg(not(any(target_os = "ios")))]
+lazy_static::lazy_static! {
+    static ref PARALLEL_WRITE_JOBS: StdMutex<HashMap<String, ParallelWriteState>> =
+        StdMutex::new(HashMap::new());
+}
+
+#[cfg(not(any(target_os = "ios")))]
+fn remove_parallel_downloads(state: ParallelWriteState) {
+    if state.clipboard_cache {
+        notify_parallel_clipboard_cache(&state.transfer_id, false);
+    }
+    for file in state.files.into_values() {
+        drop(file.file);
+        let _ = std::fs::remove_file(file.download_path);
+        let _ = std::fs::remove_file(format!("{}.digest", file.final_path.to_string_lossy()));
+    }
+}
+
+#[cfg(all(not(any(target_os = "ios")), target_os = "windows"))]
+fn notify_parallel_clipboard_cache(transfer_id: &str, success: bool) {
+    if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+        context
+            .complete_parallel_file_cache(transfer_id, success)
+            .map_err(|err| err.into())
+    }) {
+        log::warn!(
+            "Failed to publish Explorer clipboard cache {} (success={}): {}",
+            transfer_id,
+            success,
+            err
+        );
+    }
+}
+
+#[cfg(all(not(any(target_os = "ios")), not(target_os = "windows")))]
+fn notify_parallel_clipboard_cache(_transfer_id: &str, _success: bool) {}
+
+#[cfg(all(not(any(target_os = "ios")), target_os = "windows"))]
+fn begin_parallel_clipboard_cache(
+    transfer_id: &str,
+    root: &std::path::Path,
+    file_count: usize,
+) -> ResultType<()> {
+    let root = root.to_string_lossy().to_string();
+    let Ok(file_count) = u32::try_from(file_count) else {
+        hbb_common::bail!("Explorer clipboard cache contains too many files");
+    };
+    ContextSend::proc(|context| -> ResultType<()> {
+        context
+            .begin_parallel_file_cache(transfer_id, &root, file_count)
+            .map_err(|err| err.into())
+    })
+}
+
+#[cfg(all(not(any(target_os = "ios")), not(target_os = "windows")))]
+fn begin_parallel_clipboard_cache(
+    _transfer_id: &str,
+    _root: &std::path::Path,
+    _file_count: usize,
+) -> ResultType<()> {
+    hbb_common::bail!("Explorer clipboard cache is only supported on Windows")
+}
+
+#[cfg(not(any(target_os = "ios")))]
+fn parallel_clipboard_cache_root(
+    transfer_id: &str,
+    files: &[(String, u64, u64)],
+) -> Result<PathBuf, String> {
+    let parsed = uuid::Uuid::parse_str(transfer_id)
+        .map_err(|_| "invalid Explorer clipboard cache transfer id".to_owned())?;
+    for (index, (name, _, _)) in files.iter().enumerate() {
+        if name != &format!("{index:08}.mdclip") {
+            return Err("invalid Explorer clipboard cache file map".to_owned());
+        }
+    }
+    Ok(std::env::temp_dir()
+        .join("MasterDesk")
+        .join("clipboard-cache")
+        .join(parsed.to_string()))
+}
+
+#[cfg(not(any(target_os = "ios")))]
+fn parallel_contiguous_prefix(file: &ParallelFileWriteState) -> u64 {
+    let mut intervals = file.completed_ranges.clone();
+    intervals.extend(
+        file.ranges
+            .values()
+            .filter(|range| range.next > range.start)
+            .map(|range| (range.start, range.next)),
+    );
+    intervals.sort_unstable_by_key(|range| range.0);
+    let mut prefix = 0u64;
+    for (start, end) in intervals {
+        if start > prefix {
+            break;
+        }
+        prefix = prefix.max(end);
+    }
+    prefix.min(file.file_size)
+}
+
+#[cfg(not(any(target_os = "ios")))]
+fn preserve_parallel_downloads(state: ParallelWriteState) {
+    for file in state.files.into_values() {
+        let prefix = parallel_contiguous_prefix(&file);
+        let digest_path = format!("{}.digest", file.final_path.to_string_lossy());
+        if prefix == 0 {
+            drop(file.file);
+            let _ = std::fs::remove_file(file.download_path);
+            let _ = std::fs::remove_file(digest_path);
+            continue;
+        }
+        if let Err(err) = file.file.set_len(prefix).and_then(|_| file.file.sync_all()) {
+            log::warn!(
+                "Failed to preserve parallel partial file {}: {}",
+                file.download_path.display(),
+                err
+            );
+            drop(file.file);
+            let _ = std::fs::remove_file(file.download_path);
+            let _ = std::fs::remove_file(digest_path);
+            continue;
+        }
+        let digest = fs::FileDigest {
+            size: file.file_size,
+            modified: file.modified_time,
+        };
+        match serde_json::to_vec(&digest) {
+            Ok(data) => {
+                if let Err(err) = std::fs::write(&digest_path, data) {
+                    log::warn!("Failed to save parallel resume digest: {}", err);
+                    drop(file.file);
+                    let _ = std::fs::remove_file(file.download_path);
+                    let _ = std::fs::remove_file(digest_path);
+                }
+            }
+            Err(err) => log::warn!("Failed to serialize parallel resume digest: {}", err),
+        }
+    }
+}
 
 /// Default maximum number of files allowed per transfer request.
 /// Unit: number of files (not bytes).
@@ -161,6 +331,7 @@ struct IpcTaskRunner<T: InvokeUiCM> {
     close: bool,
     running: bool,
     conn_id: i32,
+    parallel_auxiliary: bool,
     #[cfg(target_os = "windows")]
     file_transfer_enabled: bool,
     #[cfg(target_os = "windows")]
@@ -543,10 +714,13 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                         }
                         Ok(Some(data)) => {
                             match data {
-                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, privacy_mode, from_switch} => {
+                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, privacy_mode, from_switch, parallel_auxiliary} => {
                                     log::debug!("conn_id: {}", id);
-                                    self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, privacy_mode, from_switch, self.tx.clone());
+                                    if !parallel_auxiliary {
+                                        self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, privacy_mode, from_switch, self.tx.clone());
+                                    }
                                     self.conn_id = id;
+                                    self.parallel_auxiliary = parallel_auxiliary;
                                     #[cfg(target_os = "windows")]
                                     {
                                         self.file_transfer_enabled = _file_transfer_enabled;
@@ -593,15 +767,43 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                         }
                                     }
                                 }
-                                Data::FS(mut fs) => {
-                                    if let ipc::FS::WriteBlock { id, file_num, data: _, compressed } = fs {
-                                        if let Ok(bytes) = self.stream.next_raw().await {
-                                            fs = ipc::FS::WriteBlock{id, file_num, data:bytes.into(), compressed};
-                                            handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;
+                                Data::FS(fs) => {
+                                    let fs = match fs {
+                                        ipc::FS::WriteBlock { id, file_num, data: _, compressed } => {
+                                            match self.stream.next_raw().await {
+                                                Ok(bytes) => ipc::FS::WriteBlock { id, file_num, data: bytes.into(), compressed },
+                                                Err(err) => {
+                                                    log::error!("failed to receive file block payload: {}", err);
+                                                    continue;
+                                                }
+                                            }
                                         }
-                                    } else {
-                                        handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;
-                                    }
+                                        ipc::FS::ParallelWriteBlock {
+                                            id,
+                                            file_num,
+                                            transfer_id,
+                                            worker,
+                                            offset,
+                                            data: _,
+                                        } => {
+                                            match self.stream.next_raw().await {
+                                                Ok(bytes) => ipc::FS::ParallelWriteBlock {
+                                                    id,
+                                                    file_num,
+                                                    transfer_id,
+                                                    worker,
+                                                    offset,
+                                                    data: bytes.into(),
+                                                },
+                                                Err(err) => {
+                                                    log::error!("failed to receive parallel file block payload: {}", err);
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        fs => fs,
+                                    };
+                                    handle_fs(fs, &mut write_jobs, &mut self.read_jobs, &self.tx, Some(&tx_log), self.conn_id).await;
                                     // Activate fast timer immediately when read jobs exist.
                                     // This ensures new jobs start processing without waiting for the slow 30s timer.
                                     // Deactivation (back to 30s) happens in tick handler when jobs are exhausted.
@@ -812,6 +1014,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
             close: true,
             running: true,
             conn_id: 0,
+            parallel_auxiliary: false,
             #[cfg(target_os = "windows")]
             file_transfer_enabled: false,
             #[cfg(target_os = "windows")]
@@ -822,7 +1025,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
         while task_runner.running {
             task_runner.run().await;
         }
-        if task_runner.conn_id > 0 {
+        if task_runner.conn_id > 0 && !task_runner.parallel_auxiliary {
             task_runner
                 .cm
                 .remove_connection(task_runner.conn_id, task_runner.close);
@@ -960,6 +1163,79 @@ pub async fn start_listen<T: InvokeUiCM>(
 }
 
 #[cfg(not(any(target_os = "ios")))]
+fn new_parallel_error(id: i32, file_num: i32, transfer_id: &str, err: &str) -> Message {
+    let mut response = FileResponse::new();
+    response.set_error(FileTransferError {
+        id,
+        file_num,
+        error: err.to_owned(),
+        parallel_transfer_id: transfer_id.to_owned(),
+        ..Default::default()
+    });
+    let mut message = Message::new();
+    message.set_file_response(response);
+    message
+}
+
+#[cfg(not(any(target_os = "ios")))]
+fn new_parallel_done(
+    id: i32,
+    file_num: i32,
+    transfer_id: &str,
+    worker: u32,
+    worker_ack: bool,
+    transfer_complete: bool,
+) -> Message {
+    let mut response = FileResponse::new();
+    response.set_done(FileTransferDone {
+        id,
+        file_num,
+        parallel_transfer_id: transfer_id.to_owned(),
+        parallel_worker: worker,
+        worker_ack,
+        transfer_complete,
+        ..Default::default()
+    });
+    let mut message = Message::new();
+    message.set_file_response(response);
+    message
+}
+
+#[cfg(all(not(any(target_os = "ios")), target_os = "windows"))]
+fn write_all_at(file: &StdFile, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !data.is_empty() {
+        let written = file.seek_write(data, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "parallel positioned write returned zero bytes",
+            ));
+        }
+        offset += written as u64;
+        data = &data[written..];
+    }
+    Ok(())
+}
+
+#[cfg(all(not(any(target_os = "ios")), unix))]
+fn write_all_at(file: &StdFile, mut data: &[u8], mut offset: u64) -> std::io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    while !data.is_empty() {
+        let written = file.write_at(data, offset)?;
+        if written == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "parallel positioned write returned zero bytes",
+            ));
+        }
+        offset += written as u64;
+        data = &data[written..];
+    }
+    Ok(())
+}
+
+#[cfg(not(any(target_os = "ios")))]
 async fn handle_fs(
     fs: ipc::FS,
     write_jobs: &mut Vec<fs::TransferJob>,
@@ -1033,6 +1309,609 @@ async fn handle_fs(
             job.total_size = total_size;
             job.conn_id = conn_id;
             write_jobs.push(job);
+        }
+        ipc::FS::ParallelNewWrite {
+            path,
+            id,
+            file_num,
+            files,
+            transfer_id,
+            resume,
+            clipboard_cache,
+        } => {
+            let base = if clipboard_cache {
+                match parallel_clipboard_cache_root(&transfer_id, &files) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        send_raw(new_parallel_error(id, file_num, &transfer_id, &err), tx);
+                        return;
+                    }
+                }
+            } else {
+                PathBuf::from(path)
+            };
+            let clipboard_cache_file_count = files.len();
+            let resume_single_file = resume && files.len() == 1;
+            let mut resolved = Vec::with_capacity(files.len());
+            for (index, (file_name, file_size, modified_time)) in files.into_iter().enumerate() {
+                let current_file_num = file_num.saturating_add(index as i32);
+                let final_path = match fs::resolve_transfer_path(&base, &file_name) {
+                    Ok(path) => path,
+                    Err(err) => {
+                        send_raw(
+                            new_parallel_error(
+                                id,
+                                current_file_num,
+                                &transfer_id,
+                                &err.to_string(),
+                            ),
+                            tx,
+                        );
+                        return;
+                    }
+                };
+                if final_path.exists() {
+                    let metadata = std::fs::metadata(&final_path).ok();
+                    let last_modified = metadata
+                        .as_ref()
+                        .and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+                        .map(|d| d.as_secs())
+                        .unwrap_or_default();
+                    let mut response = FileResponse::new();
+                    response.set_digest(FileTransferDigest {
+                        id,
+                        file_num: current_file_num,
+                        last_modified,
+                        file_size: metadata.map(|m| m.len()).unwrap_or_default(),
+                        is_upload: true,
+                        parallel_transfer_id: transfer_id,
+                        ..Default::default()
+                    });
+                    let mut message = Message::new();
+                    message.set_file_response(response);
+                    send_raw(message, tx);
+                    return;
+                }
+                resolved.push((current_file_num, final_path, file_size, modified_time));
+            }
+
+            let mut parallel_files = HashMap::with_capacity(resolved.len());
+            let mut parallel_resume_offset = 0u64;
+            for (current_file_num, final_path, file_size, modified_time) in resolved {
+                if let Some(parent) = final_path.parent() {
+                    if let Err(err) = std::fs::create_dir_all(parent) {
+                        for file in parallel_files.into_values() {
+                            let file: ParallelFileWriteState = file;
+                            let _ = std::fs::remove_file(file.download_path);
+                        }
+                        send_raw(
+                            new_parallel_error(
+                                id,
+                                current_file_num,
+                                &transfer_id,
+                                &err.to_string(),
+                            ),
+                            tx,
+                        );
+                        return;
+                    }
+                }
+                let download_path =
+                    PathBuf::from(format!("{}.download", final_path.to_string_lossy()));
+                let digest_path =
+                    PathBuf::from(format!("{}.digest", final_path.to_string_lossy()));
+                let resume_offset = if resume_single_file {
+                    std::fs::read_to_string(&digest_path)
+                        .ok()
+                        .and_then(|content| serde_json::from_str::<fs::FileDigest>(&content).ok())
+                        .filter(|digest| {
+                            digest.size == file_size && digest.modified == modified_time
+                        })
+                        .and_then(|_| std::fs::metadata(&download_path).ok())
+                        .map(|metadata| metadata.len())
+                        .filter(|offset| *offset > 0 && *offset <= file_size)
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                if resume_offset == 0 {
+                    let _ = std::fs::remove_file(&download_path);
+                    let _ = std::fs::remove_file(&digest_path);
+                }
+                let mut options = OpenOptions::new();
+                options.read(true).write(true);
+                if resume_offset == 0 {
+                    options.create_new(true);
+                }
+                let file = match options.open(&download_path).and_then(|file| {
+                    file.set_len(file_size)?;
+                    Ok(file)
+                }) {
+                    Ok(file) => file,
+                    Err(err) => {
+                        for file in parallel_files.into_values() {
+                            let file: ParallelFileWriteState = file;
+                            let _ = std::fs::remove_file(file.download_path);
+                        }
+                        send_raw(
+                            new_parallel_error(
+                                id,
+                                current_file_num,
+                                &transfer_id,
+                                &err.to_string(),
+                            ),
+                            tx,
+                        );
+                        return;
+                    }
+                };
+                parallel_files.insert(
+                    current_file_num,
+                    ParallelFileWriteState {
+                        file_size,
+                        modified_time,
+                        final_path,
+                        download_path,
+                        file: Arc::new(file),
+                        received: resume_offset,
+                        ranges: HashMap::new(),
+                        completed_ranges: if resume_offset > 0 {
+                            vec![(0, resume_offset)]
+                        } else {
+                            Vec::new()
+                        },
+                    },
+                );
+                parallel_resume_offset = resume_offset;
+            }
+            let state = ParallelWriteState {
+                id,
+                transfer_id: transfer_id.clone(),
+                clipboard_cache,
+                files: parallel_files,
+                primary_tx: tx.clone(),
+            };
+            if clipboard_cache {
+                if let Err(err) = begin_parallel_clipboard_cache(
+                    &transfer_id,
+                    &base,
+                    clipboard_cache_file_count,
+                ) {
+                    let primary_tx = state.primary_tx.clone();
+                    remove_parallel_downloads(state);
+                    send_raw(
+                        new_parallel_error(id, file_num, &transfer_id, &err.to_string()),
+                        &primary_tx,
+                    );
+                    return;
+                }
+                log::info!(
+                    "parallel Explorer clipboard cache {} receiving {} file(s) into {}",
+                    transfer_id,
+                    clipboard_cache_file_count,
+                    base.display()
+                );
+            }
+            let replaced = PARALLEL_WRITE_JOBS
+                .lock()
+                .unwrap()
+                .insert(transfer_id.clone(), state);
+            if let Some(old) = replaced {
+                remove_parallel_downloads(old);
+            }
+            send_raw(
+                new_send_confirm(FileTransferSendConfirmRequest {
+                    id,
+                    file_num,
+                    parallel_transfer_id: transfer_id,
+                    parallel_resume_offset,
+                    union: Some(file_transfer_send_confirm_request::Union::OffsetBlk(0)),
+                    ..Default::default()
+                }),
+                tx,
+            );
+        }
+        ipc::FS::ParallelAttach {
+            id,
+            file_num,
+            transfer_id,
+            worker,
+            range_start,
+            range_len,
+        } => {
+            log::debug!(
+                "parallel file transfer {} worker {} received attach for file {} range [{}, {})",
+                transfer_id,
+                worker,
+                file_num,
+                range_start,
+                range_start.saturating_add(range_len)
+            );
+            let Some(range_end) = range_start.checked_add(range_len) else {
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, "parallel range overflow"),
+                    tx,
+                );
+                return;
+            };
+            let mut jobs = PARALLEL_WRITE_JOBS.lock().unwrap();
+            let Some(job) = jobs.get_mut(&transfer_id) else {
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, "parallel transfer not found"),
+                    tx,
+                );
+                return;
+            };
+            let Some(file) = job.files.get_mut(&file_num) else {
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, "parallel file not found"),
+                    tx,
+                );
+                return;
+            };
+            if id != job.id || range_len == 0 || range_end > file.file_size {
+                send_raw(
+                    new_parallel_error(
+                        id,
+                        file_num,
+                        &transfer_id,
+                        "invalid or overlapping parallel range",
+                    ),
+                    tx,
+                );
+                return;
+            }
+            if let Some(previous) = file.ranges.remove(&worker) {
+                if !previous.done {
+                    file.ranges.insert(worker, previous);
+                    send_raw(
+                        new_parallel_error(
+                            id,
+                            file_num,
+                            &transfer_id,
+                            "parallel worker is still active",
+                        ),
+                        tx,
+                    );
+                    return;
+                }
+                file.completed_ranges.push((previous.start, previous.end));
+            }
+            let overlaps = file
+                .ranges
+                .values()
+                .any(|range| range_start < range.end && range_end > range.start)
+                || file
+                    .completed_ranges
+                    .iter()
+                    .any(|(start, end)| range_start < *end && range_end > *start);
+            if overlaps {
+                send_raw(
+                    new_parallel_error(
+                        id,
+                        file_num,
+                        &transfer_id,
+                        "invalid or overlapping parallel range",
+                    ),
+                    tx,
+                );
+                return;
+            }
+            file.ranges.insert(
+                worker,
+                ParallelRangeState {
+                    start: range_start,
+                    end: range_end,
+                    next: range_start,
+                    done: false,
+                },
+            );
+        }
+        ipc::FS::ParallelWriteBlock {
+            id,
+            file_num,
+            transfer_id,
+            worker,
+            offset,
+            data,
+        } => {
+            let (file, data_len, primary_tx, download_path) = {
+                let mut jobs = PARALLEL_WRITE_JOBS.lock().unwrap();
+                let Some(job) = jobs.get_mut(&transfer_id) else {
+                    send_raw(
+                        new_parallel_error(
+                            id,
+                            file_num,
+                            &transfer_id,
+                            "parallel transfer not found",
+                        ),
+                        tx,
+                    );
+                    return;
+                };
+                let Some(file) = job.files.get_mut(&file_num) else {
+                    send_raw(
+                        new_parallel_error(id, file_num, &transfer_id, "parallel file not found"),
+                        tx,
+                    );
+                    return;
+                };
+                let Some(range) = file.ranges.get(&worker) else {
+                    send_raw(
+                        new_parallel_error(
+                            id,
+                            file_num,
+                            &transfer_id,
+                            "parallel worker is not attached",
+                        ),
+                        tx,
+                    );
+                    return;
+                };
+                let Some(block_end) = offset.checked_add(data.len() as u64) else {
+                    send_raw(
+                        new_parallel_error(id, file_num, &transfer_id, "parallel block overflow"),
+                        tx,
+                    );
+                    return;
+                };
+                if id != job.id || offset != range.next || block_end > range.end {
+                    send_raw(
+                        new_parallel_error(
+                            id,
+                            file_num,
+                            &transfer_id,
+                            "parallel block is outside its assigned range",
+                        ),
+                        tx,
+                    );
+                    return;
+                }
+                (
+                    file.file.clone(),
+                    data.len() as u64,
+                    job.primary_tx.clone(),
+                    file.download_path.clone(),
+                )
+            };
+            let write_data = data.to_vec();
+            let write_result =
+                spawn_blocking(move || write_all_at(&file, &write_data, offset)).await;
+            if let Err(err) = write_result
+                .map_err(|err| err.to_string())
+                .and_then(|result| result.map_err(|err| err.to_string()))
+            {
+                let removed = PARALLEL_WRITE_JOBS.lock().unwrap().remove(&transfer_id);
+                if let Some(state) = removed {
+                    remove_parallel_downloads(state);
+                } else {
+                    let _ = std::fs::remove_file(download_path);
+                }
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, &err),
+                    &primary_tx,
+                );
+                return;
+            }
+            let mut jobs = PARALLEL_WRITE_JOBS.lock().unwrap();
+            if let Some(job) = jobs.get_mut(&transfer_id) {
+                if let Some(file) = job.files.get_mut(&file_num) {
+                    if let Some(range) = file.ranges.get_mut(&worker) {
+                        range.next += data_len;
+                        file.received += data_len;
+                    }
+                }
+            }
+        }
+        ipc::FS::ParallelWorkerDone {
+            id,
+            file_num,
+            transfer_id,
+            worker,
+        } => {
+            log::debug!(
+                "parallel file transfer {} worker {} received range completion for file {}",
+                transfer_id,
+                worker,
+                file_num
+            );
+            let mut jobs = PARALLEL_WRITE_JOBS.lock().unwrap();
+            let Some(job) = jobs.get_mut(&transfer_id) else {
+                log::warn!(
+                    "parallel file transfer {} worker {} cannot acknowledge file {}: transfer not found",
+                    transfer_id,
+                    worker,
+                    file_num
+                );
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, "parallel transfer not found"),
+                    tx,
+                );
+                return;
+            };
+            let Some(file) = job.files.get_mut(&file_num) else {
+                log::warn!(
+                    "parallel file transfer {} worker {} cannot acknowledge file {}: file not found",
+                    transfer_id,
+                    worker,
+                    file_num
+                );
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, "parallel file not found"),
+                    tx,
+                );
+                return;
+            };
+            let Some(range) = file.ranges.get_mut(&worker) else {
+                log::warn!(
+                    "parallel file transfer {} worker {} cannot acknowledge file {}: worker not attached",
+                    transfer_id,
+                    worker,
+                    file_num
+                );
+                send_raw(
+                    new_parallel_error(
+                        id,
+                        file_num,
+                        &transfer_id,
+                        "parallel worker is not attached",
+                    ),
+                    tx,
+                );
+                return;
+            };
+            if range.next != range.end {
+                log::warn!(
+                    "parallel file transfer {} worker {} cannot acknowledge file {}: incomplete range next={} end={}",
+                    transfer_id,
+                    worker,
+                    file_num,
+                    range.next,
+                    range.end
+                );
+                send_raw(
+                    new_parallel_error(
+                        id,
+                        file_num,
+                        &transfer_id,
+                        "parallel worker completed an incomplete range",
+                    ),
+                    tx,
+                );
+                return;
+            }
+            range.done = true;
+            log::debug!(
+                "parallel file transfer {} worker {} accepted range completion for file {}; sending acknowledgement",
+                transfer_id,
+                worker,
+                file_num
+            );
+            send_raw(
+                new_parallel_done(id, file_num, &transfer_id, worker, true, false),
+                tx,
+            );
+        }
+        ipc::FS::ParallelFinalize {
+            id,
+            file_num,
+            transfer_id,
+        } => {
+            let state = PARALLEL_WRITE_JOBS.lock().unwrap().remove(&transfer_id);
+            let Some(state) = state else {
+                send_raw(
+                    new_parallel_error(id, file_num, &transfer_id, "parallel transfer not found"),
+                    tx,
+                );
+                return;
+            };
+            let incomplete = state.id != id
+                || state.files.values().any(|file| {
+                    file.received != file.file_size
+                        || (file.file_size > 0
+                            && file.ranges.is_empty()
+                            && file.completed_ranges.is_empty())
+                        || file.ranges.values().any(|range| !range.done)
+                });
+            if incomplete {
+                let primary_tx = state.primary_tx.clone();
+                remove_parallel_downloads(state);
+                send_raw(
+                    new_parallel_error(
+                        id,
+                        file_num,
+                        &transfer_id,
+                        "parallel transfer is incomplete",
+                    ),
+                    &primary_tx,
+                );
+                return;
+            }
+            let sync_files = state
+                .files
+                .values()
+                .map(|file| file.file.clone())
+                .collect::<Vec<_>>();
+            for sync_file in sync_files {
+                let sync_result = spawn_blocking(move || sync_file.sync_all()).await;
+                if let Err(err) = sync_result
+                    .map_err(|err| err.to_string())
+                    .and_then(|result| result.map_err(|err| err.to_string()))
+                {
+                    let primary_tx = state.primary_tx.clone();
+                    remove_parallel_downloads(state);
+                    send_raw(
+                        new_parallel_error(id, file_num, &transfer_id, &err),
+                        &primary_tx,
+                    );
+                    return;
+                }
+            }
+
+            let primary_tx = state.primary_tx.clone();
+            let clipboard_cache = state.clipboard_cache;
+            let cache_transfer_id = state.transfer_id.clone();
+            let mut completed = Vec::with_capacity(state.files.len());
+            for file in state.files.into_values() {
+                drop(file.file);
+                let digest_path =
+                    PathBuf::from(format!("{}.digest", file.final_path.to_string_lossy()));
+                completed.push((
+                    file.download_path,
+                    file.final_path,
+                    file.modified_time,
+                    digest_path,
+                ));
+            }
+            for (index, (download_path, final_path, _, _)) in completed.iter().enumerate() {
+                if let Err(err) = std::fs::rename(download_path, final_path) {
+                    for (rolled_download, rolled_final, _, _) in completed[..index].iter().rev() {
+                        let _ = std::fs::rename(rolled_final, rolled_download);
+                    }
+                    for (temporary, _, _, _) in &completed {
+                        let _ = std::fs::remove_file(temporary);
+                    }
+                    if clipboard_cache {
+                        notify_parallel_clipboard_cache(&cache_transfer_id, false);
+                    }
+                    send_raw(
+                        new_parallel_error(id, file_num, &transfer_id, &err.to_string()),
+                        &primary_tx,
+                    );
+                    return;
+                }
+            }
+            for (_, final_path, modified_time, digest_path) in &completed {
+                let _ = fs::set_transfer_file_modified_time(final_path, *modified_time);
+                let _ = std::fs::remove_file(digest_path);
+            }
+            if clipboard_cache {
+                notify_parallel_clipboard_cache(&cache_transfer_id, true);
+                log::info!(
+                    "parallel Explorer clipboard cache {} published to Windows Explorer",
+                    cache_transfer_id
+                );
+            }
+            send_raw(
+                new_parallel_done(id, file_num, &transfer_id, 0, false, true),
+                &primary_tx,
+            );
+        }
+        ipc::FS::ParallelCancel {
+            id: _,
+            transfer_id,
+            keep_partial,
+        } => {
+            if let Some(state) = PARALLEL_WRITE_JOBS.lock().unwrap().remove(&transfer_id) {
+                if state.clipboard_cache {
+                    remove_parallel_downloads(state);
+                } else if keep_partial {
+                    preserve_parallel_downloads(state);
+                } else {
+                    remove_parallel_downloads(state);
+                }
+            }
         }
         ipc::FS::CancelWrite { id } => {
             if let Some(job) = fs::remove_job(id, write_jobs) {
@@ -1699,6 +2578,122 @@ mod tests {
         tokio::{runtime::Runtime, sync::mpsc::unbounded_channel},
     };
     use std::fs;
+
+    #[test]
+    #[cfg(any(target_os = "windows", unix))]
+    fn parallel_file_transfer_positioned_writes_preserve_ranges() {
+        use std::io::Read;
+
+        let path = std::env::temp_dir().join(format!(
+            "masterdesk-parallel-write-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        file.set_len(12).unwrap();
+        write_all_at(&file, b"EFGH", 4).unwrap();
+        write_all_at(&file, b"ABCD", 0).unwrap();
+        write_all_at(&file, b"IJKL", 8).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        let mut bytes = Vec::new();
+        StdFile::open(&path)
+            .unwrap()
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, b"ABCDEFGHIJKL");
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn parallel_pause_preserves_only_contiguous_prefix_and_digest() {
+        let final_path = std::env::temp_dir().join(format!(
+            "masterdesk-parallel-resume-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let download_path = PathBuf::from(format!("{}.download", final_path.to_string_lossy()));
+        let digest_path = PathBuf::from(format!("{}.digest", final_path.to_string_lossy()));
+        let file = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&download_path)
+            .unwrap();
+        file.set_len(32).unwrap();
+        let mut ranges = HashMap::new();
+        ranges.insert(
+            1,
+            ParallelRangeState {
+                start: 8,
+                end: 16,
+                next: 12,
+                done: false,
+            },
+        );
+        ranges.insert(
+            2,
+            ParallelRangeState {
+                start: 20,
+                end: 24,
+                next: 24,
+                done: true,
+            },
+        );
+        let (tx, _rx) = unbounded_channel();
+        let state = ParallelWriteState {
+            id: 1,
+            transfer_id: uuid::Uuid::new_v4().to_string(),
+            clipboard_cache: false,
+            files: HashMap::from([(
+                0,
+                ParallelFileWriteState {
+                    file_size: 32,
+                    modified_time: 123,
+                    final_path: final_path.clone(),
+                    download_path: download_path.clone(),
+                    file: Arc::new(file),
+                    received: 16,
+                    ranges,
+                    completed_ranges: vec![(0, 8)],
+                },
+            )]),
+            primary_tx: tx,
+        };
+
+        preserve_parallel_downloads(state);
+
+        assert_eq!(std::fs::metadata(&download_path).unwrap().len(), 12);
+        let digest: hbb_common::fs::FileDigest = serde_json::from_str(
+            &std::fs::read_to_string(&digest_path).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(digest.size, 32);
+        assert_eq!(digest.modified, 123);
+        std::fs::remove_file(download_path).unwrap();
+        std::fs::remove_file(digest_path).unwrap();
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "ios")))]
+    fn parallel_clipboard_cache_root_is_uuid_scoped_and_strictly_mapped() {
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let files = vec![
+            ("00000000.mdclip".to_owned(), 10, 0),
+            ("00000001.mdclip".to_owned(), 20, 0),
+        ];
+        let root = parallel_clipboard_cache_root(&transfer_id, &files).unwrap();
+        assert!(root.ends_with(&transfer_id));
+        assert!(root.to_string_lossy().contains("clipboard-cache"));
+
+        let unsafe_map = vec![("..\\escape.bin".to_owned(), 1, 0)];
+        assert!(parallel_clipboard_cache_root(&transfer_id, &unsafe_map).is_err());
+        assert!(parallel_clipboard_cache_root("not-a-uuid", &files).is_err());
+    }
 
     #[test]
     #[cfg(not(any(target_os = "ios")))]
