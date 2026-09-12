@@ -135,6 +135,9 @@ class _PeerCardState extends State<_PeerCard>
     final name = hideUsernameOnCard == true
         ? peer.hostname
         : '${peer.username}${peer.username.isNotEmpty && peer.hostname.isNotEmpty ? '@' : ''}${peer.hostname}';
+    final secondaryText = peer.alias.isEmpty
+        ? name
+        : '${formatID(peer.id)}${name.isEmpty ? '' : ' · $name'}';
     final greyStyle = TextStyle(
         fontSize: 11,
         color: Theme.of(context).textTheme.titleLarge?.color?.withOpacity(0.6));
@@ -195,12 +198,12 @@ class _PeerCardState extends State<_PeerCard>
                         children: [
                           Flexible(
                             child: Tooltip(
-                              message: name,
+                              message: secondaryText,
                               waitDuration: const Duration(seconds: 1),
                               child: Align(
                                 alignment: Alignment.centerLeft,
                                 child: Text(
-                                  name,
+                                  secondaryText,
                                   style: isPortrait ? null : greyStyle,
                                   textAlign: TextAlign.start,
                                   overflow: TextOverflow.ellipsis,
@@ -364,15 +367,52 @@ class _PeerCardState extends State<_PeerCard>
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       Expanded(
-                          child: Row(children: [
-                        getOnline(8, peer.online),
-                        Expanded(
-                            child: Text(
-                          peer.alias.isEmpty ? formatID(peer.id) : peer.alias,
-                          overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleSmall,
-                        )),
-                      ]).paddingSymmetric(vertical: 8)),
+                        child: Row(children: [
+                          getOnline(8, peer.online),
+                          Expanded(
+                            child: peer.alias.isEmpty
+                                ? Text(
+                                    formatID(peer.id),
+                                    overflow: TextOverflow.ellipsis,
+                                    style:
+                                        Theme.of(context).textTheme.titleSmall,
+                                  )
+                                : Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        peer.alias,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .titleSmall,
+                                      ),
+                                      FittedBox(
+                                        fit: BoxFit.scaleDown,
+                                        alignment: Alignment.centerLeft,
+                                        child: Text(
+                                          formatID(peer.id),
+                                          maxLines: 1,
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: Theme.of(context)
+                                                .textTheme
+                                                .titleLarge
+                                                ?.color
+                                                ?.withOpacity(0.6),
+                                          ),
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                          ),
+                        ]).paddingSymmetric(
+                          vertical: peer.alias.isEmpty ? 8 : 3,
+                        ),
+                      ),
                       checkBoxOrActionMoreLandscape(peer, isTile: false),
                     ],
                   ).paddingSymmetric(horizontal: 12.0),
@@ -524,16 +564,19 @@ abstract class BasePeerCard extends StatelessWidget {
   }
 
   Future<List<mod_menu.PopupMenuEntry<String>>> _buildPopupMenuEntry(
-          BuildContext context) async =>
-      (await _buildMenuItems(context))
-          .map((e) => e.build(
-              context,
-              const MenuConfig(
-                  commonColor: CustomPopupMenuTheme.commonColor,
-                  height: CustomPopupMenuTheme.height,
-                  dividerHeight: CustomPopupMenuTheme.dividerHeight)))
-          .expand((i) => i)
-          .toList();
+      BuildContext context) async {
+    final items = await _buildMenuItems(context);
+    items.insert(items.isEmpty ? 0 : 1, _copyIdAction());
+    return items
+        .map((e) => e.build(
+            context,
+            const MenuConfig(
+                commonColor: CustomPopupMenuTheme.commonColor,
+                height: CustomPopupMenuTheme.height,
+                dividerHeight: CustomPopupMenuTheme.dividerHeight)))
+        .expand((i) => i)
+        .toList();
+  }
 
   @protected
   Future<List<MenuEntryBase<String>>> _buildMenuItems(BuildContext context);
@@ -567,6 +610,37 @@ abstract class BasePeerCard extends StatelessWidget {
           isRDP: isRDP,
           isTerminal: isTerminal || isTerminalRunAsAdmin,
         );
+      },
+      padding: menuPadding,
+      dismissOnClicked: true,
+    );
+  }
+
+  String _copyIdLabel() {
+    final copyFingerprint = translate('Copy Fingerprint');
+    final fingerprint = translate('Fingerprint');
+    final fingerprintIndex =
+        copyFingerprint.toLowerCase().indexOf(fingerprint.toLowerCase());
+    if (fingerprint.isNotEmpty && fingerprintIndex >= 0) {
+      return copyFingerprint.replaceRange(
+        fingerprintIndex,
+        fingerprintIndex + fingerprint.length,
+        translate('ID'),
+      );
+    }
+    return '${translate('Copy to clipboard')} ${translate('ID')}';
+  }
+
+  MenuEntryBase<String> _copyIdAction() {
+    final displayedId = formatID(peer.id);
+    return MenuEntryButton<String>(
+      childBuilder: (TextStyle? style) => Text(
+        _copyIdLabel(),
+        style: style,
+      ),
+      proc: () async {
+        await Clipboard.setData(ClipboardData(text: displayedId));
+        showToast('$displayedId\n${translate('Copied')}');
       },
       padding: menuPadding,
       dismissOnClicked: true,

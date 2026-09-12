@@ -62,6 +62,10 @@ fn peer_features_json(pi: &PeerInfo) -> String {
             "parallel_clipboard_cache_v1",
             f.parallel_clipboard_cache_v1,
         );
+        features.insert(
+            "parallel_file_download_v1",
+            f.parallel_file_download_v1,
+        );
     }
     // compatible with 1.1.9
     if get_version_number(&pi.version) < get_version_number("1.2.0") {
@@ -1217,6 +1221,7 @@ mod masterdesk_peer_feature_tests {
                 safe_mode_reboot: true,
                 parallel_file_transfer_v1: true,
                 parallel_clipboard_cache_v1: true,
+                parallel_file_download_v1: true,
                 ..Default::default()
             })
             .into(),
@@ -1227,6 +1232,7 @@ mod masterdesk_peer_feature_tests {
         assert_eq!(parsed["safe_mode_reboot"], true);
         assert_eq!(parsed["parallel_file_transfer_v1"], true);
         assert_eq!(parsed["parallel_clipboard_cache_v1"], true);
+        assert_eq!(parsed["parallel_file_download_v1"], true);
     }
 }
 

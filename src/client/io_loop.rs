@@ -470,6 +470,33 @@ struct ParallelSendJob {
     started: bool,
 }
 
+#[derive(Clone)]
+struct ParallelDownloadArgs {
+    id: i32,
+    file_num: i32,
+    remote_path: String,
+    destination: PathBuf,
+    file: FileEntry,
+}
+
+struct ParallelReceiveJob {
+    transfer_id: String,
+    auth_token: String,
+    remote_path: String,
+    mode: ParallelMode,
+    received: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
+    file: Option<FileEntry>,
+    started: bool,
+    completion: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ParallelDownloadArgs {
+    fn target_path(&self) -> ResultType<PathBuf> {
+        fs::resolve_transfer_path(&self.destination, &self.file.name)
+    }
+}
+
 type ParallelChunkQueue = Arc<Mutex<VecDeque<ParallelWorkItem>>>;
 
 struct ParallelWorkerCommand {
@@ -1129,6 +1156,285 @@ async fn run_parallel_worker_command(
     }
 }
 
+async fn run_parallel_download_worker<T: InvokeUiSession>(
+    handler: Session<T>,
+    key: String,
+    token: String,
+    worker: u32,
+    transfer_id: String,
+    auth_token: String,
+    args: ParallelDownloadArgs,
+    chunks: Arc<Mutex<VecDeque<(u64, u64)>>>,
+    queued_chunks: Arc<AtomicUsize>,
+    open_connections: Arc<AtomicUsize>,
+    completed: Arc<Mutex<Vec<(u64, u64)>>>,
+    received: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
+    telemetry: Option<(Arc<ParallelWorkerTelemetry>, Arc<AtomicUsize>)>,
+) -> ResultType<()> {
+    use hbb_common::tokio::io::{AsyncSeekExt, AsyncWriteExt};
+
+    let mut connection =
+        connect_parallel_worker(handler, &key, &token, worker, &transfer_id, &auth_token).await?;
+    open_connections.fetch_add(1, Ordering::Relaxed);
+    let open_connections_on_drop = open_connections.clone();
+    let _open_connection_guard = crate::SimpleCallOnReturn {
+        b: true,
+        f: Box::new(move || {
+            open_connections_on_drop.fetch_sub(1, Ordering::Relaxed);
+        }),
+    };
+    let target = args.target_path()?;
+    let download = PathBuf::from(format!("{}.download", get_string(&target)));
+    let mut output = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&download)
+        .await?;
+
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            hbb_common::bail!("parallel download cancelled");
+        }
+        let next = match chunks.lock() {
+            Ok(mut chunks) => chunks.pop_front(),
+            Err(_) => hbb_common::bail!("parallel download queue lock is poisoned"),
+        };
+        let Some((range_start, range_len)) = next else {
+            output.sync_all().await?;
+            if let Some((worker_stats, _)) = &telemetry {
+                worker_stats
+                    .state
+                    .store(PARALLEL_WORKER_COMPLETE, Ordering::Relaxed);
+            }
+            return Ok(());
+        };
+        queued_chunks.fetch_sub(1, Ordering::Relaxed);
+        let range_end = range_start.saturating_add(range_len);
+        if let Some((worker_stats, phase)) = &telemetry {
+            worker_stats
+                .range_start
+                .store(range_start, Ordering::Relaxed);
+            worker_stats.range_end.store(range_end, Ordering::Relaxed);
+            worker_stats
+                .state
+                .store(PARALLEL_WORKER_TRANSFERRING, Ordering::Relaxed);
+            phase.store(PARALLEL_PHASE_TRANSFERRING, Ordering::Relaxed);
+        }
+
+        let mut action = FileAction::new();
+        action.set_send(FileTransferSendRequest {
+            id: args.id,
+            path: args.remote_path.clone(),
+            include_hidden: false,
+            file_num: 0,
+            file_type: file_transfer_send_request::FileType::Generic.into(),
+            parallel_transfer_id: transfer_id.clone(),
+            range_start,
+            range_len,
+            parallel_worker: worker,
+            ..Default::default()
+        });
+        let mut request = Message::new();
+        request.set_file_action(action);
+        connection.peer.send(&request).await?;
+
+        let mut expected_offset = range_start;
+        loop {
+            let bytes = match time::timeout(Duration::from_secs(1), connection.peer.next()).await {
+                Ok(Some(bytes)) => bytes?,
+                Ok(None) => hbb_common::bail!("parallel download connection closed"),
+                Err(_) if cancelled.load(Ordering::Relaxed) => {
+                    hbb_common::bail!("parallel download cancelled")
+                }
+                Err(_) => continue,
+            };
+            if bytes.is_empty() {
+                connection.peer.send_bytes(bytes::Bytes::new()).await?;
+                continue;
+            }
+            let message = Message::parse_from_bytes(&bytes)?;
+            match message.union {
+                Some(message::Union::FileResponse(response)) => match response.union {
+                    Some(file_response::Union::Dir(_)) => {}
+                    Some(file_response::Union::Block(block)) => {
+                        if block.parallel_transfer_id != transfer_id
+                            || block.parallel_worker != worker
+                            || block.offset != expected_offset
+                            || block.offset.saturating_add(block.data.len() as u64) > range_end
+                        {
+                            hbb_common::bail!("invalid parallel download block");
+                        }
+                        output.seek(std::io::SeekFrom::Start(block.offset)).await?;
+                        output.write_all(&block.data).await?;
+                        expected_offset = expected_offset.saturating_add(block.data.len() as u64);
+                        received.fetch_add(block.data.len() as u64, Ordering::Relaxed);
+                        if let Some((worker_stats, _)) = &telemetry {
+                            worker_stats
+                                .bytes_transferred
+                                .fetch_add(block.data.len() as u64, Ordering::Relaxed);
+                        }
+                    }
+                    Some(file_response::Union::Done(done)) => {
+                        if done.worker_ack
+                            && done.parallel_transfer_id == transfer_id
+                            && done.parallel_worker == worker
+                        {
+                            if expected_offset != range_end {
+                                hbb_common::bail!("parallel download range ended early");
+                            }
+                            if let Ok(mut ranges) = completed.lock() {
+                                ranges.push((range_start, range_end));
+                            }
+                            if let Some((worker_stats, _)) = &telemetry {
+                                worker_stats
+                                    .chunks_completed
+                                    .fetch_add(1, Ordering::Relaxed);
+                                worker_stats.jobs_completed.fetch_add(1, Ordering::Relaxed);
+                                worker_stats
+                                    .state
+                                    .store(PARALLEL_WORKER_AWAITING_ACK, Ordering::Relaxed);
+                            }
+                            break;
+                        }
+                    }
+                    Some(file_response::Union::Error(err)) => {
+                        hbb_common::bail!("parallel sender error: {}", err.error)
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
+}
+
+async fn run_parallel_download<T: InvokeUiSession>(
+    handler: Session<T>,
+    key: String,
+    token: String,
+    transfer_id: String,
+    auth_token: String,
+    args: ParallelDownloadArgs,
+    mode: ParallelMode,
+    resume_offset: u64,
+    received: Arc<AtomicU64>,
+    cancelled: Arc<AtomicBool>,
+) -> ResultType<()> {
+    let target = args.target_path()?;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let download = PathBuf::from(format!("{}.download", get_string(&target)));
+    let digest = PathBuf::from(format!("{}.digest", get_string(&target)));
+    let output = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&download)?;
+    output.set_len(resume_offset)?;
+    drop(output);
+    std::fs::write(
+        &digest,
+        serde_json::json!({"size": args.file.size, "modified": args.file.modified_time})
+            .to_string(),
+    )?;
+
+    let streams = match mode {
+        ParallelMode::Fixed(streams) => streams,
+        ParallelMode::Auto => 8,
+    }
+    .max(1)
+    .min(8);
+    let chunks = Arc::new(Mutex::new(split_parallel_chunks(
+        resume_offset,
+        args.file.size.saturating_sub(resume_offset),
+        streams,
+    )));
+    let queued_chunks = Arc::new(AtomicUsize::new(
+        chunks.lock().map(|chunks| chunks.len()).unwrap_or_default(),
+    ));
+    let open_connections = Arc::new(AtomicUsize::new(0));
+    begin_parallel_telemetry_stage(
+        &transfer_id,
+        streams,
+        queued_chunks.clone(),
+        open_connections.clone(),
+    );
+    let completed = Arc::new(Mutex::new(Vec::<(u64, u64)>::new()));
+    let mut tasks = Vec::with_capacity(streams);
+    for index in 0..streams {
+        let worker = index as u32 + 1;
+        let telemetry = register_parallel_worker(&transfer_id, worker, resume_offset, 0);
+        tasks.push(tokio::spawn(run_parallel_download_worker(
+            handler.clone(),
+            key.clone(),
+            token.clone(),
+            worker,
+            transfer_id.clone(),
+            auth_token.clone(),
+            args.clone(),
+            chunks.clone(),
+            queued_chunks.clone(),
+            open_connections.clone(),
+            completed.clone(),
+            received.clone(),
+            cancelled.clone(),
+            telemetry,
+        )));
+    }
+
+    let mut first_error = None;
+    for task in tasks {
+        match task.await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                cancelled.store(true, Ordering::Relaxed);
+                first_error.get_or_insert_with(|| err.to_string());
+            }
+            Err(err) => {
+                cancelled.store(true, Ordering::Relaxed);
+                first_error.get_or_insert_with(|| err.to_string());
+            }
+        }
+    }
+    if let Some(err) = first_error {
+        let ranges = completed
+            .lock()
+            .map(|ranges| ranges.clone())
+            .unwrap_or_default();
+        let prefix = contiguous_completed_prefix(resume_offset, ranges);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&download)?
+            .set_len(prefix)?;
+        hbb_common::bail!("{err}");
+    }
+
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&download)?
+        .set_len(args.file.size)?;
+    if target.exists() {
+        std::fs::remove_file(&target)?;
+    }
+    std::fs::rename(&download, &target)?;
+    std::fs::remove_file(&digest).ok();
+    fs::set_transfer_file_modified_time(&target, args.file.modified_time)?;
+    Ok(())
+}
+
+fn contiguous_completed_prefix(initial: u64, mut ranges: Vec<(u64, u64)>) -> u64 {
+    let mut prefix = initial;
+    ranges.sort_unstable_by_key(|range| range.0);
+    for (start, end) in ranges {
+        if start > prefix {
+            break;
+        }
+        prefix = prefix.max(end);
+    }
+    prefix
+}
+
 pub struct Remote<T: InvokeUiSession> {
     handler: Session<T>,
     audio_sender: MediaSender,
@@ -1155,6 +1461,7 @@ pub struct Remote<T: InvokeUiSession> {
     last_record_state: bool,
     sent_close_reason: bool,
     parallel_send_jobs: HashMap<i32, ParallelSendJob>,
+    parallel_receive_jobs: HashMap<i32, ParallelReceiveJob>,
     parallel_worker_pool: Option<ParallelWorkerPool>,
     connection_key: String,
     connection_token: String,
@@ -1211,6 +1518,7 @@ impl<T: InvokeUiSession> Remote<T> {
             last_record_state: false,
             sent_close_reason: false,
             parallel_send_jobs: HashMap::new(),
+            parallel_receive_jobs: HashMap::new(),
             parallel_worker_pool: None,
             connection_key: String::new(),
             connection_token: String::new(),
@@ -1382,7 +1690,9 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         _ = status_timer.tick() => {
-                            if !self.parallel_send_jobs.is_empty() {
+                            if !self.parallel_send_jobs.is_empty()
+                                || !self.parallel_receive_jobs.is_empty()
+                            {
                                 self.update_jobs_status();
                             }
                             if self.handler.is_restarting_remote_device()
@@ -1447,6 +1757,19 @@ impl<T: InvokeUiSession> Remote<T> {
                 self.handler.on_establish_connection_error(err.to_string());
             }
         }
+        for job in self.parallel_receive_jobs.values() {
+            job.cancelled.store(true, Ordering::Relaxed);
+        }
+        let completions = self
+            .parallel_receive_jobs
+            .values_mut()
+            .filter_map(|job| job.completion.take())
+            .collect::<Vec<_>>();
+        for completion in completions {
+            let _ = time::timeout(Duration::from_secs(5), completion).await;
+        }
+        let _ = self.sync_jobs_status_to_local().await;
+        self.is_connected = false;
         self.handle_disconnected(round);
     }
 
@@ -1601,6 +1924,187 @@ impl<T: InvokeUiSession> Remote<T> {
             && !job.files().is_empty()
             && (job.files().len() > 1 || job.total_size() >= PARALLEL_FILE_MIN_SIZE)
             && !matches!(configured_parallel_mode(), ParallelMode::Fixed(1))
+    }
+
+    fn parallel_download_supported(&self, job_type: fs::JobType) -> bool {
+        let lc = self.handler.lc.read().unwrap();
+        lc.features
+            .as_ref()
+            .map(|features| features.parallel_file_download_v1)
+            .unwrap_or(false)
+            && self.peer_info.platform == "Windows"
+            && job_type == fs::JobType::Generic
+            && !matches!(configured_parallel_mode(), ParallelMode::Fixed(1))
+    }
+
+    fn parallel_download_request(
+        id: i32,
+        path: String,
+        file_num: i32,
+        include_hidden: bool,
+        transfer_id: String,
+        auth_token: String,
+    ) -> Message {
+        let mut action = FileAction::new();
+        action.set_send(FileTransferSendRequest {
+            id,
+            path,
+            include_hidden,
+            file_num,
+            file_type: file_transfer_send_request::FileType::Generic.into(),
+            parallel_transfer_id: transfer_id,
+            parallel_initialize: true,
+            parallel_auth_token: auth_token,
+            ..Default::default()
+        });
+        let mut message = Message::new();
+        message.set_file_action(action);
+        message
+    }
+
+    async fn cancel_pending_parallel_download(&mut self, id: i32, peer: &mut Stream) {
+        let Some(job) = self.parallel_receive_jobs.remove(&id) else {
+            return;
+        };
+        job.cancelled.store(true, Ordering::Relaxed);
+        let mut action = FileAction::new();
+        action.set_cancel(FileTransferCancel {
+            id,
+            parallel_transfer_id: job.transfer_id,
+            keep_partial: true,
+            ..Default::default()
+        });
+        let mut message = Message::new();
+        message.set_file_action(action);
+        allow_err!(peer.send(&message).await);
+    }
+
+    async fn try_start_parallel_download(
+        &mut self,
+        digest: &FileTransferDigest,
+        peer: &mut Stream,
+    ) -> bool {
+        let Some(pending) = self.parallel_receive_jobs.get(&digest.id) else {
+            return false;
+        };
+        if pending.started {
+            return true;
+        }
+        let Some(file) = pending.file.clone() else {
+            return false;
+        };
+        if file.size < PARALLEL_FILE_MIN_SIZE {
+            self.cancel_pending_parallel_download(digest.id, peer).await;
+            return false;
+        }
+
+        let Some(job) = fs::get_job(digest.id, &mut self.write_jobs) else {
+            self.cancel_pending_parallel_download(digest.id, peer).await;
+            return false;
+        };
+        let destination = match &job.data_source {
+            fs::DataSource::FilePath(path) => path.clone(),
+            fs::DataSource::MemoryCursor(_) => {
+                self.cancel_pending_parallel_download(digest.id, peer).await;
+                return false;
+            }
+        };
+        let target = match fs::resolve_transfer_path(&destination, &file.name) {
+            Ok(path) => path,
+            Err(err) => {
+                self.handle_job_status(digest.id, digest.file_num, Some(err.to_string()));
+                self.cancel_pending_parallel_download(digest.id, peer).await;
+                return true;
+            }
+        };
+        let target_string = get_string(&target);
+        let resume_offset =
+            match fs::is_write_need_confirmation(job.is_resume, &target_string, digest) {
+                Ok(DigestCheckResult::NoSuchFile) => 0,
+                Ok(DigestCheckResult::NeedConfirm(existing))
+                    if job.is_resume && existing.is_identical =>
+                {
+                    existing.transferred_size.min(file.size)
+                }
+                _ => {
+                    self.cancel_pending_parallel_download(digest.id, peer).await;
+                    return false;
+                }
+            };
+        job.is_last_job = false;
+        job.set_finished_size_on_resume();
+
+        let Some(pending) = self.parallel_receive_jobs.get_mut(&digest.id) else {
+            return false;
+        };
+        pending.started = true;
+        pending.received.store(resume_offset, Ordering::Relaxed);
+        let transfer_id = pending.transfer_id.clone();
+        let auth_token = pending.auth_token.clone();
+        let remote_path = pending.remote_path.clone();
+        let mode = pending.mode;
+        let received = pending.received.clone();
+        let cancelled = pending.cancelled.clone();
+        register_parallel_transfer(
+            digest.id,
+            &transfer_id,
+            mode,
+            &file.name,
+            file.size,
+            1,
+            received.clone(),
+        );
+
+        let mut cancel_action = FileAction::new();
+        cancel_action.set_cancel(FileTransferCancel {
+            id: digest.id,
+            keep_partial: true,
+            ..Default::default()
+        });
+        let mut cancel = Message::new();
+        cancel.set_file_action(cancel_action);
+        allow_err!(peer.send(&cancel).await);
+
+        let sender = self.sender.clone();
+        let handler = self.handler.clone();
+        let key = self.connection_key.clone();
+        let token = self.connection_token.clone();
+        let args = ParallelDownloadArgs {
+            id: digest.id,
+            file_num: digest.file_num,
+            remote_path,
+            destination,
+            file,
+        };
+        let id = digest.id;
+        let completion = tokio::spawn(async move {
+            let file_num = args.file_num;
+            let result = run_parallel_download(
+                handler,
+                key,
+                token,
+                transfer_id.clone(),
+                auth_token,
+                args,
+                mode,
+                resume_offset,
+                received,
+                cancelled,
+            )
+            .await;
+            sender
+                .send(Data::ParallelDownloadFinished((
+                    id,
+                    file_num,
+                    transfer_id,
+                    result.err().map(|err| err.to_string()),
+                )))
+                .ok();
+        });
+        if let Some(pending) = self.parallel_receive_jobs.get_mut(&id) {
+            pending.completion = Some(completion);
+        }
+        true
     }
 
     async fn start_parallel_clipboard_cache(
@@ -1939,6 +2443,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     message.set_file_action(action);
                     allow_err!(peer.send(&message).await);
                 }
+                for job in self.parallel_receive_jobs.values() {
+                    job.cancelled.store(true, Ordering::Relaxed);
+                }
                 self.send_close_reason(peer, "").await;
                 return false;
             }
@@ -1975,8 +2482,10 @@ impl<T: InvokeUiSession> Remote<T> {
                 let od = can_enable_overwrite_detection(self.handler.lc.read().unwrap().version);
                 if is_remote {
                     log::debug!("New job {}, write to {} from remote {}", id, to, path);
+                    let parallel_download = self.parallel_download_supported(r#type);
+                    let destination = PathBuf::from(&to);
                     let to = match r#type {
-                        fs::JobType::Generic => fs::DataSource::FilePath(PathBuf::from(&to)),
+                        fs::JobType::Generic => fs::DataSource::FilePath(destination),
                         fs::JobType::Printer => {
                             fs::DataSource::MemoryCursor(std::io::Cursor::new(Vec::new()))
                         }
@@ -1991,10 +2500,38 @@ impl<T: InvokeUiSession> Remote<T> {
                         is_remote,
                         od,
                     ));
-                    allow_err!(
-                        peer.send(&fs::new_send(id, r#type, path, file_num, include_hidden))
-                            .await
-                    );
+                    if parallel_download {
+                        let transfer_id = uuid::Uuid::new_v4().to_string();
+                        let auth_token = uuid::Uuid::new_v4().to_string();
+                        let message = Self::parallel_download_request(
+                            id,
+                            path.clone(),
+                            file_num,
+                            include_hidden,
+                            transfer_id.clone(),
+                            auth_token.clone(),
+                        );
+                        self.parallel_receive_jobs.insert(
+                            id,
+                            ParallelReceiveJob {
+                                transfer_id,
+                                auth_token,
+                                remote_path: path,
+                                mode: configured_parallel_mode(),
+                                received: Arc::new(AtomicU64::new(0)),
+                                cancelled: Arc::new(AtomicBool::new(false)),
+                                file: None,
+                                started: false,
+                                completion: None,
+                            },
+                        );
+                        allow_err!(peer.send(&message).await);
+                    } else {
+                        allow_err!(
+                            peer.send(&fs::new_send(id, r#type, path, file_num, include_hidden))
+                                .await
+                        );
+                    }
                 } else {
                     match fs::TransferJob::new_read(
                         id,
@@ -2157,19 +2694,48 @@ impl<T: InvokeUiSession> Remote<T> {
             }
             Data::ResumeJob((id, is_remote)) => {
                 if is_remote {
+                    let parallel_download = self.parallel_download_supported(fs::JobType::Generic);
                     if let Some(job) = get_job(id, &mut self.write_jobs) {
                         job.is_last_job = false;
                         job.is_resume = true;
-                        allow_err!(
-                            peer.send(&fs::new_send(
+                        if parallel_download {
+                            let transfer_id = uuid::Uuid::new_v4().to_string();
+                            let auth_token = uuid::Uuid::new_v4().to_string();
+                            let message = Self::parallel_download_request(
                                 id,
-                                fs::JobType::Generic,
                                 job.remote.clone(),
                                 job.file_num,
-                                job.show_hidden
-                            ))
-                            .await
-                        );
+                                job.show_hidden,
+                                transfer_id.clone(),
+                                auth_token.clone(),
+                            );
+                            self.parallel_receive_jobs.insert(
+                                id,
+                                ParallelReceiveJob {
+                                    transfer_id,
+                                    auth_token,
+                                    remote_path: job.remote.clone(),
+                                    mode: configured_parallel_mode(),
+                                    received: Arc::new(AtomicU64::new(0)),
+                                    cancelled: Arc::new(AtomicBool::new(false)),
+                                    file: None,
+                                    started: false,
+                                    completion: None,
+                                },
+                            );
+                            allow_err!(peer.send(&message).await);
+                        } else {
+                            allow_err!(
+                                peer.send(&fs::new_send(
+                                    id,
+                                    fs::JobType::Generic,
+                                    job.remote.clone(),
+                                    job.file_num,
+                                    job.show_hidden
+                                ))
+                                .await
+                            );
+                        }
                     }
                 } else {
                     let parallel_index = self.read_jobs.iter().position(|job| {
@@ -2377,6 +2943,26 @@ impl<T: InvokeUiSession> Remote<T> {
                     allow_err!(peer.send(&message).await);
                     return true;
                 }
+                if let Some(mut job) = self.parallel_receive_jobs.remove(&id) {
+                    job.cancelled.store(true, Ordering::Relaxed);
+                    mark_parallel_transfer_phase(&job.transfer_id, PARALLEL_PHASE_FALLBACK);
+                    let mut action = FileAction::new();
+                    action.set_cancel(FileTransferCancel {
+                        id,
+                        parallel_transfer_id: job.transfer_id,
+                        ..Default::default()
+                    });
+                    let mut message = Message::new();
+                    message.set_file_action(action);
+                    allow_err!(peer.send(&message).await);
+                    if let Some(completion) = job.completion.take() {
+                        let _ = time::timeout(Duration::from_secs(5), completion).await;
+                    }
+                    if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
+                        job.remove_download_file();
+                    }
+                    return true;
+                }
                 self.cancel_transfer_job(id, peer).await;
             }
             Data::RemoveDir((id, path)) => {
@@ -2580,6 +3166,41 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
             }
+            Data::ParallelDownloadFinished((id, file_num, transfer_id, error)) => {
+                let matches = self
+                    .parallel_receive_jobs
+                    .get(&id)
+                    .map(|job| job.transfer_id.as_str())
+                    == Some(transfer_id.as_str());
+                if matches {
+                    let completed_job = self.parallel_receive_jobs.remove(&id);
+                    let mut action = FileAction::new();
+                    action.set_cancel(FileTransferCancel {
+                        id,
+                        parallel_transfer_id: transfer_id.clone(),
+                        keep_partial: error.is_some(),
+                        ..Default::default()
+                    });
+                    let mut message = Message::new();
+                    message.set_file_action(action);
+                    allow_err!(peer.send(&message).await);
+                    match error {
+                        Some(err) => {
+                            mark_parallel_transfer_phase(&transfer_id, PARALLEL_PHASE_FALLBACK);
+                            self.handle_job_status(id, file_num, Some(err));
+                        }
+                        None => {
+                            mark_parallel_transfer_phase(&transfer_id, PARALLEL_PHASE_COMPLETE);
+                            fs::remove_job(id, &mut self.write_jobs);
+                            let total = completed_job
+                                .and_then(|job| job.file.map(|file| file.size))
+                                .unwrap_or_default();
+                            self.handler.job_progress(id, file_num, 0.0, total as f64);
+                            self.handle_job_status(id, file_num, None);
+                        }
+                    }
+                }
+            }
             _ => {}
         }
         true
@@ -2644,6 +3265,20 @@ impl<T: InvokeUiSession> Remote<T> {
                     transferred as f64,
                 );
             }
+            for (id, job) in self.parallel_receive_jobs.iter() {
+                if !job.started {
+                    continue;
+                }
+                let transferred = job.received.load(Ordering::Relaxed);
+                let last_transferred = self
+                    .last_update_jobs_status
+                    .1
+                    .insert(*id, transferred)
+                    .unwrap_or_default();
+                let speed =
+                    transferred.saturating_sub(last_transferred) as f64 / (elapsed as f64 / 1000.0);
+                self.handler.job_progress(*id, 0, speed, transferred as f64);
+            }
             self.last_update_jobs_status.0 = Instant::now();
         }
     }
@@ -2659,6 +3294,9 @@ impl<T: InvokeUiSession> Remote<T> {
         allow_err!(peer.send(&msg_out).await);
         if let Some(job) = fs::remove_job(id, &mut self.write_jobs) {
             job.remove_download_file();
+        }
+        if let Some(job) = self.parallel_receive_jobs.remove(&id) {
+            job.cancelled.store(true, Ordering::Relaxed);
         }
         let _ = fs::remove_job(id, &mut self.read_jobs);
         self.remove_jobs.remove(&id);
@@ -3139,9 +3777,19 @@ impl<T: InvokeUiSession> Remote<T> {
                             // a mutable borrow from fs::get_job(&mut self.write_jobs), so defer
                             // the error handling until after the borrow scope ends.
                             let mut set_files_err = None;
+                            if let Some(pending) = self.parallel_receive_jobs.get_mut(&fd.id) {
+                                pending.file = if entries.len() == 1 {
+                                    entries.first().cloned()
+                                } else {
+                                    None
+                                };
+                            }
+                            if entries.len() != 1 {
+                                self.cancel_pending_parallel_download(fd.id, peer).await;
+                            }
                             if let Some(job) = fs::get_job(fd.id, &mut self.write_jobs) {
                                 log::info!("job set_files: {:?}", entries);
-                                if let Err(err) = job.set_files(entries) {
+                                if let Err(err) = job.set_files(entries.clone()) {
                                     set_files_err = Some(err.to_string());
                                 } else {
                                     job.set_finished_size_on_resume();
@@ -3175,6 +3823,11 @@ impl<T: InvokeUiSession> Remote<T> {
                             }
                         }
                         Some(file_response::Union::Digest(digest)) => {
+                            if self.parallel_receive_jobs.contains_key(&digest.id)
+                                && self.try_start_parallel_download(&digest, peer).await
+                            {
+                                return true;
+                            }
                             if !digest.parallel_transfer_id.is_empty() {
                                 if let Some(id) =
                                     self.parallel_send_jobs.iter().find_map(|(id, job)| {
@@ -3231,11 +3884,11 @@ impl<T: InvokeUiSession> Remote<T> {
                                                 get_string(&fs::TransferJob::join(p, &file.name));
                                             let mut overwrite_strategy =
                                                 job.default_overwrite_strategy();
-                                            let mut offset = 0;
+                                            let mut offset = 0u64;
                                             if digest.is_identical && job.is_resume {
                                                 if digest.transferred_size > 0 {
                                                     overwrite_strategy = Some(true);
-                                                    offset = digest.transferred_size as _;
+                                                    offset = digest.transferred_size;
                                                 }
                                             }
                                             if let Some(overwrite) = overwrite_strategy {
@@ -3243,12 +3896,15 @@ impl<T: InvokeUiSession> Remote<T> {
                                                     id: digest.id,
                                                     file_num: digest.file_num,
                                                     union: Some(if overwrite {
-                                                        file_transfer_send_confirm_request::Union::OffsetBlk(offset)
+                                                        file_transfer_send_confirm_request::Union::OffsetBlk(
+                                                            offset.min(u32::MAX as u64) as u32,
+                                                        )
                                                     } else {
                                                         file_transfer_send_confirm_request::Union::Skip(
                                                             true,
                                                         )
                                                     }),
+                                                    parallel_resume_offset: offset,
                                                     ..Default::default()
                                                 };
                                                 job.confirm(&req).await;
@@ -3298,13 +3954,13 @@ impl<T: InvokeUiSession> Remote<T> {
                                                     DigestCheckResult::NeedConfirm(digest) => {
                                                         let mut overwrite_strategy =
                                                             job.default_overwrite_strategy();
-                                                        let mut offset = 0;
+                                                        let mut offset = 0u64;
                                                         if digest.is_identical
                                                             && job.is_resume
                                                             && digest.transferred_size > 0
                                                         {
                                                             overwrite_strategy = Some(true);
-                                                            offset = digest.transferred_size as _;
+                                                            offset = digest.transferred_size;
                                                         }
                                                         if let Some(overwrite) = overwrite_strategy
                                                         {
@@ -3313,10 +3969,13 @@ impl<T: InvokeUiSession> Remote<T> {
                                                                     id: digest.id,
                                                                     file_num: digest.file_num,
                                                                     union: Some(if overwrite {
-                                                                        file_transfer_send_confirm_request::Union::OffsetBlk(offset)
+                                                                        file_transfer_send_confirm_request::Union::OffsetBlk(
+                                                                            offset.min(u32::MAX as u64) as u32,
+                                                                        )
                                                                     } else {
                                                                         file_transfer_send_confirm_request::Union::Skip(true)
                                                                     }),
+                                                                    parallel_resume_offset: offset,
                                                                     ..Default::default()
                                                                 };
                                                             job.confirm(&req).await;
@@ -4362,6 +5021,21 @@ mod parallel_file_transfer_tests {
         assert_eq!(
             work.iter().map(|item| item.range_len).sum::<u64>(),
             file_size - resume_offset
+        );
+    }
+
+    #[test]
+    fn interrupted_parallel_download_keeps_only_contiguous_ranges() {
+        let mib = 1024 * 1024u64;
+        let ranges = vec![
+            (24 * mib, 32 * mib),
+            (8 * mib, 16 * mib),
+            (16 * mib, 24 * mib),
+        ];
+        assert_eq!(contiguous_completed_prefix(8 * mib, ranges), 32 * mib);
+        assert_eq!(
+            contiguous_completed_prefix(8 * mib, vec![(24 * mib, 32 * mib)]),
+            8 * mib
         );
     }
 

@@ -919,13 +919,16 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                     // Note: Empty data (for empty files) is correctly handled. BytesCodec with raw=false
                     // (the default for IPC connections) adds a length prefix, so send_raw(Bytes::new())
                     // sends a 1-byte frame that next_raw() can correctly receive as empty data.
-                    if let Data::FileBlockFromCM { id, file_num, ref data, compressed, conn_id } = data {
+                    if let Data::FileBlockFromCM { id, file_num, ref data, compressed, offset, ref parallel_transfer_id, parallel_worker, conn_id } = data {
                         // Send metadata first (data field is skipped by serde), then raw data bytes
                         if let Err(e) = self.stream.send(&Data::FileBlockFromCM {
                             id,
                             file_num,
                             data: bytes::Bytes::new(), // placeholder, skipped by serde
                             compressed,
+                            offset,
+                            parallel_transfer_id: parallel_transfer_id.clone(),
+                            parallel_worker,
                             conn_id,
                         }).await {
                             log::error!("error sending FileBlockFromCM metadata: {}", e);
@@ -1399,8 +1402,7 @@ async fn handle_fs(
                 }
                 let download_path =
                     PathBuf::from(format!("{}.download", final_path.to_string_lossy()));
-                let digest_path =
-                    PathBuf::from(format!("{}.digest", final_path.to_string_lossy()));
+                let digest_path = PathBuf::from(format!("{}.digest", final_path.to_string_lossy()));
                 let resume_offset = if resume_single_file {
                     std::fs::read_to_string(&digest_path)
                         .ok()
@@ -1473,11 +1475,9 @@ async fn handle_fs(
                 primary_tx: tx.clone(),
             };
             if clipboard_cache {
-                if let Err(err) = begin_parallel_clipboard_cache(
-                    &transfer_id,
-                    &base,
-                    clipboard_cache_file_count,
-                ) {
+                if let Err(err) =
+                    begin_parallel_clipboard_cache(&transfer_id, &base, clipboard_cache_file_count)
+                {
                     let primary_tx = state.primary_tx.clone();
                     remove_parallel_downloads(state);
                     send_raw(
@@ -2031,6 +2031,10 @@ async fn handle_fs(
             include_hidden,
             conn_id,
             overwrite_detection,
+            parallel_transfer_id,
+            parallel_worker,
+            range_start,
+            range_len,
         } => {
             start_read_job(
                 path,
@@ -2039,6 +2043,10 @@ async fn handle_fs(
                 id,
                 conn_id,
                 overwrite_detection,
+                parallel_transfer_id,
+                parallel_worker,
+                range_start,
+                range_len,
                 read_jobs,
                 tx,
             )
@@ -2062,6 +2070,7 @@ async fn handle_fs(
             file_num: _,
             skip,
             offset_blk,
+            resume_offset,
             conn_id: _,
         } => {
             if let Some(job) = fs::get_job(id, read_jobs) {
@@ -2075,6 +2084,7 @@ async fn handle_fs(
                             offset_blk,
                         ))
                     },
+                    parallel_resume_offset: resume_offset,
                     ..Default::default()
                 };
                 job.confirm(&req).await;
@@ -2113,6 +2123,10 @@ async fn start_read_job(
     id: i32,
     conn_id: i32,
     overwrite_detection: bool,
+    parallel_transfer_id: String,
+    parallel_worker: u32,
+    range_start: u64,
+    range_len: u64,
     read_jobs: &mut Vec<fs::TransferJob>,
     tx: &UnboundedSender<Data>,
 ) {
@@ -2183,6 +2197,14 @@ async fn start_read_job(
                 log::error!("error sending ReadJobInitResult via IPC: {}", e);
             }
 
+            if !parallel_transfer_id.is_empty() && range_len > 0 {
+                job.set_parallel_read_range(
+                    parallel_transfer_id,
+                    parallel_worker,
+                    range_start,
+                    range_len,
+                );
+            }
             // Attach connection id so CM can route read blocks back correctly
             job.conn_id = conn_id;
             read_jobs.push(job);
@@ -2267,6 +2289,9 @@ async fn handle_read_jobs_tick(
                     file_num: block.file_num,
                     data: block.data,
                     compressed: block.compressed,
+                    offset: block.offset,
+                    parallel_transfer_id: block.parallel_transfer_id,
+                    parallel_worker: block.parallel_worker,
                     conn_id,
                 }) {
                     log::error!("error sending FileBlockFromCM via IPC: {}", e);
@@ -2668,10 +2693,8 @@ mod tests {
         preserve_parallel_downloads(state);
 
         assert_eq!(std::fs::metadata(&download_path).unwrap().len(), 12);
-        let digest: hbb_common::fs::FileDigest = serde_json::from_str(
-            &std::fs::read_to_string(&digest_path).unwrap(),
-        )
-        .unwrap();
+        let digest: hbb_common::fs::FileDigest =
+            serde_json::from_str(&std::fs::read_to_string(&digest_path).unwrap()).unwrap();
         assert_eq!(digest.size, 32);
         assert_eq!(digest.modified, 123);
         std::fs::remove_file(download_path).unwrap();

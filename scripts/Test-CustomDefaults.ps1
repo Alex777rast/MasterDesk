@@ -118,12 +118,18 @@ $customDefaults = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\custom_d
 foreach ($expectedValue in @(
     'hbbs.masterdesk.online',
     'hbbr.masterdesk.online',
-    'MasterDesk-1.4.9-RDS-x86_64.exe',
-    '1.4.9-10'
+    '1.4.9-10',
+    'https://api.github.com/repos/Alex777rast/MasterDesk/releases/latest'
 )) {
     if ($customDefaults -notmatch [regex]::Escape($expectedValue)) {
         throw "Compiled MasterDesk defaults are missing $expectedValue."
     }
+}
+if ($customDefaults -notmatch 'masterdesk_update_asset_version' -or
+    $customDefaults -notmatch 'MasterDesk-' -or
+    $customDefaults -notmatch '-beta-' -or
+    $customDefaults -notmatch '-RDS-x86_64\.exe') {
+    throw 'The GitHub updater does not enforce the dated MasterDesk beta asset name.'
 }
 if ($customDefaults -notmatch 'migrate_previous_network_settings') {
     throw 'Previous MasterDesk network settings are not migrated to the new domain.'
@@ -133,7 +139,6 @@ if ($customDefaults -notmatch 'DEFAULT_IMAGE_QUALITY:\s*&str\s*=\s*"balanced"') 
 }
 if ($customDefaults -notmatch 'is_protected_network_option' -or
     $customDefaults -notmatch 'OBFUSCATED_API_SERVER' -or
-    $customDefaults -notmatch 'OBFUSCATED_UPDATE_MANIFEST_URL' -or
     $customDefaults -notmatch 'OBFUSCATED_SERVER_PUBLIC_KEY' -or
     $customDefaults -notmatch 'OPTION_FORCE_SECURE_WEBSOCKET') {
     throw 'MasterDesk API/Key are not protected as internal compiled settings.'

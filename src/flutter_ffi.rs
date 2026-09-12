@@ -2880,7 +2880,10 @@ pub fn main_get_common(key: String) -> String {
             if crate::common::is_custom_client()
                 && crate::get_app_name() == crate::custom_defaults::APP_NAME
             {
-                return crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME.to_owned();
+                return crate::common::SOFTWARE_UPDATE_ASSET_NAME
+                    .lock()
+                    .unwrap()
+                    .clone();
             }
             #[cfg(target_os = "windows")]
             return match (

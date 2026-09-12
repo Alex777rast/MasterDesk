@@ -3947,6 +3947,7 @@ pub enum Data {
     TakeScreenshot((i32, String)),
     ParallelFinalize((i32, i32, String)),
     ParallelFailed((i32, String, String)),
+    ParallelDownloadFinished((i32, i32, String, Option<String>)),
 }
 
 pub async fn confirm_insecure_connection(

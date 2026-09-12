@@ -9,6 +9,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/formatter/id_formatter.dart';
+import 'package:flutter_hbb/common/peer_search.dart';
 import 'package:flutter_hbb/desktop/widgets/refresh_wrapper.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
 import 'package:flutter_hbb/main.dart';
@@ -1686,26 +1687,12 @@ bool mainGetPeerBoolOptionSync(String id, String key) {
 // Because all session options use `Y` and `<Empty>` as values.
 
 Future<bool> matchPeer(
-    String searchText, Peer peer, PeerTabIndex peerTabIndex) async {
-  if (searchText.isEmpty) {
-    return true;
-  }
-  if (peer.id.toLowerCase().contains(searchText)) {
-    return true;
-  }
-  if (peer.hostname.toLowerCase().contains(searchText) ||
-      peer.username.toLowerCase().contains(searchText)) {
-    return true;
-  }
-  if (peer.alias.toLowerCase().contains(searchText)) {
-    return true;
-  }
-  if (peerTabShowNote(peerTabIndex) &&
-      peer.note.toLowerCase().contains(searchText)) {
-    return true;
-  }
-  return false;
-}
+        PeerSearchQuery query, Peer peer, PeerTabIndex peerTabIndex) async =>
+    peerMatchesSearch(
+      peer,
+      query,
+      includeNote: peerTabShowNote(peerTabIndex),
+    );
 
 /// Get the image for the current [platform].
 Widget getPlatformImage(String platform, {double size = 50}) {

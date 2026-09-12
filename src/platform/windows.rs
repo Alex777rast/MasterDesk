@@ -68,9 +68,9 @@ use winapi::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
             ES_SYSTEM_REQUIRED, EVENT_MODIFY_STATE, HANDLE, PROCESS_ALL_ACCESS,
-            PROCESS_QUERY_LIMITED_INFORMATION, PSID, SECURITY_BUILTIN_DOMAIN_RID,
-            SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY, SYNCHRONIZE, TOKEN_ELEVATION,
-            TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
+            PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PSID,
+            SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
+            SYNCHRONIZE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
         },
         winreg::HKEY_CURRENT_USER,
         winspool::{
@@ -2081,6 +2081,16 @@ fn get_install_info_with_subkey(subkey: String) -> (String, String, String, Stri
 }
 
 pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String> {
+    copy_raw_cmd_with_failure(src_raw, _raw, _path, "exit /b 1", "")
+}
+
+fn copy_raw_cmd_with_failure(
+    src_raw: &str,
+    _raw: &str,
+    _path: &str,
+    failure_cmd: &str,
+    output_redirection: &str,
+) -> ResultType<String> {
     let source_dir = PathBuf::from(src_raw)
         .parent()
         .ok_or(anyhow!("Can't get parent directory of {src_raw}"))?
@@ -2089,11 +2099,11 @@ pub fn copy_raw_cmd(src_raw: &str, _raw: &str, _path: &str) -> ResultType<String
     let runtime_checks = |root: &str| {
         if cfg!(feature = "flutter") {
             format!(
-                r#"if not exist "{root}\flutter_windows.dll" exit /b 1
-if not exist "{root}\libmasterdesk.dll" exit /b 1
-if not exist "{root}\data\app.so" exit /b 1
-if not exist "{root}\data\icudtl.dat" exit /b 1
-if not exist "{root}\data\flutter_assets\AssetManifest.bin" exit /b 1"#
+                r#"if not exist "{root}\flutter_windows.dll" (set "MASTERDESK_UPDATE_ERROR=2" & {failure_cmd})
+if not exist "{root}\libmasterdesk.dll" (set "MASTERDESK_UPDATE_ERROR=2" & {failure_cmd})
+if not exist "{root}\data\app.so" (set "MASTERDESK_UPDATE_ERROR=2" & {failure_cmd})
+if not exist "{root}\data\icudtl.dat" (set "MASTERDESK_UPDATE_ERROR=2" & {failure_cmd})
+if not exist "{root}\data\flutter_assets\AssetManifest.bin" (set "MASTERDESK_UPDATE_ERROR=2" & {failure_cmd})"#
             )
         } else {
             String::new()
@@ -2103,7 +2113,7 @@ if not exist "{root}\data\flutter_assets\AssetManifest.bin" exit /b 1"#
         r#"{source_checks}
 set "MASTERDESK_COPY_OK="
 for /L %%I in (1,1,15) do (
-    XCOPY "{source_dir}" "{_path}" /Y /E /H /I /K /R /Z
+    XCOPY "{source_dir}" "{_path}" /Y /E /H /I /K /R /Z {output_redirection}
     if not errorlevel 1 (
         set "MASTERDESK_COPY_OK=1"
         goto masterdesk_copy_complete
@@ -2111,7 +2121,10 @@ for /L %%I in (1,1,15) do (
     ping 127.0.0.1 -n 2 >nul
 )
 :masterdesk_copy_complete
-if not defined MASTERDESK_COPY_OK exit /b 1
+if not defined MASTERDESK_COPY_OK (
+    set "MASTERDESK_UPDATE_ERROR=1"
+    {failure_cmd}
+)
 {destination_checks}"#,
         source_checks = runtime_checks(&source_dir),
         destination_checks = runtime_checks(_path),
@@ -2144,6 +2157,49 @@ if errorlevel 1 exit /b 1
     )
 }
 
+fn powershell_single_quoted(value: &str) -> String {
+    value.replace('\'', "''")
+}
+
+fn wait_for_update_service_stop_cmd(app_name: &str, failure_label: &str) -> String {
+    let service_name = powershell_single_quoted(app_name);
+    format!(
+        r#"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$name = '{service_name}'; $deadline = [DateTime]::UtcNow.AddSeconds(10); do {{ $service = Get-Service -Name $name -ErrorAction SilentlyContinue; if ($null -eq $service -or $service.Status -eq 'Stopped') {{ exit 0 }}; Start-Sleep -Milliseconds 500 }} while ([DateTime]::UtcNow -lt $deadline); $instance = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object Name -eq $name | Select-Object -First 1; if ($null -ne $instance) {{ $servicePid = [uint32]$instance.ProcessId; if ($servicePid -gt 0) {{ Write-Output ('Graceful service stop timed out; terminating service process tree PID ' + $servicePid); taskkill.exe /F /T /PID $servicePid | Out-Null }} }}; $deadline = [DateTime]::UtcNow.AddSeconds(30); do {{ $service = Get-Service -Name $name -ErrorAction SilentlyContinue; if ($null -eq $service -or $service.Status -eq 'Stopped') {{ exit 0 }}; Start-Sleep -Milliseconds 500 }} while ([DateTime]::UtcNow -lt $deadline); Write-Error ('Service did not reach Stopped state: ' + $name); exit 1" >> "%MASTERDESK_UPDATE_LOG%" 2>&1
+if errorlevel 1 goto {failure_label}
+"#
+    )
+}
+
+fn wait_for_installed_application_exit_cmd(app_name: &str, installed_exe: &str) -> String {
+    let process_name = powershell_single_quoted(&format!("{app_name}.exe"));
+    let installed_exe = powershell_single_quoted(installed_exe);
+    format!(
+        r#"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$name = '{process_name}'; $target = [IO.Path]::GetFullPath('{installed_exe}'); $deadline = [DateTime]::UtcNow.AddSeconds(5); do {{ $remaining = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -ieq $name -and $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target) }}); foreach ($process in $remaining) {{ Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }}; if ($remaining.Count -eq 0) {{ exit 0 }}; Start-Sleep -Milliseconds 500 }} while ([DateTime]::UtcNow -lt $deadline); $remaining = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{ $_.Name -ieq $name -and $_.ExecutablePath -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target) }}); if ($remaining.Count -gt 0) {{ Write-Output ('Warning: WMI still reports the installed application after termination attempts; the copy and SHA-256 verification stages will determine whether files are available: ' + $target); $remaining | Select-Object ProcessId, ParentProcessId, SessionId, ExecutablePath | Format-List }}; exit 0" >> "%MASTERDESK_UPDATE_LOG%" 2>&1
+"#
+    )
+}
+
+fn verify_update_runtime_copy_cmd(
+    source_exe: &str,
+    installed_exe: &str,
+    source_root: &str,
+    installed_root: &str,
+    failure_label: &str,
+) -> String {
+    let source_exe = powershell_single_quoted(source_exe);
+    let installed_exe = powershell_single_quoted(installed_exe);
+    let source_root = powershell_single_quoted(source_root);
+    let installed_root = powershell_single_quoted(installed_root);
+    format!(
+        r#"
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "$sourceExe = '{source_exe}'; $installedExe = '{installed_exe}'; $sourceRoot = '{source_root}'; $installedRoot = '{installed_root}'; $relativeFiles = @('flutter_windows.dll', 'libmasterdesk.dll', 'data\app.so', 'data\icudtl.dat', 'data\masterdesk-build-manifest.json', 'data\flutter_assets\AssetManifest.bin', 'data\flutter_assets\FontManifest.json'); if (-not (Test-Path -LiteralPath $sourceExe -PathType Leaf) -or -not (Test-Path -LiteralPath $installedExe -PathType Leaf)) {{ Write-Error ('Missing executable while verifying update copy: ' + $installedExe); exit 1 }}; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $sourceExe).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $installedExe).Hash) {{ Write-Error ('SHA-256 mismatch after update copy: ' + $installedExe); exit 1 }}; foreach ($relative in $relativeFiles) {{ $source = Join-Path $sourceRoot $relative; $installed = Join-Path $installedRoot $relative; if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or -not (Test-Path -LiteralPath $installed -PathType Leaf)) {{ Write-Error ('Missing runtime file while verifying update copy: ' + $relative); exit 1 }}; if ((Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash -ne (Get-FileHash -Algorithm SHA256 -LiteralPath $installed).Hash) {{ Write-Error ('SHA-256 mismatch after update copy: ' + $relative); exit 1 }} }}; Write-Output 'Copied runtime SHA-256 verification passed'; exit 0" >> "%MASTERDESK_UPDATE_LOG%" 2>&1
+if errorlevel 1 goto {failure_label}
+"#
+    )
+}
+
 fn wait_for_process_exit_cmd(app_name: &str, pid: u32, label: &str) -> String {
     format!(
         r#"
@@ -2166,7 +2222,17 @@ fn detached_batch_launcher(batch_path: &Path) -> String {
 }
 
 pub fn copy_exe_cmd(src_exe: &str, exe: &str, path: &str) -> ResultType<String> {
-    let main_exe = copy_raw_cmd(src_exe, exe, path)?;
+    copy_exe_cmd_with_failure(src_exe, exe, path, "exit /b 1", "")
+}
+
+fn copy_exe_cmd_with_failure(
+    src_exe: &str,
+    exe: &str,
+    path: &str,
+    failure_cmd: &str,
+    output_redirection: &str,
+) -> ResultType<String> {
+    let main_exe = copy_raw_cmd_with_failure(src_exe, exe, path, failure_cmd, output_redirection)?;
     Ok(format!(
         "
         {main_exe}
@@ -4766,7 +4832,7 @@ pub fn update_me(debug: bool) -> ResultType<()> {
     main_window_sessions.sort_unstable();
     main_window_sessions.dedup();
     main_window_sessions.retain(|session_id| *session_id != 0);
-    kill_process_by_pids(&app_exe_name, main_window_pids)?;
+    preterminate_update_processes(&app_exe_name, "main-window", main_window_pids);
     let tray_pids = crate::platform::get_pids_of_process_with_args(&app_exe_name, &["--tray"]);
     let mut tray_sessions = tray_pids
         .iter()
@@ -4775,8 +4841,12 @@ pub fn update_me(debug: bool) -> ResultType<()> {
         .collect::<Vec<_>>();
     tray_sessions.sort_unstable();
     tray_sessions.dedup();
-    kill_process_by_pids(&app_exe_name, tray_pids)?;
+    preterminate_update_processes(&app_exe_name, "tray", tray_pids);
     let is_service_running = is_self_service_running();
+    let service_should_run = should_restore_service_after_update(
+        is_service_running,
+        &Config::get_option("stop-service"),
+    );
 
     let mut version_major = "0";
     let mut version_minor = "0";
@@ -4863,13 +4933,29 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     };
 
     let filter = format!(" /FI \"PID ne {}\"", get_current_pid());
-    let wait_for_service = wait_for_service_stop_cmd(&app_name);
-    let wait_for_processes = wait_for_application_exit_cmd(&app_name, &filter, "update");
-    let restore_service_cmd = if is_service_running {
-        format!("sc start {}", &app_name)
+    let update_failure_label = "masterdesk_update_failed";
+    let failure_cmd = format!("goto {update_failure_label}");
+    let wait_for_service = wait_for_update_service_stop_cmd(&app_name, update_failure_label);
+    let wait_for_processes = wait_for_installed_application_exit_cmd(&app_name, &exe);
+    let restore_service_cmd = if service_should_run {
+        format!("sc start {} >> \"%MASTERDESK_UPDATE_LOG%\" 2>&1", &app_name)
     } else {
         "".to_owned()
     };
+    let copy_exe = copy_exe_cmd_with_failure(
+        &src_exe,
+        &exe,
+        &path,
+        &failure_cmd,
+        ">> \"%MASTERDESK_UPDATE_LOG%\" 2>&1",
+    )?;
+    let source_root = Path::new(&src_exe)
+        .parent()
+        .ok_or(anyhow!("Can't get parent directory of {src_exe}"))?
+        .to_string_lossy()
+        .to_string();
+    let verify_runtime =
+        verify_update_runtime_copy_cmd(&src_exe, &exe, &source_root, &path, update_failure_label);
 
     // No need to check the install option here, `is_rd_printer_installed` rarely fails.
     let is_printer_installed = remote_printer::is_rd_printer_installed(&app_name).unwrap_or(false);
@@ -4897,22 +4983,48 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     // But only 2 processes are shown in the tasklist.
     let cmds = format!(
         "
-chcp 65001
-sc stop {app_name}
+chcp 65001 >nul
+setlocal
+if not exist \"%ProgramData%\\MasterDesk\" md \"%ProgramData%\\MasterDesk\"
+set \"MASTERDESK_UPDATE_LOG=%ProgramData%\\MasterDesk\\update.log\"
+set \"MASTERDESK_UPDATE_STAGE=stop-service\"
+echo [%date% %time%] MasterDesk update started >> \"%MASTERDESK_UPDATE_LOG%\"
+sc stop {app_name} >> \"%MASTERDESK_UPDATE_LOG%\" 2>&1
 {wait_for_service}
-taskkill /F /IM {app_name}.exe{filter}
+set \"MASTERDESK_UPDATE_STAGE=stop-installed-processes\"
+taskkill /F /IM {app_name}.exe{filter} >> \"%MASTERDESK_UPDATE_LOG%\" 2>&1
 {wait_for_processes}
-{reg_cmd}
+set \"MASTERDESK_UPDATE_STAGE=copy-runtime\"
 {copy_exe}
+set \"MASTERDESK_UPDATE_STAGE=rename-runtime\"
 {rename_exe}
 {remove_meta_toml}
+set \"MASTERDESK_UPDATE_STAGE=verify-runtime\"
+{verify_runtime}
+set \"MASTERDESK_UPDATE_STAGE=registry\"
+{reg_cmd}
+set \"MASTERDESK_UPDATE_STAGE=restore-service\"
 {restore_service_cmd}
+set \"MASTERDESK_UPDATE_STAGE=printer\"
 {uninstall_printer_cmd}
 {install_printer_cmd}
 {sleep}
+set \"MASTERDESK_UPDATE_STAGE=complete\"
+echo [%date% %time%] MasterDesk update completed >> \"%MASTERDESK_UPDATE_LOG%\"
+goto masterdesk_update_success
+:masterdesk_update_failed
+if not defined MASTERDESK_UPDATE_ERROR set \"MASTERDESK_UPDATE_ERROR=%ERRORLEVEL%\"
+echo [%date% %time%] MasterDesk update failed; stage=%MASTERDESK_UPDATE_STAGE%; error=%MASTERDESK_UPDATE_ERROR% >> \"%MASTERDESK_UPDATE_LOG%\"
+sc queryex {app_name} >> \"%MASTERDESK_UPDATE_LOG%\" 2>&1
+powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object Name -ieq '{app_name}.exe' | Select-Object ProcessId, ParentProcessId, SessionId, ExecutablePath | Format-List\" >> \"%MASTERDESK_UPDATE_LOG%\" 2>&1
+{restore_service_cmd}
+exit /b 1
+:masterdesk_update_success
+endlocal
     ",
         app_name = app_name,
-        copy_exe = copy_exe_cmd(&src_exe, &exe, &path)?,
+        copy_exe = copy_exe,
+        verify_runtime = verify_runtime,
         rename_exe = rename_exe_cmd(&src_exe, &path)?,
         remove_meta_toml = remove_meta_toml_cmd(is_msi.unwrap_or(true), &path),
         sleep = if debug { "timeout 300" } else { "" },
@@ -5036,6 +5148,10 @@ fn preferred_update_gui_session(
         })
 }
 
+fn should_restore_service_after_update(was_running: bool, stop_service_option: &str) -> bool {
+    was_running || stop_service_option != "Y"
+}
+
 fn update_restore_arguments(update_completed: bool, updater_pid: &str) -> Vec<&str> {
     if update_completed {
         vec!["--wait-for-portable", updater_pid]
@@ -5074,25 +5190,202 @@ fn get_reg_msi_key(subkey: &str, is_msi: Option<bool>) -> Option<String> {
     Some(reg_msi_key)
 }
 
-// Double confirm the process name
-fn kill_process_by_pids(name: &str, pids: Vec<Pid>) -> ResultType<()> {
+#[derive(Debug, PartialEq, Eq)]
+enum NativeUpdateProcessTermination {
+    AlreadyExited,
+    Terminated,
+}
+
+fn terminate_update_process_at_path(
+    process_id: u32,
+    expected_executable: &Path,
+) -> ResultType<NativeUpdateProcessTermination> {
+    use hbb_common::platform::windows::RAIIHandle;
+
+    const MASTERDESK_UPDATE_EXIT_CODE: u32 = 0x4D44_5550;
+    const PROCESS_IMAGE_PATH_BUFFER_LEN: usize = 32 * 1024;
+    const TERMINATION_WAIT_MS: u32 = 5_000;
+
+    unsafe {
+        let process = OpenProcess(
+            PROCESS_TERMINATE | SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE,
+            process_id,
+        );
+        if process.is_null() {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_INVALID_PARAMETER as i32) {
+                return Ok(NativeUpdateProcessTermination::AlreadyExited);
+            }
+            bail!(
+                "Failed to open update process {} for native termination: {}",
+                process_id,
+                error
+            );
+        }
+        let _process = RAIIHandle(process);
+
+        let mut buffer = vec![0u16; PROCESS_IMAGE_PATH_BUFFER_LEN];
+        let mut length = PROCESS_IMAGE_PATH_BUFFER_LEN as u32;
+        if QueryFullProcessImageNameW(process, 0, buffer.as_mut_ptr(), &mut length) == FALSE {
+            bail!(
+                "Failed to verify update process {} executable path: {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        buffer.truncate(length as usize);
+        let actual_executable = PathBuf::from(OsString::from_wide(&buffer));
+        if !actual_executable
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected_executable.to_string_lossy())
+        {
+            bail!(
+                "Refusing native update termination because PID {} changed executable path from {:?} to {:?}",
+                process_id,
+                expected_executable,
+                actual_executable
+            );
+        }
+
+        let initial_wait = WaitForSingleObject(process, 0);
+        if initial_wait == WAIT_OBJECT_0 {
+            return Ok(NativeUpdateProcessTermination::AlreadyExited);
+        }
+        if initial_wait != WAIT_TIMEOUT {
+            bail!(
+                "Failed to inspect update process {} state before native termination: {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        if TerminateProcess(process, MASTERDESK_UPDATE_EXIT_CODE) == FALSE {
+            bail!(
+                "Failed to terminate update process {} with the native Windows API: {}",
+                process_id,
+                io::Error::last_os_error()
+            );
+        }
+        let final_wait = WaitForSingleObject(process, TERMINATION_WAIT_MS);
+        if final_wait != WAIT_OBJECT_0 {
+            bail!(
+                "Update process {} did not signal within {} ms after native termination",
+                process_id,
+                TERMINATION_WAIT_MS
+            );
+        }
+        Ok(NativeUpdateProcessTermination::Terminated)
+    }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct UpdateProcessTerminationSummary {
+    requested: usize,
+    terminated: usize,
+    native_terminated: usize,
+    deferred: usize,
+    skipped_name_mismatch: usize,
+    already_exited: usize,
+}
+
+// Close visible processes before the elevated batch copies the runtime. Some
+// Windows crash paths leave a process object with one terminating thread:
+// taskkill and sysinfo report that termination was requested, but the process
+// remains unsignaled and keeps the image files mapped. Use one native process
+// handle to verify the executable path, inspect the signaled state and perform
+// termination. This also prevents PID reuse from targeting an unrelated
+// process between independent kill and verification calls.
+fn preterminate_update_processes(
+    name: &str,
+    role: &str,
+    pids: Vec<Pid>,
+) -> UpdateProcessTerminationSummary {
     let name = name.to_lowercase();
     let s = System::new_all();
-    // No need to check all names of `pids` first, and kill them then.
-    // It's rare case that they're not matched.
+    let mut summary = UpdateProcessTerminationSummary {
+        requested: pids.len(),
+        ..Default::default()
+    };
     for pid in pids {
+        let pid_value = pid.as_u32();
+        let session_id = get_session_id_of_process(pid_value)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_owned());
         if let Some(process) = s.process(pid) {
             if process.name().to_lowercase() != name {
-                bail!("Failed to kill the process, the names are mismatched.");
+                summary.skipped_name_mismatch += 1;
+                log::warn!(
+                    "Skipping MasterDesk update pre-termination because the process name changed: role={}, pid={}, session={}, expected_name={}, actual_name={}, executable={:?}",
+                    role,
+                    pid_value,
+                    session_id,
+                    name,
+                    process.name(),
+                    process.exe()
+                );
+                continue;
             }
-            if !process.kill() {
-                bail!("Failed to kill the process");
+            log::info!(
+                "MasterDesk update pre-termination candidate: role={}, pid={}, session={}, executable={:?}",
+                role,
+                pid_value,
+                session_id,
+                process.exe()
+            );
+            match terminate_update_process_at_path(pid_value, process.exe()) {
+                Ok(NativeUpdateProcessTermination::AlreadyExited) => {
+                    summary.terminated += 1;
+                    log::info!(
+                        "MasterDesk update pre-termination target was already signaled: role={}, pid={}, session={}",
+                        role,
+                        pid_value,
+                        session_id
+                    );
+                }
+                Ok(NativeUpdateProcessTermination::Terminated) => {
+                    summary.terminated += 1;
+                    summary.native_terminated += 1;
+                    log::warn!(
+                        "MasterDesk update pre-termination used verified native Windows termination: role={}, pid={}, session={}, executable={:?}",
+                        role,
+                        pid_value,
+                        session_id,
+                        process.exe()
+                    );
+                }
+                Err(error) => {
+                    summary.deferred += 1;
+                    log::warn!(
+                        "MasterDesk update pre-termination could not confirm process exit; deferring to the elevated update batch: role={}, pid={}, session={}, executable={:?}, error={}",
+                        role,
+                        pid_value,
+                        session_id,
+                        process.exe(),
+                        error
+                    );
+                }
             }
         } else {
-            bail!("Failed to kill the process, the pid is not found");
+            summary.already_exited += 1;
+            log::info!(
+                "MasterDesk update pre-termination target already exited: role={}, pid={}, session={}",
+                role,
+                pid_value,
+                session_id
+            );
         }
     }
-    Ok(())
+    log::info!(
+        "MasterDesk update pre-termination summary: role={}, requested={}, terminated={}, native_terminated={}, deferred={}, skipped_name_mismatch={}, already_exited={}",
+        role,
+        summary.requested,
+        summary.terminated,
+        summary.native_terminated,
+        summary.deferred,
+        summary.skipped_name_mismatch,
+        summary.already_exited
+    );
+    summary
 }
 
 pub fn handle_custom_client_staging_dir_before_update(
@@ -5230,7 +5523,7 @@ pub fn verify_masterdesk_update_package(file: &str, download_url: &str) -> Resul
     let Some((release_directory, file_name)) = download_url.rsplit_once('/') else {
         bail!("The update URL is invalid");
     };
-    if file_name != crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME {
+    if !crate::custom_defaults::is_expected_masterdesk_update_asset(file_name) {
         bail!("Unexpected MasterDesk update file: {}", file_name);
     }
 
@@ -6179,25 +6472,15 @@ mod tests {
     #[test]
     fn parses_only_the_expected_release_checksum() {
         let expected = "822a049e85156f76920c824f83a8fa9530f2f781f19ebc943ed69e94fb640607";
-        let contents = format!(
-            "{}  {}\n{}  other.exe\n",
-            expected,
-            crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME,
-            "0".repeat(64)
-        );
+        let asset = "MasterDesk-1.4.9-10-beta-61-2026-09-05-RDS-x86_64.exe";
+        let contents = format!("{}  {}\n{}  other.exe\n", expected, asset, "0".repeat(64));
         assert_eq!(
-            parse_release_sha256(&contents, crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME),
+            parse_release_sha256(&contents, asset),
             Some(expected.to_owned())
         );
         assert_eq!(parse_release_sha256(&contents, "missing.exe"), None);
         assert_eq!(
-            parse_release_sha256(
-                &format!(
-                    "not-a-hash  {}",
-                    crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME
-                ),
-                crate::custom_defaults::WINDOWS_UPDATE_ASSET_NAME
-            ),
+            parse_release_sha256(&format!("not-a-hash  {}", asset), asset),
             None
         );
     }
@@ -6235,6 +6518,153 @@ mod tests {
             update_restore_arguments(true, "42"),
             vec!["--wait-for-portable", "42"]
         );
+    }
+
+    #[test]
+    fn update_restores_the_desired_service_state_after_a_previous_failed_attempt() {
+        assert!(should_restore_service_after_update(true, ""));
+        assert!(should_restore_service_after_update(false, ""));
+        assert!(!should_restore_service_after_update(false, "Y"));
+    }
+
+    #[test]
+    fn update_service_wait_has_a_force_stop_fallback_and_failure_route() {
+        let command = wait_for_update_service_stop_cmd("MasterDesk", "update_failed");
+        assert!(command.contains("AddSeconds(10)"));
+        assert!(command.contains("Get-CimInstance Win32_Service"));
+        assert!(command.contains("taskkill.exe /F /T /PID $servicePid"));
+        assert!(command.contains("goto update_failed"));
+        assert!(command.contains("%MASTERDESK_UPDATE_LOG%"));
+    }
+
+    #[test]
+    fn update_process_wait_targets_only_the_installed_executable() {
+        let command = wait_for_installed_application_exit_cmd(
+            "MasterDesk",
+            r"C:\Program Files\MasterDesk\MasterDesk.exe",
+        );
+        assert!(command.contains(r"C:\Program Files\MasterDesk\MasterDesk.exe"));
+        assert!(command.contains("Get-CimInstance Win32_Process"));
+        assert!(command.contains("ExecutablePath"));
+        assert!(command.contains("AddSeconds(5)"));
+        assert!(command.contains("WMI still reports the installed application"));
+        assert!(!command.contains("exit 1"));
+    }
+
+    #[test]
+    fn update_runtime_copy_is_verified_by_hash_before_restart() {
+        let command = verify_update_runtime_copy_cmd(
+            r"C:\portable\MasterDesk.exe",
+            r"C:\Program Files\MasterDesk\MasterDesk.exe",
+            r"C:\portable",
+            r"C:\Program Files\MasterDesk",
+            "masterdesk_update_failed",
+        );
+        assert!(command.contains("Get-FileHash -Algorithm SHA256"));
+        assert!(command.contains("libmasterdesk.dll"));
+        assert!(command.contains(r"data\app.so"));
+        assert!(command.contains("masterdesk-build-manifest.json"));
+        assert!(command.contains("AssetManifest.bin"));
+        assert!(command.contains("FontManifest.json"));
+        assert!(command.contains("goto masterdesk_update_failed"));
+    }
+
+    #[cfg(feature = "flutter")]
+    #[test]
+    fn update_copy_failures_reach_the_cleanup_label() {
+        let command = copy_exe_cmd_with_failure(
+            r"C:\portable\MasterDesk.exe",
+            r"C:\Program Files\MasterDesk\MasterDesk.exe",
+            r"C:\Program Files\MasterDesk",
+            "goto masterdesk_update_failed",
+            r#">> "%MASTERDESK_UPDATE_LOG%" 2>&1"#,
+        )
+        .unwrap();
+        assert!(command.contains("goto masterdesk_update_failed"));
+        assert!(!command.contains("exit /b 1"));
+        assert!(command.contains(r#">> "%MASTERDESK_UPDATE_LOG%" 2>&1"#));
+        assert!(command.contains("MASTERDESK_UPDATE_ERROR=1"));
+    }
+
+    #[test]
+    fn update_pretermination_does_not_fail_for_stale_or_reused_pids() {
+        let missing = preterminate_update_processes(
+            "MasterDesk.exe",
+            "test-missing",
+            vec![(u32::MAX as usize).into()],
+        );
+        assert_eq!(missing.requested, 1);
+        assert_eq!(missing.already_exited, 1);
+        assert_eq!(missing.terminated, 0);
+        assert_eq!(missing.deferred, 0);
+
+        let current_pid: Pid = (std::process::id() as usize).into();
+        let reused = preterminate_update_processes(
+            "definitely-not-the-test-process.exe",
+            "test-reused",
+            vec![current_pid],
+        );
+        assert_eq!(reused.requested, 1);
+        assert_eq!(reused.skipped_name_mismatch, 1);
+        assert_eq!(reused.terminated, 0);
+        assert_eq!(reused.deferred, 0);
+    }
+
+    #[test]
+    fn native_update_termination_treats_a_missing_pid_as_already_exited() {
+        assert_eq!(
+            terminate_update_process_at_path(
+                u32::MAX,
+                Path::new(r"C:\Program Files\MasterDesk\MasterDesk.exe")
+            )
+            .unwrap(),
+            NativeUpdateProcessTermination::AlreadyExited
+        );
+    }
+
+    #[test]
+    fn native_update_termination_rejects_a_reused_pid_by_executable_path() {
+        let error = terminate_update_process_at_path(
+            std::process::id(),
+            Path::new(r"C:\definitely-not-the-test-process\MasterDesk.exe"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("changed executable path"));
+    }
+
+    #[test]
+    fn native_update_termination_ends_a_verified_test_process() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "ping.exe 127.0.0.1 -n 30 >nul"])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let executable = get_process_executable_path(process_id).unwrap();
+        let result = terminate_update_process_at_path(process_id, &executable);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(result.unwrap(), NativeUpdateProcessTermination::Terminated);
+    }
+
+    #[test]
+    fn update_pretermination_confirms_a_real_test_process_exit() {
+        let mut child = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "ping.exe 127.0.0.1 -n 30 >nul"])
+            .creation_flags(winapi::um::winbase::CREATE_NO_WINDOW)
+            .spawn()
+            .unwrap();
+        let process_id = child.id();
+        let summary = preterminate_update_processes(
+            "cmd.exe",
+            "controlled-test",
+            vec![(process_id as usize).into()],
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(summary.requested, 1);
+        assert_eq!(summary.terminated, 1);
+        assert_eq!(summary.deferred, 0);
     }
 
     #[test]

@@ -14,6 +14,7 @@ import 'package:visibility_detector/visibility_detector.dart';
 import 'package:window_manager/window_manager.dart';
 
 import '../../common.dart';
+import '../../common/peer_search.dart';
 import '../../models/peer_model.dart';
 import '../../models/platform_model.dart';
 import 'peer_card.dart';
@@ -448,13 +449,12 @@ class _PeersViewState extends State<_PeersView>
       }
     }
 
-    searchText = searchText.trim();
-    if (searchText.isEmpty) {
+    final query = PeerSearchQuery(searchText);
+    if (query.isEmpty) {
       return peers;
     }
-    searchText = searchText.toLowerCase();
     final matches = await Future.wait(
-        peers.map((peer) => matchPeer(searchText, peer, widget.peerTabIndex)));
+        peers.map((peer) => matchPeer(query, peer, widget.peerTabIndex)));
     final filteredList = List<Peer>.empty(growable: true);
     for (var i = 0; i < peers.length; i++) {
       if (matches[i]) {

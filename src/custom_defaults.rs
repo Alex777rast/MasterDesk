@@ -11,7 +11,8 @@ use std::collections::HashMap;
 pub const APP_NAME: &str = "MasterDesk";
 pub const ID_SERVER: &str = "hbbs.masterdesk.online";
 pub const RELAY_SERVER: &str = "hbbr.masterdesk.online";
-pub const WINDOWS_UPDATE_ASSET_NAME: &str = "MasterDesk-1.4.9-RDS-x86_64.exe";
+pub const GITHUB_LATEST_RELEASE_API: &str =
+    "https://api.github.com/repos/Alex777rast/MasterDesk/releases/latest";
 /// Branded release sequence. Keep the upstream protocol version in
 /// `src/version.rs` unchanged so peer feature negotiation remains compatible.
 pub const UPDATE_VERSION: &str = "1.4.9-10";
@@ -40,6 +41,34 @@ fn split_build_version(value: &str) -> (&str, u64) {
     } else {
         (trimmed, 0)
     }
+}
+
+pub fn masterdesk_update_asset_version(file_name: &str) -> Option<String> {
+    const PREFIX: &str = "MasterDesk-";
+    const SUFFIX: &str = "-RDS-x86_64.exe";
+    let value = file_name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+    let (base, beta_and_date) = value.split_once("-beta-")?;
+    if base.is_empty() || hbb_common::get_version_number(base) <= 0 {
+        return None;
+    }
+    let (beta, date) = beta_and_date.split_once('-')?;
+    let beta = beta.parse::<u64>().ok()?;
+    if beta == 0 || date.len() != 10 {
+        return None;
+    }
+    let mut date_parts = date.split('-');
+    let valid_date = date_parts
+        .by_ref()
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        && date_parts.next().is_none();
+    if !valid_date {
+        return None;
+    }
+    Some(format!("{base} beta {beta}"))
+}
+
+pub fn is_expected_masterdesk_update_asset(file_name: &str) -> bool {
+    masterdesk_update_asset_version(file_name).is_some()
 }
 
 pub fn installed_build_is_older(installed_version: &str, installed_date: &str) -> bool {
@@ -91,12 +120,6 @@ const OBFUSCATED_API_SERVER: &[u8] = &[
     0x59, 0x08, 0xd1, 0x69, 0xa0, 0x58, 0x61, 0xa7, 0x66, 0x81, 0x3c, 0x1f, 0x11, 0xc4, 0x6a, 0xa7,
     0x07, 0x3c, 0xec, 0x62, 0x82, 0x3e, 0x1f, 0x13, 0xcb, 0x75, 0xba, 0x0c, 0x2b,
 ];
-const OBFUSCATED_UPDATE_MANIFEST_URL: &[u8] = &[
-    0x59, 0x08, 0xd1, 0x69, 0xa0, 0x58, 0x61, 0xa7, 0x66, 0x81, 0x3c, 0x1f, 0x11, 0xc4, 0x6a, 0xa7,
-    0x07, 0x3c, 0xec, 0x62, 0x82, 0x3e, 0x1f, 0x13, 0xcb, 0x75, 0xba, 0x0c, 0x2b, 0xa7, 0x6a, 0x90,
-    0x26, 0x45, 0x19, 0xd7, 0x7d, 0xb6, 0x11, 0x25, 0xa7, 0x71, 0x94, 0x27, 0x42, 0x15, 0xca, 0x77,
-    0xfc, 0x0e, 0x2f, 0xfc, 0x62, 0x82, 0x21,
-];
 const OBFUSCATED_SERVER_PUBLIC_KEY: &[u8] = &[
     0x5e, 0x04, 0xc1, 0x5e, 0x83, 0x5b, 0x27, 0xcf, 0x4a, 0xbb, 0x64, 0x56, 0x3d, 0x96, 0x7e, 0xbe,
     0x1b, 0x0f, 0xf1, 0x6d, 0xa4, 0x1b, 0x5c, 0x1b, 0xeb, 0x58, 0xab, 0x54, 0x08, 0xbc, 0x6c, 0xb5,
@@ -114,10 +137,6 @@ fn decode_internal_value(value: &[u8]) -> String {
 
 pub fn internal_api_server() -> String {
     decode_internal_value(OBFUSCATED_API_SERVER)
-}
-
-pub fn update_manifest_url() -> String {
-    decode_internal_value(OBFUSCATED_UPDATE_MANIFEST_URL)
 }
 
 pub fn internal_server_public_key() -> String {
@@ -291,7 +310,12 @@ fn migrate_previous_network_settings() {
 }
 
 pub fn is_newer_update(latest: &str) -> bool {
-    hbb_common::get_version_number(latest) > hbb_common::get_version_number(UPDATE_VERSION)
+    let (latest_base, latest_beta) = split_build_version(latest);
+    let latest_base = hbb_common::get_version_number(latest_base);
+    let current_base = hbb_common::get_version_number(UPDATE_VERSION);
+    latest_base > current_base
+        || (latest_base == current_base
+            && latest_beta > BUILD_BETA_NUMBER.trim().parse::<u64>().unwrap_or_default())
 }
 
 /// Apply the fork defaults in every RustDesk process (GUI, service and
@@ -348,6 +372,20 @@ mod tests {
     fn build_version_parser_distinguishes_beta_sequence() {
         assert_eq!(split_build_version("1.4.9-10"), ("1.4.9-10", 0));
         assert_eq!(split_build_version("1.4.9-10 beta 12"), ("1.4.9-10", 12));
+    }
+
+    #[test]
+    fn parses_current_github_windows_asset_name() {
+        assert_eq!(
+            masterdesk_update_asset_version(
+                "MasterDesk-1.4.9-10-beta-60-2026-09-04-RDS-x86_64.exe"
+            ),
+            Some("1.4.9-10 beta 60".to_owned())
+        );
+        assert!(!is_expected_masterdesk_update_asset("MasterDesk.exe"));
+        assert!(!is_expected_masterdesk_update_asset(
+            "MasterDesk-1.4.9-10-beta-60-RDS-x86_64.exe"
+        ));
     }
 
     #[test]

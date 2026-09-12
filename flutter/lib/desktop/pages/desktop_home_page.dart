@@ -36,7 +36,7 @@ class DesktopHomePage extends StatefulWidget {
 const borderColor = Color(0xFF2F65BA);
 
 class _DesktopHomePageState extends State<DesktopHomePage>
-    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
+    with AutomaticKeepAliveClientMixin, WidgetsBindingObserver, WindowListener {
   final _leftPaneScrollController = ScrollController();
 
   @override
@@ -749,6 +749,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     });
     Get.put<RxBool>(svcStopped, tag: 'stop-service');
     rustDeskWinManager.registerActiveWindowListener(onActiveWindowChanged);
+    windowManager.addListener(this);
 
     screenToMap(window_size.Screen screen) => {
           'frame': {
@@ -880,6 +881,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
+    rustDeskWinManager.unregisterActiveWindowListener(onActiveWindowChanged);
+    windowManager.removeListener(this);
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
@@ -889,7 +892,13 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     super.didChangeAppLifecycleState(state);
     if (state == AppLifecycleState.resumed) {
       shouldBeBlocked(_block, canBeBlocked);
+      bind.mainGetSoftwareUpdateUrl();
     }
+  }
+
+  @override
+  void onWindowFocus() {
+    bind.mainGetSoftwareUpdateUrl();
   }
 
   Widget buildPluginEntry() {

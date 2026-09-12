@@ -1013,9 +1013,9 @@ impl Connection {
                                 conn.handle_read_job_init_result(id, file_num, include_hidden, result).await;
                             }
                         }
-                        ipc::Data::FileBlockFromCM { id, file_num, data, compressed, conn_id } => {
+                        ipc::Data::FileBlockFromCM { id, file_num, data, compressed, offset, parallel_transfer_id, parallel_worker, conn_id } => {
                             if conn_id == conn.inner.id() {
-                                conn.handle_file_block_from_cm(id, file_num, data, compressed).await;
+                                conn.handle_file_block_from_cm(id, file_num, data, compressed, offset, parallel_transfer_id, parallel_worker).await;
                             }
                         }
                         ipc::Data::FileReadDone { id, file_num, conn_id } => {
@@ -1981,6 +1981,7 @@ impl Connection {
             safe_mode_reboot,
             parallel_file_transfer_v1: cfg!(target_os = "windows"),
             parallel_clipboard_cache_v1: cfg!(target_os = "windows"),
+            parallel_file_download_v1: cfg!(target_os = "windows"),
             ..Default::default()
         })
         .into();
@@ -3440,9 +3441,44 @@ impl Connection {
                                 let job_type = JobType::from_proto(s.file_type);
                                 match job_type {
                                     JobType::Generic => {
+                                        let parallel_range = !s.parallel_transfer_id.is_empty()
+                                            && !self.parallel_transfer_id.is_empty()
+                                            && s.parallel_transfer_id == self.parallel_transfer_id
+                                            && s.parallel_worker == self.parallel_worker
+                                            && s.range_len > 0;
+                                        if s.parallel_initialize
+                                            && !s.parallel_transfer_id.is_empty()
+                                            && self.parallel_transfer_id.is_empty()
+                                        {
+                                            if !register_parallel_transfer_auth(
+                                                &s.parallel_transfer_id,
+                                                self.session_key(),
+                                                &s.parallel_auth_token,
+                                            ) {
+                                                self.send(fs::new_error(
+                                                    id,
+                                                    "invalid parallel transfer authorization",
+                                                    s.file_num,
+                                                ))
+                                                .await;
+                                                return true;
+                                            }
+                                            self.parallel_primary_transfers
+                                                .insert(s.parallel_transfer_id.clone());
+                                        } else if !s.parallel_transfer_id.is_empty()
+                                            && !parallel_range
+                                        {
+                                            self.send(fs::new_error(
+                                                id,
+                                                "invalid parallel read request",
+                                                s.file_num,
+                                            ))
+                                            .await;
+                                            return true;
+                                        }
                                         let od = can_enable_overwrite_detection(
                                             get_version_number(&self.lr.version),
-                                        );
+                                        ) && !parallel_range;
                                         if crate::common::need_fs_cm_send_files() {
                                             // Delegate file reading to CM on Windows
                                             self.cm_read_job_ids.insert(id);
@@ -3453,6 +3489,26 @@ impl Connection {
                                                 include_hidden: s.include_hidden,
                                                 conn_id: self.inner.id(),
                                                 overwrite_detection: od,
+                                                parallel_transfer_id: if parallel_range {
+                                                    s.parallel_transfer_id.clone()
+                                                } else {
+                                                    String::new()
+                                                },
+                                                parallel_worker: if parallel_range {
+                                                    s.parallel_worker
+                                                } else {
+                                                    0
+                                                },
+                                                range_start: if parallel_range {
+                                                    s.range_start
+                                                } else {
+                                                    0
+                                                },
+                                                range_len: if parallel_range {
+                                                    s.range_len
+                                                } else {
+                                                    0
+                                                },
                                             });
                                         } else {
                                             // Handle file reading in Connection on non-Windows
@@ -3467,6 +3523,16 @@ impl Connection {
                                                 od,
                                                 path,
                                                 true, // check file count limit
+                                                if parallel_range {
+                                                    Some((
+                                                        s.parallel_transfer_id.clone(),
+                                                        s.parallel_worker,
+                                                        s.range_start,
+                                                        s.range_len,
+                                                    ))
+                                                } else {
+                                                    None
+                                                },
                                             )
                                             .await;
                                         }
@@ -3491,6 +3557,7 @@ impl Connection {
                                                 true, // always enable overwrite detection for printer
                                                 path,
                                                 false, // no file count limit for printer
+                                                None,
                                             )
                                             .await;
                                         } else {
@@ -3701,6 +3768,7 @@ impl Connection {
                                         file_num: r.file_num,
                                         skip: r.skip(),
                                         offset_blk: r.offset_blk(),
+                                        resume_offset: r.parallel_resume_offset,
                                         conn_id: self.inner.id(),
                                     });
                                 } else {
@@ -5328,6 +5396,9 @@ impl Connection {
         file_num: i32,
         data: bytes::Bytes,
         compressed: bool,
+        offset: u64,
+        parallel_transfer_id: String,
+        parallel_worker: u32,
     ) {
         // Check if the job is still valid (not cancelled)
         if !self.cm_read_job_ids.contains(&id) {
@@ -5345,6 +5416,9 @@ impl Connection {
         block.file_num = file_num;
         block.data = data.to_vec().into();
         block.compressed = compressed;
+        block.offset = offset;
+        block.parallel_transfer_id = parallel_transfer_id;
+        block.parallel_worker = parallel_worker;
 
         let mut msg = Message::new();
         let mut fr = FileResponse::new();
@@ -5368,6 +5442,11 @@ impl Connection {
         let mut done = FileTransferDone::new();
         done.id = id;
         done.file_num = file_num;
+        if !self.parallel_transfer_id.is_empty() {
+            done.parallel_transfer_id = self.parallel_transfer_id.clone();
+            done.parallel_worker = self.parallel_worker;
+            done.worker_ack = true;
+        }
 
         let mut msg = Message::new();
         let mut fr = FileResponse::new();
@@ -5519,6 +5598,7 @@ impl Connection {
         overwrite_detection: bool,
         path: String,
         check_file_limit: bool,
+        parallel_range: Option<(String, u32, u64, u64)>,
     ) {
         match fs::TransferJob::new_read(
             id,
@@ -5533,7 +5613,7 @@ impl Connection {
             Err(err) => {
                 self.send(fs::new_error(id, err, 0)).await;
             }
-            Ok(job) => {
+            Ok(mut job) => {
                 if check_file_limit {
                     if let Err(msg) =
                         crate::ui_cm_interface::check_file_count_limit(job.files().len())
@@ -5541,6 +5621,9 @@ impl Connection {
                         self.send(fs::new_error(id, msg, -1)).await;
                         return;
                     }
+                }
+                if let Some((transfer_id, worker, range_start, range_len)) = parallel_range {
+                    job.set_parallel_read_range(transfer_id, worker, range_start, range_len);
                 }
                 self.process_new_read_job(job, path).await;
             }
@@ -6436,13 +6519,16 @@ async fn start_ipc(
                             // Note: Empty data (for empty files) is correctly handled. BytesCodec with
                             // raw=false adds a length prefix, so next_raw() returns empty BytesMut for
                             // zero-length frames. This mirrors the WriteBlock pattern below.
-                            ipc::Data::FileBlockFromCM { id, file_num, data: _, compressed, conn_id } => {
+                            ipc::Data::FileBlockFromCM { id, file_num, data: _, compressed, offset, parallel_transfer_id, parallel_worker, conn_id } => {
                                 let raw_data = stream.next_raw().await?;
                                 tx_from_cm.send(ipc::Data::FileBlockFromCM {
                                     id,
                                     file_num,
                                     data: raw_data.into(),
                                     compressed,
+                                    offset,
+                                    parallel_transfer_id,
+                                    parallel_worker,
                                     conn_id,
                                 })?;
                             }

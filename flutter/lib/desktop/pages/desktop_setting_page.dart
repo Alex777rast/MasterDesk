@@ -169,11 +169,12 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
 
   @override
   void dispose() {
-    super.dispose();
     Get.delete<PageController>(tag: _kSettingPageControllerTag);
-    Get.delete<RxInt>(tag: _kSettingPageTabKeyTag);
+    Get.delete<Rx<SettingsTabKey>>(tag: _kSettingPageTabKeyTag);
     WidgetsBinding.instance.removeObserver(this);
     _videoConnTimer?.cancel();
+    controller.dispose();
+    super.dispose();
   }
 
   List<_TabInfo> _settingTabs() {
@@ -293,10 +294,11 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
           Expanded(
             child: Container(
               color: Theme.of(context).scaffoldBackgroundColor,
-              child: PageView(
+              child: PageView.builder(
                 controller: controller,
                 physics: NeverScrollableScrollPhysics(),
-                children: _children(),
+                itemCount: DesktopSettingPage.tabKeys.length,
+                itemBuilder: (context, index) => _children()[index],
               ),
             ),
           )
@@ -404,10 +406,17 @@ class _General extends StatefulWidget {
 }
 
 class _GeneralState extends State<_General> {
-  final RxBool serviceStop =
-      isWeb ? RxBool(false) : Get.find<RxBool>(tag: 'stop-service');
+  late final RxBool serviceStop;
   RxBool serviceBtnEnabled = true.obs;
   final GlobalKey _minToolbarOptionKey = GlobalKey();
+
+  @override
+  void initState() {
+    super.initState();
+    serviceStop = !isWeb && Get.isRegistered<RxBool>(tag: 'stop-service')
+        ? Get.find<RxBool>(tag: 'stop-service')
+        : false.obs;
+  }
 
   @override
   Widget build(BuildContext context) {

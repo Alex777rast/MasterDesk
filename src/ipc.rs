@@ -366,6 +366,10 @@ pub enum FS {
         include_hidden: bool,
         conn_id: i32,
         overwrite_detection: bool,
+        parallel_transfer_id: String,
+        parallel_worker: u32,
+        range_start: u64,
+        range_len: u64,
     },
     CancelRead {
         id: i32,
@@ -376,6 +380,7 @@ pub enum FS {
         file_num: i32,
         skip: bool,
         offset_blk: u32,
+        resume_offset: u64,
         conn_id: i32,
     },
     ReadAllFiles {
@@ -609,6 +614,9 @@ pub enum Data {
         #[serde(skip)]
         data: bytes::Bytes,
         compressed: bool,
+        offset: u64,
+        parallel_transfer_id: String,
+        parallel_worker: u32,
         conn_id: i32,
     },
     /// File read completed successfully

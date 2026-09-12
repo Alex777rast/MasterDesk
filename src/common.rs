@@ -2,7 +2,10 @@ use std::{
     collections::HashMap,
     future::Future,
     net::{SocketAddr, ToSocketAddrs},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, RwLock,
+    },
     task::Poll,
 };
 
@@ -95,10 +98,17 @@ pub mod input {
 lazy_static::lazy_static! {
     pub static ref SOFTWARE_UPDATE_URL: Arc<Mutex<String>> = Default::default();
     pub static ref SOFTWARE_UPDATE_VERSION: Arc<Mutex<String>> = Default::default();
+    pub static ref SOFTWARE_UPDATE_ASSET_NAME: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_ID: Arc<Mutex<String>> = Default::default();
     pub static ref DEVICE_NAME: Arc<Mutex<String>> = Default::default();
     static ref PUBLIC_IPV6_ADDR: Arc<Mutex<(Option<SocketAddr>, Option<Instant>)>> = Default::default();
 }
+
+static SOFTWARE_UPDATE_CHECK_RUNNING: AtomicBool = AtomicBool::new(false);
+lazy_static::lazy_static! {
+    static ref SOFTWARE_UPDATE_LAST_CHECK: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+}
+const SOFTWARE_UPDATE_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
 
 lazy_static::lazy_static! {
     // Is server process, with "--server" args
@@ -583,7 +593,6 @@ impl Drop for CheckTestNatType {
 
 pub fn test_nat_type() {
     test_ipv6_sync();
-    use std::sync::atomic::{AtomicBool, Ordering};
     std::thread::spawn(move || {
         static IS_RUNNING: AtomicBool = AtomicBool::new(false);
         if IS_RUNNING.load(Ordering::SeqCst) {
@@ -957,16 +966,45 @@ pub fn check_software_update() {
     let is_portable = false;
 
     if should_check_software_update_for_runtime(update_enabled, is_masterdesk, is_portable) {
-        std::thread::spawn(move || allow_err!(do_check_software_update()));
+        let should_start = SOFTWARE_UPDATE_LAST_CHECK
+            .lock()
+            .map(|mut last| {
+                if last.map_or(false, |time| {
+                    time.elapsed() < SOFTWARE_UPDATE_CHECK_INTERVAL
+                }) {
+                    false
+                } else {
+                    *last = Some(std::time::Instant::now());
+                    true
+                }
+            })
+            .unwrap_or(false);
+        if should_start
+            && SOFTWARE_UPDATE_CHECK_RUNNING
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            std::thread::spawn(move || {
+                allow_err!(do_check_software_update());
+                SOFTWARE_UPDATE_CHECK_RUNNING.store(false, Ordering::SeqCst);
+            });
+        }
     } else if is_masterdesk && is_portable {
         log::info!("Skipping the automatic MasterDesk update request for a portable application.");
     }
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct MasterDeskUpdateManifest {
-    version: String,
-    url: String,
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct MasterDeskGithubRelease {
+    html_url: String,
+    draft: bool,
+    assets: Vec<GithubReleaseAsset>,
 }
 
 // No need to check `danger_accept_invalid_cert` here. Both the official
@@ -977,7 +1015,7 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let (request, official_url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
     let url = if is_masterdesk {
-        crate::custom_defaults::update_manifest_url()
+        crate::custom_defaults::GITHUB_LATEST_RELEASE_API.to_owned()
     } else {
         official_url
     };
@@ -988,7 +1026,11 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let tls_type = tls_type.unwrap_or(TlsType::Rustls);
     let client = create_http_client_async(tls_type, false);
     let request_result = if is_masterdesk {
-        client.get(&url).send().await
+        client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, "MasterDesk update checker")
+            .send()
+            .await
     } else {
         client.post(&url).json(&request).send().await
     };
@@ -1002,7 +1044,11 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
                 let tls_type = TlsType::NativeTls;
                 let client = create_http_client_async(tls_type, false);
                 let resp = if is_masterdesk {
-                    client.get(&url).send().await?
+                    client
+                        .get(&url)
+                        .header(reqwest::header::USER_AGENT, "MasterDesk update checker")
+                        .send()
+                        .await?
                 } else {
                     client.post(&url).json(&request).send().await?
                 };
@@ -1017,13 +1063,28 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     if bytes.len() > 64 * 1024 {
         bail!("Update manifest is too large");
     }
-    let (response_url, latest_release_version) = if is_masterdesk {
-        let resp: MasterDeskUpdateManifest = serde_json::from_slice(&bytes)?;
-        (resp.url, resp.version)
+    let (response_url, latest_release_version, asset_name) = if is_masterdesk {
+        let resp: MasterDeskGithubRelease = serde_json::from_slice(&bytes)?;
+        if resp.draft {
+            bail!("The latest MasterDesk release is a draft");
+        }
+        let asset = resp
+            .assets
+            .into_iter()
+            .find(|asset| {
+                crate::custom_defaults::is_expected_masterdesk_update_asset(&asset.name)
+                    && asset
+                        .browser_download_url
+                        .starts_with("https://github.com/Alex777rast/MasterDesk/releases/download/")
+            })
+            .ok_or_else(|| anyhow!("MasterDesk release has no supported Windows package"))?;
+        let version = crate::custom_defaults::masterdesk_update_asset_version(&asset.name)
+            .ok_or_else(|| anyhow!("Invalid MasterDesk release asset name"))?;
+        (resp.html_url, version, asset.name)
     } else {
         let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
         let version = resp.url.rsplit('/').next().unwrap_or_default().to_owned();
-        (resp.url, version)
+        (resp.url, version, String::new())
     };
     if latest_release_version.trim().is_empty() || !response_url.starts_with("https://") {
         bail!("Invalid update manifest");
@@ -1037,6 +1098,7 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     if is_newer {
         *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url.clone();
         *SOFTWARE_UPDATE_VERSION.lock().unwrap() = latest_release_version;
+        *SOFTWARE_UPDATE_ASSET_NAME.lock().unwrap() = asset_name;
         #[cfg(feature = "flutter")]
         {
             let mut m = HashMap::new();
@@ -1049,6 +1111,7 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     } else {
         *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
         *SOFTWARE_UPDATE_VERSION.lock().unwrap() = "".to_string();
+        *SOFTWARE_UPDATE_ASSET_NAME.lock().unwrap() = "".to_string();
     }
     Ok(())
 }
@@ -1869,6 +1932,17 @@ pub fn decode64<T: AsRef<[u8]>>(input: T) -> Result<Vec<u8>, base64::DecodeError
     base64::decode(input)
 }
 
+#[cfg(not(target_os = "ios"))]
+fn connection_key_from_ipc_options(
+    mut options: HashMap<String, String>,
+    configured_key: String,
+) -> String {
+    options
+        .remove("key")
+        .filter(|key| !key.is_empty())
+        .unwrap_or(configured_key)
+}
+
 pub async fn get_key(sync: bool) -> String {
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::windows::get_license_from_exe_name() {
@@ -1879,11 +1953,15 @@ pub async fn get_key(sync: bool) -> String {
     #[cfg(target_os = "ios")]
     let mut key = Config::get_option("key");
     #[cfg(not(target_os = "ios"))]
+    let configured_key = Config::get_option("key");
+    #[cfg(not(target_os = "ios"))]
     let mut key = if sync {
-        Config::get_option("key")
+        configured_key
     } else {
-        let mut options = crate::ipc::get_options_async().await;
-        options.remove("key").unwrap_or_default()
+        // The installed-server compatibility IPC deliberately omits protected
+        // network options. In that case keep using the compiled/local protected
+        // key instead of falling back to the public RustDesk rendezvous key.
+        connection_key_from_ipc_options(crate::ipc::get_options_async().await, configured_key)
     };
     if key.is_empty() {
         key = config::RS_PUB_KEY.to_owned();
@@ -2701,6 +2779,26 @@ mod tests {
         time::{interval, interval_at, sleep, Duration, Instant, Interval},
     };
     use std::collections::HashSet;
+
+    #[test]
+    fn ipc_options_keep_configured_key_when_protected_value_is_omitted() {
+        let configured_key = "masterdesk-server-key".to_owned();
+
+        assert_eq!(
+            connection_key_from_ipc_options(HashMap::new(), configured_key.clone()),
+            configured_key
+        );
+    }
+
+    #[test]
+    fn ipc_options_prefer_explicit_nonempty_key() {
+        let options = HashMap::from([("key".to_owned(), "ipc-server-key".to_owned())]);
+
+        assert_eq!(
+            connection_key_from_ipc_options(options, "configured-key".to_owned()),
+            "ipc-server-key"
+        );
+    }
 
     #[test]
     fn masterdesk_release_name_is_a_portable_or_update_package() {

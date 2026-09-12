@@ -36,8 +36,8 @@ The major layers are:
 - `src/rendezvous_mediator.rs`: ID registration, authenticated installation
   leases, online state, direct/relay negotiation and WSS/native registration.
 - `src/client.rs` and `src/client/io_loop.rs`: controller-side session loop,
-  ordinary file jobs, parallel worker negotiation, upload workers, telemetry,
-  fallback and resume initiation.
+  ordinary file jobs, parallel worker negotiation, upload/download workers,
+  telemetry, fallback and resume initiation.
 - `src/server/connection.rs`: controlled-side authorization, input queue,
   clipboard/file messages, parallel receive/finalize and session permissions.
 - `libs/hbb_common/`: protobufs, config, security payloads, identity and shared
@@ -117,6 +117,27 @@ queue; the receiver performs positioned writes and final verification. The
 configured modes are Auto, 1x/off, 2x, 4x and 8x. A peer without the feature or
 a negotiation/worker failure must fall back safely to the legacy stream.
 
+For a large single-file File Manager receive, the controller registers a
+one-time transfer authorization on the primary connection and opens auxiliary
+authenticated range readers back to the controlled peer. The controlled side
+seeks and bounds every range; the controller validates transfer ID, worker and
+absolute block offsets before positioned writes. The separate
+`parallel_file_download_v1` capability prevents older peers from entering this
+directional protocol.
+
 Resume state is intended to preserve a contiguous completed prefix and restart
-parallel workers at that offset. Current runtime gaps are listed only in
-[current-state.md](current-state.md).
+parallel workers at that offset. The resume offset is 64-bit; interrupted
+parallel receivers truncate speculative out-of-order tail ranges to the last
+contiguous byte before persisting the job. Current runtime gaps are listed only
+in [current-state.md](current-state.md).
+
+## Installed-client updates
+
+The main Flutter window requests an update check after startup/resume and on
+window focus. Rust throttles checks, queries the official MasterDesk GitHub
+latest-release API, validates the dated Windows asset name and publishes the
+release page/version to the existing Update card. The integrated downloader
+derives the release download URL from that page and the validated dynamic asset
+name. Windows verifies the same-release SHA-256 before running the existing
+elevated replacement path. Automatic checks are restricted to installed
+MasterDesk clients.
