@@ -85,3 +85,6 @@ foreach($case in $cases){
     $passed++
 }
 Write-Output "PASS defaults-scope=$passed (full-by-default guard, incremental AOT guard, valid server/API fixture, fail-closed fixtures) evidence=$output"
+# Expected negative native fixtures must not leak exit=1 to GitHub's pwsh tail.
+# This is reached only after every positive and fail-closed assertion passes.
+exit 0
