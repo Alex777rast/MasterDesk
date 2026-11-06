@@ -22,7 +22,9 @@ The build was not rerun and the package was not modified, signed or installed.
 
 Artifact:MasterDesk-1.4.9-10-beta-108-2026-11-06-RDS-x86_64.exe
 SHA256:0A21163AC5D3DA8448C645195E3F26746B43E772FF4E9CDDE74955CAD934E0E3
-Actual CLI version:1.4.9-10 beta108; build date:2026-11-06 14:14.
+Actual CLI version:1.4.9-10 beta 108; build date:2026-11-06 14:14.
+Local pure portable decoding also matched all100 payload files byte-for-byte;
+the extraction wrapper and client CLI were not run on the maintainer host.
 These are packaging/identity checks, not GUI/install/update/network-performance
 or SmartScreen acceptance. No signing credential/request or release step ran.
 
