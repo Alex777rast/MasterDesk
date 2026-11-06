@@ -60,8 +60,18 @@ if(-not $refused -or (Get-FileHash $signedFixture).Hash -cne $signedHash){throw 
 $passed++
 $parsed=@('Set-MasterDeskPeMetadata.ps1','Test-MasterDeskSigningSource.ps1',
     'Test-MasterDeskSigningPreparation.ps1','Build-CustomWindows.ps1','New-MasterDeskSigningInventory.ps1',
-    'Test-DesktopDropWindowsPatch.ps1','Test-CustomDefaults.ps1','Test-ServerDefaults.ps1','Test-DefaultsScope.ps1')
+    'Test-DesktopDropWindowsPatch.ps1','Test-CustomDefaults.ps1','Test-ServerDefaults.ps1','Test-DefaultsScope.ps1',
+    'Test-HostedCliProof.ps1')
 foreach($name in $parsed){$tokens=$null;$errors=$null;[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name),[ref]$tokens,[ref]$errors)|Out-Null;if($errors){throw ('Syntax error: '+$name)}}
+
+# CODEOWNERS must name its actual security-sensitive location. The file alone
+# does not claim branch-protection enforcement or provider approval.
+$owners=Get-Content -LiteralPath (Join-Path $repo '.github/CODEOWNERS') -Raw
+$selfRule='(?m)^/\.github/CODEOWNERS[ \t]+@Alex777rast[ \t]*\r?$'
+if($owners -notmatch $selfRule){throw 'CODEOWNERS does not cover its actual path'}
+$legacyRule=$owners.Replace('/.github/CODEOWNERS','/CODEOWNERS')
+if($legacyRule -match $selfRule){throw 'Wrong-root CODEOWNERS fixture was accepted'}
+$ownershipCases=2
 
 # Isolated Git fixtures only: never stage/commit the actual user worktree.
 function Git-Fixture([string]$Directory,[string[]]$Arguments){
@@ -109,6 +119,6 @@ Git-Fixture $source @('add','synthetic-token.txt')
 & $gate -RepositoryRoot $source -OutputPath (Join-Path $out 'source-secret-indicator.json') -ReportOnly | Out-Null
 $indicator=Get-Content (Join-Path $out 'source-secret-indicator.json') -Raw|ConvertFrom-Json
 if($indicator.SecretIndicatorPaths -notcontains 'synthetic-token.txt' -or $indicator.Status -cne 'NOT_READY'){throw 'Secret-indicator guard failed'}
-[ordered]@{Status='PASS';MetadataAndGuards=$passed;SourceGateCases=4;SyntaxFiles=$parsed;FixturesNeverExecuted=$true;Evidence=$out}|
+[ordered]@{Status='PASS';MetadataAndGuards=$passed;SourceGateCases=4;OwnershipCases=$ownershipCases;SyntaxFiles=$parsed;FixturesNeverExecuted=$true;Evidence=$out}|
     ConvertTo-Json -Depth 3 | Set-Content (Join-Path $out 'result.json')
-Write-Output "PASS metadata/guards=$passed source-gates=4 syntax=$($parsed.Count) fixtures-not-executed evidence=$out"
+Write-Output "PASS metadata/guards=$passed source-gates=4 ownership=$ownershipCases syntax=$($parsed.Count) fixtures-not-executed evidence=$out"

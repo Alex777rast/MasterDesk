@@ -1,43 +1,43 @@
 # Current public source state
 
-## 2026-11-06 unsigned hosted client preparation, candidate108+
+## 2026-11-06 unsigned x64 preparation verified; Foundation review pending
 
-The Foundation acknowledged the project application; it remains under review.
-This is not an active certificate, signed release or SmartScreen acceptance.
-Existing beta105 releases and the website/server are unchanged by this branch.
+The owner confirmed receipt of the Foundation application. This is not provider
+approval, an active certificate, a signed release or SmartScreen acceptance.
+Existing beta105 assets/tags and the website/server remain unchanged.
 
-The reviewed source snapshot includes corresponding hbb_common source and the
-installed-client DPAPI import fix, existing WinPE/transfer/profile code and x64
-signing preparation. Source publication does not rewrite older release tags or
-make historical automatic source archives exact sources for local dirty builds.
+The complete hosted beta108 build and client validation succeeded:
+https://github.com/Alex777rast/MasterDesk/actions/runs/42231650980
+Exact build source:99441ca7182f49b55b6e62726b50850c24343018.
+Exact shared gitlink:1afc2f9d89e0e462da2cbf080e54f80e8f6984a2.
+Client assertions and22 Rust tests passed; the source gate and package/payload
+inventories were uploaded. Server checks are explicitly NOT_RUN in client-only
+CI, not a server validation PASS. The full defaults gate still includes them.
 
-Local unsigned106 and hosted107 are reserved and must not be reissued. Hosted107
-successfully built its EXE, but the later mixed client/server defaults gate
-failed because private server deployment files were intentionally not published.
-No107 artifact upload or complete pipeline acceptance was obtained.
+An independent disposable GitHub Windows VM verified those existing artifacts,
+their archive digests, payload hashes, owned PE metadata and runner/core CLI:
+https://github.com/Alex777rast/MasterDesk/actions/runs/42239997357
+Verification-tool source:0be09bf23715e5b65a319902290d99969dfafcbd.
+The build was not rerun and the package was not modified, signed or installed.
 
-This branch retains the full defaults gate by default and adds explicit public
-client-only selection. All client source/Rust/update/IPC/portable assertions
-remain enabled. Server patch and update-API service checks are available in
-Test-ServerDefaults.ps1 and still run from the default full gate; client-only
-CI reports them NOT_RUN, never server PASS. Dedicated fixtures verify separation
-and fail-closed source/security guards. Stale implementation-name assertions
-were aligned to the current incremental AOT and installed-server/handoff paths,
-with IPC/handoff Rust regression filters included. No runtime behavior changed.
+Artifact:MasterDesk-1.4.9-10-beta-108-2026-11-06-RDS-x86_64.exe
+SHA256:0A21163AC5D3DA8448C645195E3F26746B43E772FF4E9CDDE74955CAD934E0E3
+Actual CLI version:1.4.9-10 beta108; build date:2026-11-06 14:14.
+These are packaging/identity checks, not GUI/install/update/network-performance
+or SmartScreen acceptance. No signing credential/request or release step ran.
 
-The manual GitHub-hosted workflow builds a new unsigned beta108 or later from
-the exact source checkout, validates it and uploads package/payload inventories.
-It has read-only repository permissions, no signing credential/submission,
-automatic release/site update or production deployment. Do not represent local
-binaries as GitHub-hosted output. Successful compilation alone is not a passed
-pipeline, new GUI/runtime acceptance or provider-verified provenance.
+Local106, hosted107 and hosted108 identities are reserved. New full builds use
+109+; artifact-only proof may inspect existing108 but must never rebuild or
+rename old output. Source-only review/ownership changes do not change108 bytes.
+CODEOWNERS now names its actual .github/CODEOWNERS location, with positive and
+wrong-root regression cases; the file alone does not enforce branch protection.
 
-Pending: successful hosted artifacts and their independent hash/extraction/
-identity checks, complete dependency licensing/SBOM review, maintainer MFA,
-Foundation eligibility and later reviewed origin/artifact policy configuration.
-Actual signing must cover owned payload first, package exact signed bytes,
-then sign/verify the outer package. Provider setup and public release remain
-separate authorized stages. x86/WinPE signing is outside this x64 application.
+Still open: maintainer MFA confirmation, dependency notices/license/SBOM review,
+Foundation eligibility and later explicit origin/artifact/reviewer setup.
+Cargo/Flutter/native inventories are supporting evidence, not legal clearance.
+Signing must cover approved owned payload first, then its recomputed manifest,
+then the exact packed outer EXE. x86/WinPE signing is outside this x64 scope.
+Public default-branch/site promotion and release publication are separate owner
+decisions. No personal contact details or private lab/deployment logs are added.
 
-See docs/signing-x64-preparation.md, SIGNING_POLICY.md and PRIVACY.md. Private
-contact data, lab logs and deployment configuration are not newly published.
+See docs/signing-x64-preparation.md, SIGNING_POLICY.md and PRIVACY.md.

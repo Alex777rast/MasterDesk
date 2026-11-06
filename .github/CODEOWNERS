@@ -1,7 +1,7 @@
 # Security-sensitive release and signing configuration
 /.github/workflows/ @Alex777rast
 /.signpath/ @Alex777rast
-/CODEOWNERS @Alex777rast
+/.github/CODEOWNERS @Alex777rast
 /SIGNING_POLICY.md @Alex777rast
 /scripts/*Signing*.ps1 @Alex777rast
 /scripts/Set-MasterDeskPeMetadata.ps1 @Alex777rast
