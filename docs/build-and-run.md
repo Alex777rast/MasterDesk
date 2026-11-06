@@ -63,6 +63,14 @@ Pop-Location
 
 Run only those applicable to the changed path.
 
+The defaults gate above retains client AND local server/API checks by default.
+For the public client-only signing workflow, use
+`scripts/Test-CustomDefaults.ps1 -ClientOnly`: all client source/Rust/portable
+checks remain enabled; excluded deployment checks are reported as NOT_RUN,
+not server PASS. Server/API checks are also available independently through
+`scripts/Test-ServerDefaults.ps1`. `scripts/Test-DefaultsScope.ps1` verifies the
+split and fail-closed fixtures without private deployment files.
+
 ## Cached incremental candidate
 
 Preferred wrapper; it runs the targeted gate, chooses the next beta when
@@ -180,7 +188,8 @@ main GUI and update processes use different current/dated names.
   adds signing-preparation requirements (including the pinned custom-engine
   archive on full setup), but does not sign, upload, install or publish anything.
   See [x64 preparation](signing-x64-preparation.md). Local unsigned beta106 was
-  used for verification; a future hosted proof build starts at beta107 or later.
+  used for verification. Hosted107 built but its final mixed-scope gate failed;
+  both106/107 are reserved. The next hosted proof starts at beta108 or later.
 - The custom build applies reproducible patches to the cached `desktop_drop`
   Windows source. If the upstream package signature changes, the build fails
   closed instead of silently omitting the patch.

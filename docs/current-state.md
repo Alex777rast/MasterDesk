@@ -1,43 +1,43 @@
 # Current public source state
 
-## 2026-11-06 reviewed client snapshot and x64 signing preparation
+## 2026-11-06 unsigned hosted client preparation, candidate108+
 
-This branch publishes reviewed current MasterDesk client sources and the
-modified hbb_common commit. It includes the installed-client DPAPI import fix,
-existing WinPE/parallel-transfer support, protected-profile code and tests, plus
-local x64 signing-preparation work. It is not a new binary release and does not
-rewrite the immutable beta105 tag or assets. Historical base commits and
-automatic source archives at older tags must not be represented as exact
-snapshots of locally modified beta binaries.
+The Foundation acknowledged the project application; it remains under review.
+This is not an active certificate, signed release or SmartScreen acceptance.
+Existing beta105 releases and the website/server are unchanged by this branch.
 
-Published beta105 remains unsigned. A local unsigned beta106 packaging proof
-was checked for metadata, self-extraction, runner/core DLL loading and exact
-owned payload hashes. Its package SHA256 is
-82A21B2FFBA8E1CE74DA9F08D27C96ACF90BAA77164465E8FBDC6152B47DE958.
-It is not GitHub-hosted provenance and must not be reissued as a different106.
-The next hosted proof candidate is107 or later.
+The reviewed source snapshot includes corresponding hbb_common source and the
+installed-client DPAPI import fix, existing WinPE/transfer/profile code and x64
+signing preparation. Source publication does not rewrite older release tags or
+make historical automatic source archives exact sources for local dirty builds.
 
-The masterdesk-windows.yml workflow is manual, uses read-only repository
-permissions and uploads unsigned evidence only. It verifies clean source and
-submodules before building on GitHub-hosted Windows. It has no automatic
-release/site update, signing secret or signing submission. Changes to GitHub
-Release, the website, server configuration and signing/provider accounts need
-separate explicit authority; source publication alone does not authorize them.
+Local unsigned106 and hosted107 are reserved and must not be reissued. Hosted107
+successfully built its EXE, but the later mixed client/server defaults gate
+failed because private server deployment files were intentionally not published.
+No107 artifact upload or complete pipeline acceptance was obtained.
 
-Local checks passed:7 metadata/guard cases,4 source-gate fixtures,5 PowerShell
-syntax checks, actionlint, cached x64 build and package/CLI/hash smoke. This is
-not GUI, installed-update, remote-session or signed-SmartScreen acceptance.
-Previously reported field/lab results are not blanket acceptance for a new
-hosted candidate.
+This branch retains the full defaults gate by default and adds explicit public
+client-only selection. All client source/Rust/update/IPC/portable assertions
+remain enabled. Server patch and update-API service checks are available in
+Test-ServerDefaults.ps1 and still run from the default full gate; client-only
+CI reports them NOT_RUN, never server PASS. Dedicated fixtures verify separation
+and fail-closed source/security guards. Stale implementation-name assertions
+were aligned to the current incremental AOT and installed-server/handoff paths,
+with IPC/handoff Rust regression filters included. No runtime behavior changed.
 
-Next: run the manual unsigned beta107+ proof from the reviewed source branch;
-review dependency licenses/SBOM, public policies, MFA/review controls, origin and
-artifact rules with SignPath. Foundation approval, certificate/timestamp and
-payload-first/package-second signing activation have not been established.
-Do not submit local binaries as hosted artifacts or claim SmartScreen bypass.
-x86/Sciter signing and WinPE images are outside this x64 application scope.
+The manual GitHub-hosted workflow builds a new unsigned beta108 or later from
+the exact source checkout, validates it and uploads package/payload inventories.
+It has read-only repository permissions, no signing credential/submission,
+automatic release/site update or production deployment. Do not represent local
+binaries as GitHub-hosted output. Successful compilation alone is not a passed
+pipeline, new GUI/runtime acceptance or provider-verified provenance.
+
+Pending: successful hosted artifacts and their independent hash/extraction/
+identity checks, complete dependency licensing/SBOM review, maintainer MFA,
+Foundation eligibility and later reviewed origin/artifact policy configuration.
+Actual signing must cover owned payload first, package exact signed bytes,
+then sign/verify the outer package. Provider setup and public release remain
+separate authorized stages. x86/WinPE signing is outside this x64 application.
 
 See docs/signing-x64-preparation.md, SIGNING_POLICY.md and PRIVACY.md. Private
-lab logs, snapshots, deployment secrets and handoff records are intentionally
-not included in this public source snapshot. No credentials belong in source,
-test output or published build artifacts.
+contact data, lab logs and deployment configuration are not newly published.

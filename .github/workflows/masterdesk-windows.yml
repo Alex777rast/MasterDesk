@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       beta_number:
-        description: "New beta newer than every release (minimum 107; 106 is a local proof)"
+        description: "New beta newer than every release (minimum 108; 106/107 are reserved proofs)"
         required: true
         type: string
-        default: "107"
+        default: "108"
 
 permissions:
   contents: read
@@ -46,7 +46,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           if ($env:REQUESTED_BETA -notmatch '^[1-9][0-9]{0,4}$') { throw 'Invalid beta input' }
           $beta = [int]$env:REQUESTED_BETA
-          if ($beta -lt 107 -or $beta -gt 65535) { throw 'Beta must be 107..65535; local106 is already reserved' }
+          if ($beta -lt 108 -or $beta -gt 65535) { throw 'Beta must be 108..65535; local106 and hosted107 are already reserved' }
           $headers = @{Authorization="Bearer $env:GITHUB_TOKEN";'User-Agent'='MasterDesk-signing-preparation'}
           $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/Alex777rast/MasterDesk/releases?per_page=100'
           foreach ($release in $releases) {
@@ -94,6 +94,7 @@ jobs:
         run: |
           .\scripts\Test-MasterDeskSigningPreparation.ps1
           .\scripts\Test-DesktopDropWindowsPatch.ps1
+          .\scripts\Test-DefaultsScope.ps1
 
       - name: Full x64 build with matching PE metadata
         shell: pwsh
@@ -108,7 +109,7 @@ jobs:
         shell: pwsh
         run: |
           $env:MASTERDESK_LLVM_BIN = Split-Path (Get-Command clang.exe).Source
-          .\scripts\Test-CustomDefaults.ps1
+          .\scripts\Test-CustomDefaults.ps1 -ClientOnly
           .\scripts\New-MasterDeskSigningInventory.ps1 -BetaNumber ([int]$env:MASTERDESK_CANDIDATE_BETA) -OutputDirectory artifacts/signing/evidence
 
       - name: Upload unsigned package and source evidence

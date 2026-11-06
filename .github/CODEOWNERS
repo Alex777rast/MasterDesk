@@ -7,4 +7,5 @@
 /scripts/Set-MasterDeskPeMetadata.ps1 @Alex777rast
 /scripts/Build-CustomWindows.ps1 @Alex777rast
 /scripts/Test-DesktopDropWindowsPatch.ps1 @Alex777rast
+/scripts/Test-*Defaults*.ps1 @Alex777rast
 /docs/signing-x64-preparation.md @Alex777rast

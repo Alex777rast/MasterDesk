@@ -1,6 +1,8 @@
 # x64 signing preparation
 
 Status: local preparation, **not Foundation approval and not a signed release**.
+The Foundation acknowledged the project application on2026-11-06; approval is
+pending. Reviewed sources are public on `codex/x64-signing-source-20261106`.
 The current scope is Windows x64 Flutter only. Published beta105, its GitHub
 tag/assets, website, API and mirrors must remain unchanged. x86/Sciter and
 WinPE images are excluded. No credentials belong in source or review artifacts.
@@ -38,7 +40,8 @@ WinPE images are excluded. No credentials belong in source or review artifacts.
 5. After publishing the reviewed source, manually run the unsigned preparation
    workflow on that branch with a beta newer than every existing release.
    Local proof beta106 is already reserved; the next hosted candidate starts
-   at107 or higher, never a different binary reusing the local106 identity.
+   at108 or higher: local106 and the built-but-not-uploaded hosted107 are
+   reserved, never reissue a different binary under either identity.
    All steps use GitHub-hosted agents; application/native caches are not restored.
    Inspect the exact build, tests, inventory and artifact provenance.
 
@@ -49,6 +52,13 @@ Local helper checks (do not publish artifacts as signed):
 .\scripts\Test-MasterDeskSigningSource.ps1 -ReportOnly `
   -OutputPath artifacts/signing/source-readiness.json
 ```
+
+The hosted client gate uses `Test-CustomDefaults.ps1 -ClientOnly`, retaining
+client source, Rust defaults/IPC/update and portable checks. Server deployment
+and API-service checks remain enabled by default in the full defaults gate and
+in `Test-ServerDefaults.ps1`; they are explicitly NOT_RUN in client-only CI.
+No private deployment files need publication. `Test-DefaultsScope.ps1` checks
+the separation and negative fixtures before the expensive hosted build.
 
 An optional local new-beta verification build can use the existing caches:
 

@@ -60,7 +60,7 @@ if(-not $refused -or (Get-FileHash $signedFixture).Hash -cne $signedHash){throw 
 $passed++
 $parsed=@('Set-MasterDeskPeMetadata.ps1','Test-MasterDeskSigningSource.ps1',
     'Test-MasterDeskSigningPreparation.ps1','Build-CustomWindows.ps1','New-MasterDeskSigningInventory.ps1',
-    'Test-DesktopDropWindowsPatch.ps1')
+    'Test-DesktopDropWindowsPatch.ps1','Test-CustomDefaults.ps1','Test-ServerDefaults.ps1','Test-DefaultsScope.ps1')
 foreach($name in $parsed){$tokens=$null;$errors=$null;[Management.Automation.Language.Parser]::ParseFile((Join-Path $PSScriptRoot $name),[ref]$tokens,[ref]$errors)|Out-Null;if($errors){throw ('Syntax error: '+$name)}}
 
 # Isolated Git fixtures only: never stage/commit the actual user worktree.
@@ -83,6 +83,7 @@ $required=@('Cargo.lock','Cargo.toml','src/core_main.rs','src/platform/windows/i
     'scripts/Set-MasterDeskPeMetadata.ps1','scripts/Test-MasterDeskSigningSource.ps1',
     'scripts/Test-MasterDeskSigningPreparation.ps1','scripts/New-MasterDeskSigningInventory.ps1',
     'scripts/Test-DesktopDropWindowsPatch.ps1',
+    'scripts/Test-CustomDefaults.ps1','scripts/Test-ServerDefaults.ps1','scripts/Test-DefaultsScope.ps1',
     'docs/signing-x64-preparation.md',
     'SIGNING_POLICY.md','PRIVACY.md','NOTICE','.github/workflows/masterdesk-windows.yml')
 foreach($relative in $required){

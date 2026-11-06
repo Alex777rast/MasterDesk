@@ -14,6 +14,7 @@ $required = @('Cargo.lock','Cargo.toml','src/core_main.rs','src/platform/windows
     'scripts/Set-MasterDeskPeMetadata.ps1','scripts/Test-MasterDeskSigningSource.ps1',
     'scripts/Test-MasterDeskSigningPreparation.ps1','scripts/New-MasterDeskSigningInventory.ps1',
     'scripts/Test-DesktopDropWindowsPatch.ps1',
+    'scripts/Test-CustomDefaults.ps1','scripts/Test-ServerDefaults.ps1','scripts/Test-DefaultsScope.ps1',
     'docs/signing-x64-preparation.md',
     'SIGNING_POLICY.md','PRIVACY.md','NOTICE','.github/workflows/masterdesk-windows.yml')
 $missing = @()

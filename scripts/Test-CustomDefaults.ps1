@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$ClientOnly)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
@@ -204,28 +204,10 @@ if ($serverConnection -match 'should_sync_keyboard_layout_after_key' -or
     throw 'The stale peer-KLID feedback path can still override the controller layout.'
 }
 
-$serverPatch = Join-Path $ProjectRoot 'deploy\masterdesk-server\masterdesk-server-a7736be.patch'
-$serverPatchScript = Join-Path $ProjectRoot 'deploy\masterdesk-server\Apply-MasterDeskServerPatch.ps1'
-$caddyExample = Join-Path $ProjectRoot 'deploy\masterdesk-server\Caddyfile.example'
-foreach ($serverArtifact in @($serverPatch, $serverPatchScript, $caddyExample)) {
-    if (-not (Test-Path -LiteralPath $serverArtifact)) {
-        throw "Server security artifact is missing: $serverArtifact"
-    }
-}
-$serverPatchSource = Get-Content -LiteralPath $serverPatch -Raw
-foreach ($serverSecurityMarker in @(
-    'require-relay-ticket',
-    'relay_ed25519',
-    'CONSUMED_TICKETS',
-    'MAX_ACTIVE_PER_IP',
-    'DEVICE_LEASE_TIMEOUT'
-)) {
-    if ($serverPatchSource -notmatch [regex]::Escape($serverSecurityMarker)) {
-        throw "Server security patch is missing $serverSecurityMarker."
-    }
-}
-if ($serverPatchSource -notmatch 'if\s+!relay_security_required\(\)\s*\{\s*\+?\s*return true;') {
-    throw 'Server compatibility mode can still reject partially upgraded clients.'
+if (-not $ClientOnly) {
+    & (Join-Path $PSScriptRoot 'Test-ServerDefaults.ps1') -RepositoryRoot $ProjectRoot
+} else {
+    Write-Output 'SERVER_DEFAULTS=NOT_RUN scope=ClientOnly (not a server validation PASS)'
 }
 
 if ($flutterCommon -notmatch 'kCheckSoftwareUpdateFinish') {
@@ -270,7 +252,8 @@ if ($buildScript -match '(?i)-install\.exe') {
 }
 if ($buildScript -notmatch 'RefreshFlutterAot' -or
     $buildScript -notmatch 'tool_backend\.bat' -or
-    $buildScript -notmatch "@\('windows-x64', 'Release'\)" -or
+    $buildScript -notmatch 'Invoke-IncrementalFlutterAotBuild' -or
+    $buildScript -notmatch 'windows-x64 Release' -or
     $buildScript -notmatch "-Filter 'app\.so'") {
     throw 'The targeted Dart UI path does not refresh only the cached Flutter runner.'
 }
@@ -304,8 +287,9 @@ if ($coreMain -notmatch 'is_cur_exe_the_installed\(\)' -or
     $coreMain -notmatch 'remove_var\(crate::common::PORTABLE_APPNAME_RUNTIME_ENV_KEY\)') {
     throw 'The installed executable does not clear the inherited portable package marker.'
 }
-if ($coreMain -notmatch 'should_use_installed_gui_compat' -or
-    $coreMain -notmatch 'Portable GUI will use the installed MasterDesk server') {
+if ($coreMain -notmatch 'args\.is_empty\(\)\s*&&\s*crate::ipc::should_use_installed_server_identity\(\)' -or
+    $coreMain -notmatch 'if attach_to_installed_server\s*\{' -or
+    $coreMain -notmatch 'MasterDesk GUI will use the service-owned installed server') {
     throw 'Portable MasterDesk can start a second server instead of attaching to the installed GUI compatibility IPC.'
 }
 
@@ -333,7 +317,7 @@ if ($coreMain -notmatch '--wait-for-portable' -or
     $windowsPlatform -notmatch 'wait_for_current_process') {
     throw 'The installed GUI does not wait for the portable installer to release IPC.'
 }
-$earlyHandoff = $coreMain.IndexOf('wait_for_portable_handoff_before_initialization();')
+$earlyHandoff = $coreMain.IndexOf('if complete_portable_handoff_before_initialization()')
 $globalInit = $coreMain.IndexOf('crate::common::global_init()')
 if ($earlyHandoff -lt 0 -or $globalInit -lt 0 -or $earlyHandoff -gt $globalInit) {
     throw 'The portable handoff wait must happen before global initialization and IPC bootstrap.'
@@ -360,7 +344,8 @@ if ($windowsPlatform -notmatch 'application_display_version\(\)' -or
     throw 'The installed MasterDesk build number is not persisted for update comparisons.'
 }
 if ($windowsPlatform -notmatch 'No previous main window found; opening the updated application' -or
-    $windowsPlatform -notmatch 'vec!\["--wait-for-portable", &updater_pid\]') {
+    $windowsPlatform -notmatch 'update_restore_arguments\(use_portable_handoff, &updater_pid\)' -or
+    $windowsPlatform -notmatch 'vec!\["--wait-for-portable", updater_pid\]') {
     throw 'The updater does not wait for the portable process before reopening the main MasterDesk window.'
 }
 
@@ -375,26 +360,6 @@ $flutterFfi = Get-Content -LiteralPath (Join-Path $ProjectRoot 'src\flutter_ffi.
 if ($flutterFfi -notmatch 'verify_masterdesk_update_package') {
     throw 'The interactive updater does not verify the downloaded MasterDesk package.'
 }
-
-$updateManifest = Get-Content -LiteralPath (Join-Path $ProjectRoot 'deploy\masterdesk-api\latest.json') -Raw |
-    ConvertFrom-Json
-if ($updateManifest.version -notmatch '^\d+\.\d+\.\d+-\d+$') {
-    throw 'The MasterDesk update manifest version is not in the expected numeric format.'
-}
-if ($updateManifest.url -notmatch '^https://') {
-    throw 'The MasterDesk update manifest release URL must use HTTPS.'
-}
-
-$pythonCommand = Get-Command python.exe -ErrorAction SilentlyContinue
-if (-not $pythonCommand) {
-    throw 'Python is required to test the update-manifest refresh service.'
-}
-Invoke-NativeChecked $pythonCommand.Source @(
-    '-m', 'unittest', 'discover',
-    '-s', (Join-Path $ProjectRoot 'deploy\masterdesk-api'),
-    '-p', 'test_*.py',
-    '-v'
-) 'Update-manifest tests failed'
 
 Push-Location $ProjectRoot
 try {
@@ -413,7 +378,9 @@ try {
     foreach ($testName in @(
         'masterdesk_release_name_is_a_portable_or_update_package',
         'portable_masterdesk_skips_automatic_update_check',
-        'parses_only_the_expected_release_checksum'
+        'parses_only_the_expected_release_checksum',
+        'gui_compat_',
+        'failed_update_restores_legacy_gui_without_new_handoff_argument'
     )) {
         Invoke-NativeChecked (Join-Path $CargoBin 'cargo.exe') @(
             'test',
@@ -446,3 +413,4 @@ try {
 } finally {
     Pop-Location
 }
+Write-Output ('DEFAULTS_GATE=PASS scope='+$(if($ClientOnly){'ClientOnly'}else{'ClientAndServer'}))
