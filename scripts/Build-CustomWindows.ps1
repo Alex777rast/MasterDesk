@@ -341,6 +341,8 @@ function Initialize-DesktopDropWindowsPatch {
                          : DROPEFFECT_NONE;
     }
 '@
+    # Git checkouts can use CRLF even when the plugin is normalized to LF.
+    $effectSelection = $effectSelection.Replace("`r`n", "`n")
 
     $changed = $false
     $patchedCount = ([regex]::Matches(
@@ -391,6 +393,8 @@ function Initialize-DesktopDropWindowsPatch {
                     }
                 }
 '@
+    $hdropOld = $hdropOld.Replace("`r`n", "`n")
+    $hdropNew = $hdropNew.Replace("`r`n", "`n")
     $oldHdropCount = ([regex]::Matches($normalized, [regex]::Escape($hdropOld))).Count
     $newHdropCount = ([regex]::Matches($normalized, [regex]::Escape($hdropNew))).Count
     if ($oldHdropCount -eq 1 -and $newHdropCount -eq 0) {

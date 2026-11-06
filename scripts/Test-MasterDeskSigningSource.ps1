@@ -13,6 +13,7 @@ $required = @('Cargo.lock','Cargo.toml','src/core_main.rs','src/platform/windows
     'flutter/lib/common/peer_thumbnail_cache.dart','scripts/Build-CustomWindows.ps1',
     'scripts/Set-MasterDeskPeMetadata.ps1','scripts/Test-MasterDeskSigningSource.ps1',
     'scripts/Test-MasterDeskSigningPreparation.ps1','scripts/New-MasterDeskSigningInventory.ps1',
+    'scripts/Test-DesktopDropWindowsPatch.ps1',
     'docs/signing-x64-preparation.md',
     'SIGNING_POLICY.md','PRIVACY.md','NOTICE','.github/workflows/masterdesk-windows.yml')
 $missing = @()

@@ -91,7 +91,9 @@ jobs:
 
       - name: Test metadata and policy helpers
         shell: pwsh
-        run: .\scripts\Test-MasterDeskSigningPreparation.ps1
+        run: |
+          .\scripts\Test-MasterDeskSigningPreparation.ps1
+          .\scripts\Test-DesktopDropWindowsPatch.ps1
 
       - name: Full x64 build with matching PE metadata
         shell: pwsh
