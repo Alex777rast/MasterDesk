@@ -9,6 +9,16 @@ on:
         required: true
         type: string
         default: "108"
+      proof_run_id:
+        description: "Optional: verify existing successful preparation artifacts only; do not rebuild"
+        required: false
+        type: string
+        default: ""
+      proof_source_commit:
+        description: "Required for artifact-only proof: exact reviewed build commit (40 hex)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -24,7 +34,7 @@ env:
 
 jobs:
   prepare:
-    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref_type == 'branch' }}
+    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref_type == 'branch' && inputs.proof_run_id == '' }}
     name: Build unsigned x64 evidence, without publication
     runs-on: windows-2022
     timeout-minutes: 180
@@ -41,9 +51,11 @@ jobs:
         shell: pwsh
         env:
           REQUESTED_BETA: ${{ inputs.beta_number }}
+          PROOF_SOURCE_COMMIT: ${{ inputs.proof_source_commit }}
           GITHUB_TOKEN: ${{ github.token }}
         run: |
           $ErrorActionPreference = 'Stop'
+          if ($env:PROOF_SOURCE_COMMIT) { throw 'Artifact-only proof needs both proof inputs; no build started' }
           if ($env:REQUESTED_BETA -notmatch '^[1-9][0-9]{0,4}$') { throw 'Invalid beta input' }
           $beta = [int]$env:REQUESTED_BETA
           if ($beta -lt 108 -or $beta -gt 65535) { throw 'Beta must be 108..65535; local106 and hosted107 are already reserved' }
@@ -130,6 +142,61 @@ jobs:
           path: flutter/build/windows/x64/runner/Release/
           if-no-files-found: error
           retention-days: 14
+
+  verify_existing:
+    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref_type == 'branch' && inputs.proof_run_id != '' }}
+    name: Verify existing unsigned artifacts without rebuilding
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Check out verification tools only
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Require successful reviewed preparation source
+        shell: pwsh
+        env:
+          PROOF_RUN_ID: ${{ inputs.proof_run_id }}
+          PROOF_SOURCE_COMMIT: ${{ inputs.proof_source_commit }}
+          PROOF_BETA: ${{ inputs.beta_number }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference='Stop'
+          if ($env:PROOF_RUN_ID -notmatch '^[1-9][0-9]{0,19}$' -or
+              $env:PROOF_SOURCE_COMMIT -notmatch '^[0-9a-f]{40}$' -or
+              $env:PROOF_BETA -notmatch '^[1-9][0-9]{0,4}$' -or
+              [int]$env:PROOF_BETA -lt 108 -or [int]$env:PROOF_BETA -gt 65535) { throw 'Invalid proof inputs' }
+          $headers=@{Authorization="Bearer $env:GITHUB_TOKEN";'User-Agent'='MasterDesk-artifact-proof'}
+          $run=Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/Alex777rast/MasterDesk/actions/runs/$env:PROOF_RUN_ID"
+          if ($run.conclusion -cne 'success' -or $run.workflow_id -ne 323927768 -or
+              $run.event -cne 'workflow_dispatch' -or $run.head_sha -cne $env:PROOF_SOURCE_COMMIT -or
+              $run.head_branch -cne 'codex/x64-signing-source-20261106') { throw 'Run is not the successful reviewed preparation source' }
+      - name: Download exact build artifacts with enforced archive digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.proof_run_id }}
+          pattern: MasterDesk-x64-*-beta-${{ inputs.beta_number }}-${{ inputs.proof_source_commit }}
+          path: artifacts/proof-input
+          digest-mismatch: error
+      - name: Check payload hashes, metadata and actual runner/core CLI
+        shell: pwsh
+        env:
+          PROOF_SOURCE_COMMIT: ${{ inputs.proof_source_commit }}
+          PROOF_BETA: ${{ inputs.beta_number }}
+        run: |
+          .\scripts\Test-HostedCliProof.ps1 -ArtifactRoot artifacts/proof-input -ExpectedCommit $env:PROOF_SOURCE_COMMIT -BetaNumber ([int]$env:PROOF_BETA) -OutputPath artifacts/proof-result/cli-proof.json
+      - name: Upload proof report only, not a new EXE
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: MasterDesk-x64-cli-proof-${{ inputs.proof_run_id }}-${{ github.sha }}
+          path: artifacts/proof-result/cli-proof.json
+          if-no-files-found: error
+          retention-days: 30
 
 # A future reviewed payload-first/package-second signing flow needs Foundation
 # approval, verified policies and a separate explicit maintainer decision.

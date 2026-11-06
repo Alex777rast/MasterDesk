@@ -60,6 +60,15 @@ in `Test-ServerDefaults.ps1`; they are explicitly NOT_RUN in client-only CI.
 No private deployment files need publication. `Test-DefaultsScope.ps1` checks
 the separation and negative fixtures before the expensive hosted build.
 
+After a successful preparation run, the same manual workflow can verify the
+existing artifacts without rebuilding or reissuing a beta: supply its run ID,
+exact reviewed build commit and beta as the optional proof inputs. The separate
+job requires a successful preparation source, enforces artifact archive digests,
+checks payload hashes/PE identity, and runs only runner/core `--version` and
+`--build-date` on a disposable hosted Windows VM. It uploads a report, not a new
+package. This avoids touching the maintainer's installed application/config.
+It is not GUI/install/update/remote-session or SmartScreen acceptance.
+
 An optional local new-beta verification build can use the existing caches:
 
 ```powershell
