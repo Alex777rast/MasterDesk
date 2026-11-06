@@ -67,7 +67,15 @@ pub trait CliprdrServiceContext: Send + Sync {
     /// cancel the paste task.
     fn cancel(&mut self);
     /// Enable the Explorer parallel-cache marker for local file clipboard snapshots.
-    fn set_parallel_file_cache_enabled(&mut self, _enabled: bool) -> Result<(), CliprdrError> {
+    fn set_parallel_file_cache_enabled(
+        &mut self,
+        _enabled: bool,
+        _minimum_total_bytes: u64,
+    ) -> Result<(), CliprdrError> {
+        Ok(())
+    }
+    /// Fail the unbound cache generation so Explorer immediately uses the legacy stream.
+    fn fail_pending_parallel_file_cache(&mut self) -> Result<(), CliprdrError> {
         Ok(())
     }
     /// Associate the current remote Explorer clipboard generation with a cache transfer.
@@ -79,12 +87,25 @@ pub trait CliprdrServiceContext: Send + Sync {
     ) -> Result<(), CliprdrError> {
         Ok(())
     }
+    /// Publish the contiguous byte prefix currently readable by Explorer.
+    fn update_parallel_file_cache_progress(
+        &mut self,
+        _transfer_id: &str,
+        _file_index: u32,
+        _available_bytes: u64,
+    ) -> Result<(), CliprdrError> {
+        Ok(())
+    }
     /// Publish or fail a receiver-side Explorer clipboard cache.
     fn complete_parallel_file_cache(
         &mut self,
         _transfer_id: &str,
         _success: bool,
     ) -> Result<(), CliprdrError> {
+        Ok(())
+    }
+    /// Cancel a receiver-side Explorer clipboard cache without starting legacy fallback.
+    fn cancel_parallel_file_cache(&mut self, _transfer_id: &str) -> Result<(), CliprdrError> {
         Ok(())
     }
 }

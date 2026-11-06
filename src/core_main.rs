@@ -48,7 +48,9 @@ fn complete_portable_handoff_before_initialization() -> bool {
                         log::error!("Failed to complete portable GUI handoff: {err}");
                     }
                 }
-                Err(err) => log::error!("Failed to locate installed executable for GUI handoff: {err}"),
+                Err(err) => {
+                    log::error!("Failed to locate installed executable for GUI handoff: {err}")
+                }
             }
             return true;
         }
@@ -609,6 +611,30 @@ pub fn core_main() -> Option<Vec<String>> {
         } else if args[0] == "--get-id" {
             println!("{}", crate::ipc::get_id());
             return None;
+        } else if args[0] == "--winpe-get-credentials" {
+            #[cfg(windows)]
+            {
+                if !winpe_credentials_access_allowed(
+                    crate::platform::windows::is_windows_pe(),
+                    is_root(),
+                ) {
+                    eprintln!("Windows PE and administrative privileges required!");
+                    return None;
+                }
+                let id = crate::ipc::get_id();
+                let password = crate::ipc::get_config("temporary-password")
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                if let Some(credentials) = format_winpe_credentials(&id, &password) {
+                    println!("{credentials}");
+                } else {
+                    eprintln!("MasterDesk credentials are not ready.");
+                }
+            }
+            #[cfg(not(windows))]
+            eprintln!("Windows PE required!");
+            return None;
         } else if args[0] == "--set-id" {
             if is_cli_setting_change_disabled() {
                 println!("Settings are disabled!");
@@ -909,33 +935,73 @@ fn init_plugins(args: &Vec<String>) {
     }
 }
 
+#[cfg(windows)]
 fn import_config(path: &str) {
     use hbb_common::{config::*, get_exe_time, get_modified_time};
     let path2 = path.replace(".toml", "2.toml");
     let path2 = std::path::Path::new(&path2);
     let path = std::path::Path::new(path);
     log::info!("import config from {:?} and {:?}", path, path2);
-    let config: Config = load_path(path.into());
+    let read = || Config::load_for_install_import(path);
+    let source = crate::platform::windows::read_install_config_as_source_user(path, read);
+    let (config, password_h1) = match source {
+        Ok(config) => config,
+        Err(err) => {
+            log::error!("Failed to read installation source identity; preserving destination: {err:#}");
+            return;
+        }
+    };
     if config.is_empty() {
         log::info!("Empty source config, skipped");
         return;
     }
     let destination: Config = load_path(Config::file());
-    if should_import_primary_config(
+    let repair_identity = destination.can_repair_install_import_from(&config);
+    if repair_identity || should_import_primary_config(
         destination.is_empty(),
         get_modified_time(path),
         get_modified_time(&Config::file()),
         get_exe_time(),
     ) {
-        match store_path(Config::file(), config) {
+        match config.store_for_install_import(password_h1.as_ref()) {
             Ok(()) => log::info!("Primary config imported"),
-            Err(err) => log::error!("Failed to import primary config: {err}"),
+            Err(err) => {
+                log::error!("Failed to import primary config: {err}");
+                return;
+            }
         }
     }
-    let config2: Config2 = load_path(path2.into());
-    if get_modified_time(&path2) > get_modified_time(&Config2::file()) {
-        if store_path(Config2::file(), config2).is_err() {
-            log::info!("config2 written");
+    if repair_identity || get_modified_time(&path2) > get_modified_time(&Config2::file()) {
+        let read = || Config2::load_for_install_import(path2);
+        let source = crate::platform::windows::read_install_config_as_source_user(path2, read);
+        match source.and_then(|config| config.store_for_install_import()) {
+            Ok(()) => log::info!("Secondary config imported with destination-account protection"),
+            Err(err) => log::error!("Failed to import secondary config; preserving destination: {err:#}"),
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn import_config(path: &str) {
+    use hbb_common::{config::*, get_exe_time, get_modified_time};
+    let path2 = path.replace(".toml", "2.toml");
+    let path2 = std::path::Path::new(&path2);
+    let path = std::path::Path::new(path);
+    let config: Config = load_path(path.into());
+    if config.is_empty() {
+        return;
+    }
+    let destination: Config = load_path(Config::file());
+    if should_import_primary_config(destination.is_empty(), get_modified_time(path),
+        get_modified_time(&Config::file()), get_exe_time()) {
+        if let Err(err) = store_path(Config::file(), config) {
+            log::error!("Failed to import primary config: {err}");
+        }
+    }
+    if get_modified_time(path2) > get_modified_time(&Config2::file()) {
+        let config2: Config2 = load_path(path2.into());
+        if let Err(err) = store_path(Config2::file(), config2) {
+            log::error!("Failed to import secondary config: {err}");
         }
     }
 }
@@ -1085,6 +1151,25 @@ fn is_cli_setting_change_disabled() -> bool {
     config::is_disable_settings() && !allow_command_line_settings
 }
 
+#[cfg(any(windows, test))]
+fn winpe_credentials_access_allowed(is_windows_pe: bool, is_root: bool) -> bool {
+    is_windows_pe && is_root
+}
+
+#[cfg(any(windows, test))]
+fn format_winpe_credentials(id: &str, password: &str) -> Option<String> {
+    let id = id.trim();
+    let password = password.trim();
+    if id.is_empty()
+        || !id.bytes().all(|value| value.is_ascii_digit())
+        || password.is_empty()
+        || !password.bytes().all(|value| value.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(format!("ID={id}\nPASSWORD={password}"))
+}
+
 #[cfg(windows)]
 fn parse_silent_install_args(args: &[String]) -> (Option<bool>, bool) {
     let mut printer_override = None;
@@ -1139,10 +1224,31 @@ mod tests {
     }
 
     #[test]
+    fn winpe_credentials_require_both_winpe_and_administrator() {
+        assert!(winpe_credentials_access_allowed(true, true));
+        assert!(!winpe_credentials_access_allowed(true, false));
+        assert!(!winpe_credentials_access_allowed(false, true));
+        assert!(!winpe_credentials_access_allowed(false, false));
+    }
+
+    #[test]
+    fn winpe_credentials_output_rejects_shell_control_characters() {
+        assert_eq!(
+            format_winpe_credentials("412447483", "a2b3c4"),
+            Some("ID=412447483\nPASSWORD=a2b3c4".to_owned())
+        );
+        assert!(format_winpe_credentials("412 447 483", "a2b3c4").is_none());
+        assert!(format_winpe_credentials("412447483", "abc&whoami").is_none());
+        assert!(format_winpe_credentials("412447483\r\nX=1", "a2b3c4").is_none());
+    }
+
+    #[test]
     fn empty_service_profile_imports_newer_user_identity() {
         let source = UNIX_EPOCH + Duration::from_secs(300);
         let executable = UNIX_EPOCH + Duration::from_secs(200);
-        assert!(should_import_primary_config(true, source, UNIX_EPOCH, executable));
+        assert!(should_import_primary_config(
+            true, source, UNIX_EPOCH, executable
+        ));
     }
 
     #[test]

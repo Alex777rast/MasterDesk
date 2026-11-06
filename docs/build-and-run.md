@@ -15,6 +15,18 @@ beta number.
 - vcpkg commit `120deac3062162151622ca4860575a33844ba10b`;
 - Visual Studio 2022 x64 C++ build tools, Git for Windows and Python 3.12.
 
+The 32-bit Windows fallback uses the upstream Sciter path because Flutter
+Windows has no i686 desktop runner. `scripts/Build-CustomWindowsX86.ps1` pins:
+
+- Rust `nightly-2023-10-13-i686-pc-windows-msvc` (the Sciter x86 ABI needs
+  nightly Rust 1.75);
+- the same vcpkg commit with the `x86-windows-static` triplet in the separate
+  `.tools\vcpkg-x86` checkout;
+- rust-sciter `dyn_x86` commit
+  `674e07d3066ca9a92ced3816203ab6b652629d1e`;
+- Sciter x86 commit `f33df075d9eb2f8d252cb88f1b2c8096e56197ed`
+  and its verified DLL SHA-256.
+
 `scripts/Initialize-MasterDeskBuildEnvironment.ps1` resolves the existing
 `.tools` caches and optional `MASTERDESK_LLVM_BIN`,
 `MASTERDESK_VCPKG_ROOT`, `MASTERDESK_FLUTTER_ROOT`,
@@ -87,6 +99,21 @@ change, proven cache incompatibility, or an explicit request:
 .\scripts\Build-CustomWindows.ps1 -BetaNumber <next-beta>
 ```
 
+For native 32-bit Windows, including the Windows 7 compatibility candidate,
+use the separate Sciter wrapper after provisioning its pinned x86 toolchain and
+vcpkg checkout:
+
+```powershell
+.\scripts\Build-CustomWindowsX86.ps1 -BetaNumber <next-beta>
+```
+
+This is not a Flutter package. It builds `i686-pc-windows-msvc`, statically
+links the native libraries, embeds the legacy Sciter UI, verifies the pinned
+32-bit `sciter.dll`, and creates one portable self-extracting EXE. A successful
+x86 build or WOW64 launch is not by itself a Windows 7 PASS; inspect the PE
+imports and launch/connect on a real Windows 7 SP1 32-bit VM before publishing
+Windows 7 support.
+
 Do not run `cargo clean` or clear Flutter/vcpkg/Rust caches as a routine step.
 
 The Flutter 3.24 backend can finish `app.so` and the generated asset bundle
@@ -103,6 +130,7 @@ Every changed package must be created by the build script as:
 
 ```text
 dist\MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe
+dist\MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86-sciter.exe
 ```
 
 `N` is a monotonically increasing positive integer. Filename, embedded
@@ -113,6 +141,8 @@ EXE.
 Important outputs:
 
 - packaged EXE: `dist\`;
+- x86 Sciter build evidence and unpacked payload:
+  `artifacts\build\beta-<N>-x86-sciter-<YYYY-MM-DD>\`;
 - unpacked runner: `flutter\build\windows\x64\runner\Release\`;
 - Rust library: `...\Release\libmasterdesk.dll`;
 - Flutter AOT: `...\Release\data\app.so`;
@@ -144,6 +174,13 @@ main GUI and update processes use different current/dated names.
 
 ## Known build details
 
+- x64 beta106+ packages align their owned EXE/DLL PE metadata with the generated
+  beta identity, including an incrementally reused runner. Existing issued
+  packages and signed files cannot be overwritten/stamped. `-PrepareSigning`
+  adds signing-preparation requirements (including the pinned custom-engine
+  archive on full setup), but does not sign, upload, install or publish anything.
+  See [x64 preparation](signing-x64-preparation.md). Local unsigned beta106 was
+  used for verification; a future hosted proof build starts at beta107 or later.
 - The custom build applies reproducible patches to the cached `desktop_drop`
   Windows source. If the upstream package signature changes, the build fails
   closed instead of silently omitting the patch.

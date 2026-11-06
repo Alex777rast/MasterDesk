@@ -498,6 +498,8 @@ pub enum Data {
         privacy_mode: bool,
         from_switch: bool,
         parallel_auxiliary: bool,
+        #[serde(default)]
+        parallel_clipboard_cache: bool,
     },
     ChatMessage {
         text: String,
@@ -721,9 +723,8 @@ pub async fn start(postfix: &str) -> ResultType<()> {
                                                 if name == "temporary-password-gui"
                                         )
                                     {
-                                        temporary_password_gui_lease = Some(
-                                            password::acquire_temporary_password_gui_lease(),
-                                        );
+                                        temporary_password_gui_lease =
+                                            Some(password::acquire_temporary_password_gui_lease());
                                     }
                                     // On Linux/macOS, the protected `_service` channel is used only for
                                     // syncing config between root service and the active user process.
@@ -979,9 +980,8 @@ pub async fn start_gui_compat() -> ResultType<()> {
                                                 if name == "temporary-password-gui"
                                         )
                                     {
-                                        temporary_password_gui_lease = Some(
-                                            password::acquire_temporary_password_gui_lease(),
-                                        );
+                                        temporary_password_gui_lease =
+                                            Some(password::acquire_temporary_password_gui_lease());
                                     }
                                     if !handle_gui_compat(data, &mut stream).await {
                                         log::warn!("Rejected command outside the GUI compatibility IPC allowlist");
@@ -2196,7 +2196,11 @@ async fn set_permanent_password_with_ack_async(v: String) -> ResultType<bool> {
     // Installed Windows writes are committed by the service and then synchronized
     // back into the active server before ACK. Allow both protected IPC round trips.
     #[cfg(windows)]
-    let ms_timeout = if crate::platform::is_installed() { 8_000 } else { 1_000 };
+    let ms_timeout = if crate::platform::is_installed() {
+        8_000
+    } else {
+        1_000
+    };
     #[cfg(not(windows))]
     let ms_timeout = 1_000;
     let mut c = connect(ms_timeout, "").await?;

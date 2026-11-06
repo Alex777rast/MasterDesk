@@ -117,6 +117,13 @@ queue; the receiver performs positioned writes and final verification. The
 configured modes are Auto, 1x/off, 2x, 4x and 8x. A peer without the feature or
 a negotiation/worker failure must fall back safely to the legacy stream.
 
+WinPE advertises the same Windows parallel capabilities; absence of a WTS
+console username is handled independently by session selection. Its Explorer
+cache uses a transfer-scoped, protected local disk directory, not the boot RAM
+disk, with capacity checked before starting the transfer. Without a suitable
+disk it logs the reason and retains the legacy clipboard path. File Manager
+uses the explicitly selected destination and does not require this cache.
+
 For a large single-file File Manager receive, the controller registers a
 one-time transfer authorization on the primary connection and opens auxiliary
 authenticated range readers back to the controlled peer. The controlled side

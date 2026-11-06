@@ -1,6 +1,21 @@
 use clipboard::ClipboardFile;
 use hbb_common::message_proto::*;
 
+const PARALLEL_CLIPBOARD_CACHE_FORMAT: &str = "MasterDeskParallelFileCacheV1";
+
+pub fn filter_parallel_clipboard_cache_format(
+    format_list: &mut Vec<(i32, String)>,
+    parallel_clipboard_cache_enabled: bool,
+) -> bool {
+    let advertised = format_list
+        .iter()
+        .any(|(_, name)| name == PARALLEL_CLIPBOARD_CACHE_FORMAT);
+    if !parallel_clipboard_cache_enabled {
+        format_list.retain(|(_, name)| name != PARALLEL_CLIPBOARD_CACHE_FORMAT);
+    }
+    advertised && parallel_clipboard_cache_enabled
+}
+
 pub fn clip_2_msg(clip: ClipboardFile) -> Message {
     match clip {
         ClipboardFile::NotifyCallback {
@@ -219,8 +234,61 @@ pub fn msg_2_clip(msg: Cliprdr) -> Option<ClipboardFile> {
                 requested_data: data.requested_data.into(),
             })
         }
+        Some(cliprdr::Union::Files(data)) => Some(ClipboardFile::Files {
+            files: data
+                .files
+                .into_iter()
+                .map(|file| (file.name, file.size))
+                .collect(),
+        }),
         Some(cliprdr::Union::TryEmpty(_)) => Some(ClipboardFile::TryEmpty),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unsupported_parallel_clipboard_cache_marker_is_not_forwarded() {
+        let mut formats = vec![
+            (1, "FileGroupDescriptorW".to_owned()),
+            (2, PARALLEL_CLIPBOARD_CACHE_FORMAT.to_owned()),
+            (3, "FileContents".to_owned()),
+        ];
+        assert!(!filter_parallel_clipboard_cache_format(
+            &mut formats,
+            false
+        ));
+        assert_eq!(
+            formats,
+            vec![
+                (1, "FileGroupDescriptorW".to_owned()),
+                (3, "FileContents".to_owned())
+            ]
+        );
+
+        formats.insert(1, (2, PARALLEL_CLIPBOARD_CACHE_FORMAT.to_owned()));
+        assert!(filter_parallel_clipboard_cache_format(&mut formats, true));
+        assert!(formats
+            .iter()
+            .any(|(_, name)| name == PARALLEL_CLIPBOARD_CACHE_FORMAT));
+    }
+
+    #[test]
+    fn clipboard_file_manifest_round_trips_for_parallel_receive() {
+        let expected = vec![(r"C:\source\example.bin".to_owned(), 31 * 1024 * 1024)];
+        let message = clip_2_msg(ClipboardFile::Files {
+            files: expected.clone(),
+        });
+        let Some(message::Union::Cliprdr(cliprdr)) = message.union else {
+            panic!("file manifest was not encoded as Cliprdr");
+        };
+        let Some(ClipboardFile::Files { files }) = msg_2_clip(cliprdr) else {
+            panic!("file manifest was not decoded");
+        };
+        assert_eq!(files, expected);
     }
 }
 
@@ -332,10 +400,7 @@ pub mod unix_file_clip {
                 log::debug!("format data response: msg_flags: {}", msg_flags);
 
                 if msg_flags != 0x1 {
-                    log::error!(
-                        "peer reported clipboard format data failure: {}",
-                        msg_flags
-                    );
+                    log::error!("peer reported clipboard format data failure: {}", msg_flags);
                     return vec![];
                 }
 

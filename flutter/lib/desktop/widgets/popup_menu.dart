@@ -292,6 +292,7 @@ class MenuEntryRadios<T> extends MenuEntryBase<T> {
 
 class MenuEntrySubRadios<T> extends MenuEntryBase<T> {
   final String text;
+  final String Function(String value)? textBuilder;
   final RadioOptionsGetter optionsGetter;
   final RadioCurOptionGetter curOptionGetter;
   final RadioOptionSetter optionSetter;
@@ -300,6 +301,7 @@ class MenuEntrySubRadios<T> extends MenuEntryBase<T> {
 
   MenuEntrySubRadios({
     required this.text,
+    this.textBuilder,
     required this.optionsGetter,
     required this.curOptionGetter,
     required this.optionSetter,
@@ -394,13 +396,15 @@ class MenuEntrySubRadios<T> extends MenuEntryBase<T> {
             options.map((opt) => _buildSecondMenu(context, conf, opt)).toList(),
         child: Row(children: [
           const SizedBox(width: MenuConfig.midPadding),
-          Text(
-            text,
-            style: TextStyle(
-                color: Theme.of(context).textTheme.titleLarge?.color,
-                fontSize: MenuConfig.fontSize,
-                fontWeight: FontWeight.normal),
-          ),
+          Obx(() => Text(
+                textBuilder == null || curOption.value.isEmpty
+                    ? text
+                    : textBuilder!(curOption.value),
+                style: TextStyle(
+                    color: Theme.of(context).textTheme.titleLarge?.color,
+                    fontSize: MenuConfig.fontSize,
+                    fontWeight: FontWeight.normal),
+              )),
           Expanded(
               child: Align(
             alignment: Alignment.centerRight,

@@ -38,15 +38,21 @@ MasterDesk — независимая модифицированная сбор�
 
 ## Сборка
 
-Для каждого тега `v*` workflow
-[`masterdesk-windows.yml`](.github/workflows/masterdesk-windows.yml):
+Подготовка x64 к подписи запускается вручную через
+[`masterdesk-windows.yml`](.github/workflows/masterdesk-windows.yml)
+для нового номера beta (не ниже 107: локальная 106 уже использована для проверки). Она:
 
-1. получает этот commit и все submodules;
+1. получает точный commit и все submodules, проверяет чистоту исходников;
 2. устанавливает закреплённые версии Rust, Flutter, LLVM и vcpkg;
 3. запускает `scripts/Build-CustomWindows.ps1`;
 4. выполняет тесты MasterDesk;
-5. публикует EXE, SHA-256 и идентификатор исходного commit;
-6. для тега создаёт GitHub Release.
+5. сохраняет неподписанные EXE, payload, SHA-256 и сведения об исходниках
+   как артефакты GitHub Actions.
+
+Этот процесс **не публикует релизы, не запрашивает подпись и не меняет сайт**.
+Существующие теги и EXE не пересобираются и не заменяются. Перед запуском нужно
+опубликовать проверенные исходники и изменения submodule; грязное локальное
+дерево не считается подтверждённым источником CI-сборки.
 
 Ручная локальная сборка:
 
@@ -58,23 +64,25 @@ pwsh -File .\scripts\Test-CustomDefaults.ps1
 Результат следует правилу идентичности сборки:
 `dist/MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe`.
 
-Текущий проверенный пакет:
-`dist/MasterDesk-1.4.9-10-beta-60-2026-09-04-RDS-x86_64.exe`, SHA-256
-`A26D047CFB37ED33CAB9284ADCB826B5751A85720AC74824D76DE2B536B54339`.
-Это неподписанная portable-сборка, опубликованная без переименования как
-`v1.4.9-masterdesk.10-beta.60`.
+Опубликованная beta105 остаётся неподписанной portable-сборкой. Её точные хеши
+и происхождение приведены в GitHub Release. `SOURCE_ATTRIBUTION.md` объясняет,
+что historical base commit и автоматический архив GitHub не являются полным
+снимком изменённых локальных исходников этой beta. Для следующего подписываемого
+релиза требуется проверенный и опубликованный снимок, включая submodule.
 
 Зависимость `libs/hbb_common` публикуется отдельно как видимый fork:
 <https://github.com/Alex777rast/MasterDesk-hbb-common>.
 
 ## Code signing policy / Политика подписания кода
 
-После одобрения проекта SignPath Foundation workflow можно переключить на
-подписание артефакта, собранного GitHub-hosted runner. Порядок, роли и
-ограничения описаны в [SIGNING_POLICY.md](SIGNING_POLICY.md).
+Подготовка ограничена x64. Одобрение SignPath Foundation пока не подтверждено;
+наличие подготовительных файлов не означает наличие сертификата. Порядок,
+роли и ограничения описаны в [SIGNING_POLICY.md](SIGNING_POLICY.md), следующие
+шаги — в [инструкции подготовки](docs/signing-x64-preparation.md).
 
-Free code signing provided by [SignPath.io](https://signpath.io/), certificate
-by [SignPath Foundation](https://signpath.org/).
+После одобрения будет использоваться атрибуция: Free code signing provided by
+[SignPath.io](https://signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/). Это не обещание устранить SmartScreen.
 
 ## Безопасность и допустимое использование
 

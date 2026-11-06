@@ -1,6 +1,6 @@
 # MasterDesk privacy notice
 
-Last updated: 2026-08-01
+Last updated: 2026-11-06
 
 This notice describes the test MasterDesk service operated through
 `masterdesk.online`. The current API deployment is intended for authorized
@@ -59,3 +59,13 @@ be submitted through the private security contact described in
 The MasterDesk client source is published under AGPL-3.0 in this repository.
 The test account/address-book API is based on the MIT-licensed
 [`lejianwen/rustdesk-api`](https://github.com/lejianwen/rustdesk-api) project.
+
+## Optional code-signing preparation
+
+The x64 signing-preparation workflow produces unsigned build artifacts and
+source/inventory reports on GitHub Actions. It does not collect end-user files,
+device passwords, account tokens or session logs for signing. No application
+has been submitted and no active Foundation certificate is claimed by these
+preparation files. If signing is approved later, only reviewed software build
+artifacts and their source provenance will be submitted to SignPath; no remote
+session content or private test configuration belongs in those artifacts.

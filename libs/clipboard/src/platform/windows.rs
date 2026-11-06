@@ -544,17 +544,29 @@ extern "C" {
     pub(crate) fn set_parallel_file_cache_enabled(
         context: *mut CliprdrClientContext,
         enabled: BOOL,
+        minimum_total_bytes: u64,
     ) -> BOOL;
+    pub(crate) fn fail_pending_parallel_file_cache(context: *mut CliprdrClientContext) -> BOOL;
     pub(crate) fn begin_parallel_file_cache(
         context: *mut CliprdrClientContext,
         transfer_id: *const ::std::os::raw::c_char,
         root: *const WCHAR,
         file_count: UINT32,
     ) -> BOOL;
+    pub(crate) fn update_parallel_file_cache_progress(
+        context: *mut CliprdrClientContext,
+        transfer_id: *const ::std::os::raw::c_char,
+        file_index: UINT32,
+        available_bytes: u64,
+    ) -> BOOL;
     pub(crate) fn complete_parallel_file_cache(
         context: *mut CliprdrClientContext,
         transfer_id: *const ::std::os::raw::c_char,
         success: BOOL,
+    ) -> BOOL;
+    pub(crate) fn cancel_parallel_file_cache(
+        context: *mut CliprdrClientContext,
+        transfer_id: *const ::std::os::raw::c_char,
     ) -> BOOL;
 }
 
@@ -651,9 +663,27 @@ impl CliprdrServiceContext for CliprdrClientContext {
 
     fn cancel(&mut self) {}
 
-    fn set_parallel_file_cache_enabled(&mut self, enabled: bool) -> Result<(), CliprdrError> {
-        let result =
-            unsafe { set_parallel_file_cache_enabled(self, if enabled { TRUE } else { FALSE }) };
+    fn set_parallel_file_cache_enabled(
+        &mut self,
+        enabled: bool,
+        minimum_total_bytes: u64,
+    ) -> Result<(), CliprdrError> {
+        let result = unsafe {
+            set_parallel_file_cache_enabled(
+                self,
+                if enabled { TRUE } else { FALSE },
+                minimum_total_bytes,
+            )
+        };
+        if result == TRUE {
+            Ok(())
+        } else {
+            Err(CliprdrError::ClipboardInternalError)
+        }
+    }
+
+    fn fail_pending_parallel_file_cache(&mut self) -> Result<(), CliprdrError> {
+        let result = unsafe { fail_pending_parallel_file_cache(self) };
         if result == TRUE {
             Ok(())
         } else {
@@ -694,6 +724,38 @@ impl CliprdrServiceContext for CliprdrClientContext {
                 self,
                 transfer_id.as_ptr(),
                 if success { TRUE } else { FALSE },
+            )
+        };
+        if result == TRUE {
+            Ok(())
+        } else {
+            Err(CliprdrError::ClipboardInternalError)
+        }
+    }
+
+    fn cancel_parallel_file_cache(&mut self, transfer_id: &str) -> Result<(), CliprdrError> {
+        let transfer_id = CString::new(transfer_id).map_err(|_| CliprdrError::CliprdrName)?;
+        let result = unsafe { cancel_parallel_file_cache(self, transfer_id.as_ptr()) };
+        if result == TRUE {
+            Ok(())
+        } else {
+            Err(CliprdrError::ClipboardInternalError)
+        }
+    }
+
+    fn update_parallel_file_cache_progress(
+        &mut self,
+        transfer_id: &str,
+        file_index: u32,
+        available_bytes: u64,
+    ) -> Result<(), CliprdrError> {
+        let transfer_id = CString::new(transfer_id).map_err(|_| CliprdrError::CliprdrName)?;
+        let result = unsafe {
+            update_parallel_file_cache_progress(
+                self,
+                transfer_id.as_ptr(),
+                file_index,
+                available_bytes,
             )
         };
         if result == TRUE {

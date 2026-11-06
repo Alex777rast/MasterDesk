@@ -1214,6 +1214,8 @@ class _FileManagerViewState extends State<FileManagerView> {
       MenuEntrySubRadios<String>(
         text:
             '${translate("Transfer file")}: ${parallelFileTransferModeLabel(bind.mainGetOptionSync(key: kOptionParallelFileTransferMode))}',
+        textBuilder: (mode) =>
+            '${translate("Transfer file")}: ${parallelFileTransferModeLabel(mode)}',
         optionsGetter: () => kParallelFileTransferModes
             .map((mode) => MenuEntryRadioOption(
                   text: parallelFileTransferModeLabel(mode),

@@ -43,7 +43,7 @@ use wallpaper;
 use winapi::um::libloaderapi::{LoadLibraryExW, LOAD_LIBRARY_SEARCH_USER_DIRS};
 use winapi::{
     ctypes::c_void,
-    shared::{minwindef::*, ntdef::NULL, windef::*, winerror::*},
+    shared::{minwindef::*, ntdef::NULL, ntdef::ULARGE_INTEGER, windef::*, winerror::*},
     um::{
         errhandlingapi::GetLastError,
         handleapi::{CloseHandle, INVALID_HANDLE_VALUE},
@@ -67,7 +67,8 @@ use winapi::{
         winnt::{
             SecurityImpersonation, TokenElevation, TokenGroups, TokenImpersonation, TokenType,
             DOMAIN_ALIAS_RID_ADMINS, ES_AWAYMODE_REQUIRED, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-            ES_SYSTEM_REQUIRED, EVENT_MODIFY_STATE, HANDLE, PROCESS_ALL_ACCESS,
+            ES_SYSTEM_REQUIRED, EVENT_MODIFY_STATE, FILE_PERSISTENT_ACLS, FILE_READ_ONLY_VOLUME,
+            HANDLE, PROCESS_ALL_ACCESS,
             PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE, PSID,
             SECURITY_BUILTIN_DOMAIN_RID, SECURITY_NT_AUTHORITY, SID_IDENTIFIER_AUTHORITY,
             SYNCHRONIZE, TOKEN_ELEVATION, TOKEN_GROUPS, TOKEN_QUERY, TOKEN_TYPE,
@@ -107,6 +108,8 @@ use windows_service::{
 use winreg::{enums::*, RegKey};
 
 mod acl;
+mod install_import;
+pub(crate) use install_import::read_install_config_as_source_user;
 pub(crate) use acl::current_process_user_sid_string;
 pub use acl::{
     set_path_permission, set_path_permission_for_machine_secret,
@@ -1717,7 +1720,17 @@ pub fn is_physical_console_session() -> Option<bool> {
 
 pub fn get_active_username() -> String {
     // get_active_user will give console username higher priority
-    if let Some(name) = get_current_session_username() {
+    let windows_pe = is_windows_pe();
+    let process_username = if windows_pe {
+        crate::username()
+    } else {
+        String::new()
+    };
+    if let Some(name) = resolve_interactive_username(
+        get_current_session_username(),
+        windows_pe,
+        &process_username,
+    ) {
         return name;
     }
     if !is_root() {
@@ -1739,6 +1752,19 @@ pub fn get_active_username() -> String {
         .unwrap_or("??".to_owned())
         .trim_end_matches('\0')
         .to_owned()
+}
+
+fn resolve_interactive_username(
+    session_username: Option<String>,
+    windows_pe: bool,
+    process_username: &str,
+) -> Option<String> {
+    match session_username {
+        Some(username) if !username.is_empty() => Some(username),
+        Some(username) if !windows_pe => Some(username),
+        Some(_) | None if !process_username.is_empty() => Some(process_username.to_owned()),
+        other => other,
+    }
 }
 
 fn get_current_session_username() -> Option<String> {
@@ -1872,10 +1898,11 @@ pub fn portable_service_logon_helper_paths() -> Option<(PathBuf, PathBuf)> {
 }
 
 pub fn is_prelogin() -> bool {
-    let Some(username) = get_current_session_username() else {
-        return false;
-    };
-    username.is_empty() || username == "SYSTEM"
+    is_prelogin_session(get_current_session_username().as_deref(), is_windows_pe())
+}
+
+fn is_prelogin_session(username: Option<&str>, windows_pe: bool) -> bool {
+    !windows_pe && username.is_some_and(|username| username.is_empty() || username == "SYSTEM")
 }
 
 pub fn is_locked() -> bool {
@@ -2932,6 +2959,114 @@ pub fn add_recent_document(path: &str) {
 pub fn is_installed() -> bool {
     let (_, _, _, exe) = get_install_info();
     std::fs::metadata(exe).is_ok()
+}
+
+/// Windows PE exposes this marker for the lifetime of the preinstallation
+/// environment. WinPE-only commands use it to remain unavailable on ordinary
+/// Windows installations.
+pub fn is_windows_pe() -> bool {
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey_with_flags(r"SYSTEM\CurrentControlSet\Control\MiniNT", KEY_READ)
+        .is_ok()
+}
+
+fn winpe_clipboard_cache_volume_is_eligible(
+    drive_type: u32,
+    is_boot_volume: bool,
+    filesystem_flags: u32,
+    available: u64,
+    total_size: u64,
+) -> bool {
+    // Require persistent ACLs (also excludes FAT32's 4-GiB file limit). Leave
+    // room for Explorer's destination copy as well as the temporary cache.
+    drive_type == DRIVE_FIXED
+        && !is_boot_volume
+        && filesystem_flags & FILE_PERSISTENT_ACLS != 0
+        && filesystem_flags & FILE_READ_ONLY_VOLUME == 0
+        && total_size
+            .checked_mul(2)
+            .and_then(|size| size.checked_add(64 * 1024 * 1024))
+            .map(|required| available >= required)
+            .unwrap_or(false)
+}
+
+/// WinPE's TEMP is normally on the small X: RAM disk. Never preallocate a large
+/// Explorer cache there. Use a new, ACL-protected, transfer-scoped directory on
+/// a writable local disk; the native clipboard cache owns its normal cleanup.
+pub(super) fn create_winpe_clipboard_cache(
+    transfer_id: &str,
+    total_size: u64,
+) -> ResultType<PathBuf> {
+    use winapi::um::fileapi::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+
+    let id = uuid::Uuid::parse_str(transfer_id)?;
+    let boot_drive = std::env::var_os("SystemRoot")
+        .and_then(|root| root.to_string_lossy().chars().next())
+        .unwrap_or('X')
+        .to_ascii_uppercase();
+    let mut candidates = Vec::new();
+    let drives = unsafe { GetLogicalDrives() };
+    for letter in b'C'..=b'Z' {
+        if drives & (1 << (letter - b'A')) == 0 || char::from(letter) == boot_drive {
+            continue;
+        }
+        let root = PathBuf::from(format!("{}:\\", char::from(letter)));
+        let wide = wide_string(&root.to_string_lossy());
+        let drive_type = unsafe { GetDriveTypeW(wide.as_ptr()) };
+        if drive_type != DRIVE_FIXED {
+            continue;
+        }
+        let mut flags = 0;
+        let mut available: ULARGE_INTEGER = unsafe { mem::zeroed() };
+        let inspected = unsafe {
+            GetVolumeInformationW(
+                wide.as_ptr(),
+                null_mut(),
+                0,
+                null_mut(),
+                null_mut(),
+                &mut flags,
+                null_mut(),
+                0,
+            ) != 0
+                && GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, null_mut(), null_mut()) != 0
+        };
+        let available = unsafe { *available.QuadPart() };
+        if inspected
+            && winpe_clipboard_cache_volume_is_eligible(
+                drive_type,
+                false,
+                flags,
+                available,
+                total_size,
+            )
+        {
+            candidates.push((available, root));
+        }
+    }
+    candidates.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    for (_, volume) in candidates {
+        // create_dir (not create_dir_all) rejects existing paths/junctions. Only
+        // this newly-created directory receives an ACL, never a user's folder.
+        let root = volume.join(format!("MasterDesk-WinPE-Cache-{id}"));
+        if fs::create_dir(&root).is_err() {
+            continue;
+        }
+        if let Err(err) = set_path_permission_for_machine_secret(&root, true) {
+            log::warn!("Cannot protect WinPE clipboard cache: {}", err);
+            let _ = fs::remove_dir(&root);
+            continue;
+        }
+        log::info!(
+            "WinPE Explorer cache uses disk {} for {} bytes",
+            volume.display(),
+            total_size
+        );
+        return Ok(root);
+    }
+    bail!("No writable local ACL-capable disk has enough space for the WinPE Explorer cache ({} bytes plus destination copy); keeping legacy clipboard transfer", total_size)
 }
 
 #[inline]
@@ -5801,6 +5936,50 @@ pub struct WallPaperRemover {
     old_path: String,
 }
 
+const WALLPAPER_PREVIEW_MAX_DIMENSION: u32 = 1280;
+
+fn encode_wallpaper_preview_png(path: &Path) -> ResultType<Vec<u8>> {
+    let source = image::open(path).map_err(|err| anyhow!(err.to_string()))?;
+    let preview = source.thumbnail(
+        WALLPAPER_PREVIEW_MAX_DIMENSION,
+        WALLPAPER_PREVIEW_MAX_DIMENSION,
+    );
+    let mut png = io::Cursor::new(Vec::new());
+    preview
+        .write_to(&mut png, image::ImageOutputFormat::Png)
+        .map_err(|err| anyhow!(err.to_string()))?;
+    Ok(png.into_inner())
+}
+
+pub fn get_wallpaper_preview_png() -> ResultType<Vec<u8>> {
+    let mut candidates = Vec::new();
+    if let Ok(path) = WallPaperRemover::get_recent_wallpaper() {
+        if !path.is_empty() {
+            candidates.push(PathBuf::from(path));
+        }
+    }
+    if let Ok(path) = wallpaper::get() {
+        if !path.is_empty() {
+            let path = PathBuf::from(path);
+            if !candidates.contains(&path) {
+                candidates.push(path);
+            }
+        }
+    }
+
+    let mut last_error = None;
+    for path in candidates {
+        match encode_wallpaper_preview_png(&path) {
+            Ok(png) => return Ok(png),
+            Err(err) => last_error = Some(err),
+        }
+    }
+    match last_error {
+        Some(err) => Err(err),
+        None => bail!("No desktop wallpaper image is configured."),
+    }
+}
+
 impl WallPaperRemover {
     pub fn new() -> ResultType<Self> {
         let start = std::time::Instant::now();
@@ -6468,6 +6647,85 @@ pub(super) fn get_pids_with_first_arg_by_wmic<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn winpe_clipboard_cache_rejects_ram_boot_fat_and_small_volumes() {
+        let size = 5u64 * 1024 * 1024 * 1024;
+        let free = size * 3;
+        assert!(winpe_clipboard_cache_volume_is_eligible(
+            DRIVE_FIXED,
+            false,
+            FILE_PERSISTENT_ACLS,
+            free,
+            size,
+        ));
+        for (kind, boot, flags, available, bytes) in [
+            (DRIVE_RAMDISK, false, FILE_PERSISTENT_ACLS, free, size),
+            (DRIVE_REMOTE, false, FILE_PERSISTENT_ACLS, free, size),
+            (DRIVE_FIXED, true, FILE_PERSISTENT_ACLS, free, size),
+            (DRIVE_FIXED, false, 0, free, size),
+            (
+                DRIVE_FIXED,
+                false,
+                FILE_PERSISTENT_ACLS | FILE_READ_ONLY_VOLUME,
+                free,
+                size,
+            ),
+            (DRIVE_FIXED, false, FILE_PERSISTENT_ACLS, size, size),
+            (DRIVE_FIXED, false, FILE_PERSISTENT_ACLS, u64::MAX, u64::MAX),
+        ] {
+            assert!(!winpe_clipboard_cache_volume_is_eligible(
+                kind, boot, flags, available, bytes,
+            ));
+        }
+    }
+
+    #[test]
+    fn winpe_uses_process_identity_when_wts_has_no_username() {
+        assert_eq!(
+            resolve_interactive_username(Some(String::new()), true, "SYSTEM"),
+            Some("SYSTEM".to_owned())
+        );
+        assert_eq!(
+            resolve_interactive_username(None, true, "SYSTEM"),
+            Some("SYSTEM".to_owned())
+        );
+        assert_eq!(
+            resolve_interactive_username(Some("MasterDeskTest".to_owned()), true, "SYSTEM"),
+            Some("MasterDeskTest".to_owned())
+        );
+    }
+
+    #[test]
+    fn winpe_interactive_system_session_is_not_prelogin() {
+        assert!(!is_prelogin_session(Some("SYSTEM"), true));
+        assert!(!is_prelogin_session(Some(""), true));
+        assert!(is_prelogin_session(Some("SYSTEM"), false));
+        assert!(is_prelogin_session(Some(""), false));
+        assert!(!is_prelogin_session(Some("MasterDeskTest"), false));
+        assert!(!is_prelogin_session(None, false));
+    }
+
+    #[test]
+    fn wallpaper_preview_is_png_and_bounded_without_desktop_content() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "masterdesk-wallpaper-preview-{}-{unique}.bmp",
+            std::process::id()
+        ));
+        let source = image::RgbaImage::from_pixel(1600, 800, image::Rgba([7, 19, 31, 255]));
+        source.save(&path).unwrap();
+
+        let png = encode_wallpaper_preview_png(&path).unwrap();
+        let decoded = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+        assert_eq!((decoded.width(), decoded.height()), (1280, 640));
+        assert_eq!(decoded.to_rgba8().get_pixel(0, 0).0, [7, 19, 31, 255]);
+
+        let _ = std::fs::remove_file(path);
+    }
 
     #[test]
     fn parses_only_the_expected_release_checksum() {

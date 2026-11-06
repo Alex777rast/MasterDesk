@@ -48,8 +48,10 @@ impl ContextSend {
                     );
                 }
             }
-        } else if let Some(_clp) = lock.take() {
-            *lock = None;
+        } else if let Some(clp) = lock.take() {
+            // Drop while the singleton is still locked so a new native Windows
+            // clipboard context cannot race the old context's teardown.
+            drop(clp);
             log::info!("clipboard context for file transfer destroyed.");
         }
     }

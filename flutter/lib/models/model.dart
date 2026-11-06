@@ -41,6 +41,7 @@ import 'package:file_picker/file_picker.dart';
 import 'package:vector_math/vector_math.dart' show Vector2;
 
 import '../common.dart';
+import '../common/peer_thumbnail_cache.dart';
 import '../utils/image.dart' as img;
 import '../common/widgets/dialog.dart';
 import 'input_model.dart';
@@ -139,6 +140,13 @@ class FfiModel with ChangeNotifier {
   bool isRefreshing = false;
 
   Timer? timerScreenshot;
+  bool _preparingPeerThumbnail = false;
+  PeerThumbnailCapture? _peerThumbnailCapture;
+
+  bool get screenshotRequestPending =>
+      timerScreenshot != null ||
+      _preparingPeerThumbnail ||
+      _peerThumbnailCapture != null;
 
   Rect? get rect => _rect;
   bool get isOriginalResolutionSet =>
@@ -263,6 +271,51 @@ class FfiModel with ChangeNotifier {
     clearPermissions();
     waitForImageTimer?.cancel();
     timerScreenshot?.cancel();
+    timerScreenshot = null;
+    _preparingPeerThumbnail = false;
+    _peerThumbnailCapture = null;
+  }
+
+  Future<void> capturePeerThumbnail(String peerId) async {
+    final ffi = parent.target;
+    if (!isDesktop ||
+        ffi == null ||
+        ffi.closed ||
+        ffi.connType != ConnType.defaultConn ||
+        screenshotRequestPending ||
+        _pi.currentDisplay == kAllDisplayValue ||
+        bind.sessionGetCommonSync(
+                sessionId: sessionId,
+                key: 'is_screenshot_supported',
+                param: '') !=
+            'true') {
+      return;
+    }
+
+    _preparingPeerThumbnail = true;
+    try {
+      final previousFileName = bind.mainGetPeerFlutterOptionSync(
+        id: peerId,
+        k: peerThumbnailOptionKey,
+      );
+      final capture =
+          await createPeerThumbnailCapture(peerId, previousFileName);
+      if (ffi.closed ||
+          timerScreenshot != null ||
+          _peerThumbnailCapture != null) {
+        return;
+      }
+      _peerThumbnailCapture = capture;
+      bind.sessionTakePeerThumbnail(
+        sessionId: sessionId,
+        display: _pi.currentDisplay,
+      );
+    } catch (e, st) {
+      debugPrint('Failed to prepare peer thumbnail: $e');
+      debugPrintStack(stackTrace: st);
+    } finally {
+      _preparingPeerThumbnail = false;
+    }
   }
 
   setConnectionType(
@@ -483,7 +536,7 @@ class FfiModel with ChangeNotifier {
       } else if (name == "printer_request") {
         _handlePrinterRequest(evt, sessionId, peerId);
       } else if (name == 'screenshot') {
-        _handleScreenshot(evt, sessionId, peerId);
+        await _handleScreenshot(evt, sessionId, peerId);
       } else if (name == 'exit_relative_mouse_mode') {
         // Handle exit shortcut from rdev grab loop (Ctrl+Alt on Win/Linux, Cmd+G on macOS)
         parent.target?.inputModel.exitRelativeMouseModeWithKeyRelease();
@@ -493,15 +546,54 @@ class FfiModel with ChangeNotifier {
     };
   }
 
-  _handleScreenshot(
-      Map<String, dynamic> evt, SessionID sessionId, String peerId) {
+  Future<void> _handleScreenshot(
+      Map<String, dynamic> evt, SessionID sessionId, String peerId) async {
     timerScreenshot?.cancel();
     timerScreenshot = null;
     final msg = evt['msg'] ?? '';
+    final thumbnailCapture = _peerThumbnailCapture;
+    _peerThumbnailCapture = null;
+    if (thumbnailCapture != null) {
+      if (msg.isNotEmpty) {
+        await bind.sessionHandleScreenshot(sessionId: sessionId, action: '2');
+        debugPrint('Peer thumbnail request failed: $msg');
+        return;
+      }
+
+      final result = await bind.sessionHandleScreenshot(
+        sessionId: sessionId,
+        action: '0:${thumbnailCapture.path}',
+      );
+      if (result.isNotEmpty) {
+        debugPrint('Failed to save peer thumbnail: $result');
+        return;
+      }
+
+      await bind.sessionSetFlutterOption(
+        sessionId: sessionId,
+        k: peerThumbnailOptionKey,
+        v: thumbnailCapture.fileName,
+      );
+      if (thumbnailCapture.previousFileName.isNotEmpty &&
+          thumbnailCapture.previousFileName != thumbnailCapture.fileName) {
+        try {
+          await deletePeerThumbnail(peerId, thumbnailCapture.previousFileName);
+        } catch (e) {
+          debugPrint('Failed to remove previous peer thumbnail: $e');
+        }
+      }
+      await Future.wait([
+        bind.mainLoadRecentPeers(),
+        bind.mainLoadFavPeers(),
+      ]);
+      return;
+    }
+
     final msgBoxType = 'custom-nook-nocancel-hasclose';
     final msgBoxTitle = 'Take screenshot';
     final dialogManager = parent.target!.dialogManager;
     if (msg.isNotEmpty) {
+      await bind.sessionHandleScreenshot(sessionId: sessionId, action: '2');
       msgBox(sessionId, msgBoxType, msgBoxTitle, msg, '', dialogManager);
     } else {
       final msgBoxText = 'screenshot-action-tip';

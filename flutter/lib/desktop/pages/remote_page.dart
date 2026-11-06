@@ -33,6 +33,20 @@ final SimpleWrapper<bool> _firstEnterImage = SimpleWrapper(false);
 // Used to skip session close if "move to new window" is clicked.
 final Map<String, bool> closeSessionOnDispose = {};
 
+class RemoteKeyboardFocusRestorePolicy {
+  bool _remoteCanvasHadFocus = false;
+
+  void recordWindowBlur({required bool remoteCanvasHadFocus}) {
+    _remoteCanvasHadFocus = remoteCanvasHadFocus;
+  }
+
+  bool consumeWindowFocus({required bool relativeMouseMode}) {
+    final shouldRestore = _remoteCanvasHadFocus || relativeMouseMode;
+    _remoteCanvasHadFocus = false;
+    return shouldRestore;
+  }
+}
+
 class RemotePage extends StatefulWidget {
   RemotePage({
     Key? key,
@@ -92,6 +106,8 @@ class _RemotePageState extends State<RemotePage>
   var _blockableOverlayState = BlockableOverlayState();
 
   final FocusNode _rawKeyFocusNode = FocusNode(debugLabel: "rawkeyFocusNode");
+  final RemoteKeyboardFocusRestorePolicy _keyboardFocusRestorePolicy =
+      RemoteKeyboardFocusRestorePolicy();
 
   // Debounce timer for pointer lock center updates during window events.
   // Uses kDefaultPointerLockCenterThrottleMs from consts.dart for the duration.
@@ -107,6 +123,7 @@ class _RemotePageState extends State<RemotePage>
   bool _waylandKeyboardModeNormalized = false;
   bool _waylandKeyboardModeNormalizing = false;
   bool _viewerFileDropInProgress = false;
+  Timer? _peerThumbnailTimer;
 
   SessionID get sessionId => _ffi.sessionId;
 
@@ -132,6 +149,11 @@ class _RemotePageState extends State<RemotePage>
           _ffi.ffiModel.pi.platform, _ffi.dialogManager);
       _ffi.recordingModel
           .updateStatus(bind.sessionGetIsRecording(sessionId: _ffi.sessionId));
+      _peerThumbnailTimer?.cancel();
+      _peerThumbnailTimer = Timer(const Duration(seconds: 3), () {
+        if (!mounted) return;
+        unawaited(_ffi.ffiModel.capturePeerThumbnail(peerId));
+      });
     });
     _ffi.canvasModel.initializeEdgeScrollFallback(this);
     _ffi.start(
@@ -232,6 +254,8 @@ class _RemotePageState extends State<RemotePage>
   void _cancelPointerLockCenterDebounceTimer() {
     _pointerLockCenterDebounceTimer?.cancel();
     _pointerLockCenterDebounceTimer = null;
+    _peerThumbnailTimer?.cancel();
+    _peerThumbnailTimer = null;
   }
 
   @override
@@ -242,6 +266,8 @@ class _RemotePageState extends State<RemotePage>
     // We disable the `focus` way for non-Windows temporarily.
     if (isWindows) {
       _isWindowBlur = true;
+      _keyboardFocusRestorePolicy.recordWindowBlur(
+          remoteCanvasHadFocus: _rawKeyFocusNode.hasFocus);
       // unfocus the primary-focus when the whole window is lost focus,
       // and let OS to handle events instead.
       _rawKeyFocusNode.unfocus();
@@ -265,9 +291,18 @@ class _RemotePageState extends State<RemotePage>
     }
     stateGlobal.isFocused.value = true;
 
+    final relativeMouseMode = _ffi.inputModel.relativeMouseMode.value;
+    if (isWindows &&
+        _keyboardFocusRestorePolicy.consumeWindowFocus(
+            relativeMouseMode: relativeMouseMode)) {
+      SchedulerBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || _isWindowBlur || _rawKeyFocusNode.hasFocus) return;
+        _rawKeyFocusNode.requestFocus();
+      });
+    }
+
     // Restore relative mouse mode constraints when window regains focus.
-    if (_ffi.inputModel.relativeMouseMode.value) {
-      _rawKeyFocusNode.requestFocus();
+    if (relativeMouseMode) {
       _ffi.inputModel.onWindowFocus();
     }
   }

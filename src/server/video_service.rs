@@ -1363,6 +1363,35 @@ pub fn set_take_screenshot(source: VideoSource, display_idx: usize, sid: String,
     );
 }
 
+pub fn send_wallpaper_preview(sid: String, tx: Sender) {
+    let worker_sid = sid.clone();
+    let worker_tx = tx.clone();
+    let spawn_result = std::thread::Builder::new()
+        .name("wallpaper-preview".to_owned())
+        .spawn(move || {
+            let mut response = ScreenshotResponse::new();
+            response.sid = worker_sid;
+            #[cfg(target_os = "windows")]
+            match crate::platform::get_wallpaper_preview_png() {
+                Ok(data) => response.data = data.into(),
+                Err(err) => response.msg = format!("Failed to load desktop wallpaper: {err}"),
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                response.msg =
+                    "Wallpaper-only thumbnails are not supported on this platform.".to_owned();
+            }
+            send_screenshot_response(response, worker_tx);
+        });
+    if let Err(err) = spawn_result {
+        log::error!("Failed to start wallpaper preview worker: {err}");
+        let mut response = ScreenshotResponse::new();
+        response.sid = sid;
+        response.msg = "Failed to start wallpaper preview worker.".to_owned();
+        send_screenshot_response(response, tx);
+    }
+}
+
 // We need to this function, because the `stride` may be larger than `width * 4`.
 fn get_rgba_from_pixelbuf<'a>(pixbuf: &scrap::PixelBuffer<'a>) -> ResultType<Vec<u8>> {
     let w = pixbuf.width();
@@ -1416,12 +1445,13 @@ fn handle_screenshot(screenshot: Screenshot, msg: String, w: usize, h: usize, da
     } else {
         response.msg = msg;
     }
+    send_screenshot_response(response, screenshot.tx);
+}
+
+fn send_screenshot_response(response: ScreenshotResponse, tx: Sender) {
     let mut msg_out = Message::new();
     msg_out.set_screenshot_response(response);
-    if let Err(e) = screenshot
-        .tx
-        .send((hbb_common::tokio::time::Instant::now(), Arc::new(msg_out)))
-    {
+    if let Err(e) = tx.send((hbb_common::tokio::time::Instant::now(), Arc::new(msg_out))) {
         log::error!("Failed to send screenshot, {}", e);
     }
 }

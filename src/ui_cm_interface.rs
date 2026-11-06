@@ -55,6 +55,7 @@ struct ParallelRangeState {
 
 #[cfg(not(any(target_os = "ios")))]
 struct ParallelFileWriteState {
+    cache_index: u32,
     file_size: u64,
     modified_time: u64,
     final_path: PathBuf,
@@ -108,6 +109,34 @@ fn notify_parallel_clipboard_cache(transfer_id: &str, success: bool) {
     }
 }
 
+#[cfg(all(not(any(target_os = "ios")), target_os = "windows"))]
+fn notify_parallel_clipboard_cache_progress(
+    transfer_id: &str,
+    file_index: u32,
+    available_bytes: u64,
+) {
+    if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+        context
+            .update_parallel_file_cache_progress(transfer_id, file_index, available_bytes)
+            .map_err(|err| err.into())
+    }) {
+        log::warn!(
+            "Failed to publish Explorer clipboard cache {} progress for file {}: {}",
+            transfer_id,
+            file_index,
+            err
+        );
+    }
+}
+
+#[cfg(all(not(any(target_os = "ios")), not(target_os = "windows")))]
+fn notify_parallel_clipboard_cache_progress(
+    _transfer_id: &str,
+    _file_index: u32,
+    _available_bytes: u64,
+) {
+}
+
 #[cfg(all(not(any(target_os = "ios")), not(target_os = "windows")))]
 fn notify_parallel_clipboard_cache(_transfer_id: &str, _success: bool) {}
 
@@ -149,10 +178,13 @@ fn parallel_clipboard_cache_root(
             return Err("invalid Explorer clipboard cache file map".to_owned());
         }
     }
-    Ok(std::env::temp_dir()
-        .join("MasterDesk")
-        .join("clipboard-cache")
-        .join(parsed.to_string()))
+    let total_size = files.iter().try_fold(0u64, |total, (_, size, _)| {
+        total
+            .checked_add(*size)
+            .ok_or("Explorer clipboard cache size overflow")
+    })?;
+    crate::platform::parallel_clipboard_cache_root(&parsed.to_string(), total_size)
+        .map_err(|err| err.to_string())
 }
 
 #[cfg(not(any(target_os = "ios")))]
@@ -714,7 +746,7 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                         }
                         Ok(Some(data)) => {
                             match data {
-                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, privacy_mode, from_switch, parallel_auxiliary} => {
+                                Data::Login{id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, file_transfer_enabled: _file_transfer_enabled, restart, recording, block_input, privacy_mode, from_switch, parallel_auxiliary, parallel_clipboard_cache} => {
                                     log::debug!("conn_id: {}", id);
                                     if !parallel_auxiliary {
                                         self.cm.add_connection(id, is_file_transfer, is_view_camera, is_terminal, port_forward, peer_id, name, avatar, authorized, keyboard, clipboard, audio, file, restart, recording, block_input, privacy_mode, from_switch, self.tx.clone());
@@ -724,6 +756,28 @@ impl<T: InvokeUiCM> IpcTaskRunner<T> {
                                     #[cfg(target_os = "windows")]
                                     {
                                         self.file_transfer_enabled = _file_transfer_enabled;
+                                        if !parallel_auxiliary {
+                                            let (mode_enabled, minimum_total_bytes) =
+                                                crate::client::io_loop::configured_parallel_clipboard_cache_policy();
+                                            let enabled = parallel_clipboard_cache
+                                                && _file_transfer_enabled
+                                                && mode_enabled;
+                                            if let Err(err) = ContextSend::proc(
+                                                |context| -> ResultType<()> {
+                                                    context
+                                                        .set_parallel_file_cache_enabled(
+                                                            enabled,
+                                                            minimum_total_bytes,
+                                                        )
+                                                        .map_err(|err| err.into())
+                                                },
+                                            ) {
+                                                log::warn!(
+                                                    "Failed to configure remote Explorer parallel cache: {}",
+                                                    err
+                                                );
+                                            }
+                                        }
                                     }
                                     self.running = true;
                                     break;
@@ -1381,7 +1435,9 @@ async fn handle_fs(
 
             let mut parallel_files = HashMap::with_capacity(resolved.len());
             let mut parallel_resume_offset = 0u64;
-            for (current_file_num, final_path, file_size, modified_time) in resolved {
+            for (cache_index, (current_file_num, final_path, file_size, modified_time)) in
+                resolved.into_iter().enumerate()
+            {
                 if let Some(parent) = final_path.parent() {
                     if let Err(err) = std::fs::create_dir_all(parent) {
                         for file in parallel_files.into_values() {
@@ -1451,6 +1507,7 @@ async fn handle_fs(
                 parallel_files.insert(
                     current_file_num,
                     ParallelFileWriteState {
+                        cache_index: cache_index as u32,
                         file_size,
                         modified_time,
                         final_path,
@@ -1694,14 +1751,23 @@ async fn handle_fs(
                 );
                 return;
             }
+            let mut progress = None;
             let mut jobs = PARALLEL_WRITE_JOBS.lock().unwrap();
             if let Some(job) = jobs.get_mut(&transfer_id) {
+                let clipboard_cache = job.clipboard_cache;
                 if let Some(file) = job.files.get_mut(&file_num) {
                     if let Some(range) = file.ranges.get_mut(&worker) {
                         range.next += data_len;
                         file.received += data_len;
+                        if clipboard_cache {
+                            progress = Some((file.cache_index, parallel_contiguous_prefix(file)));
+                        }
                     }
                 }
+            }
+            drop(jobs);
+            if let Some((file_index, available_bytes)) = progress {
+                notify_parallel_clipboard_cache_progress(&transfer_id, file_index, available_bytes);
             }
         }
         ipc::FS::ParallelWorkerDone {
@@ -1887,6 +1953,30 @@ async fn handle_fs(
                 let _ = std::fs::remove_file(digest_path);
             }
             if clipboard_cache {
+                // Explorer may already be blocked in IStream::Read. Publish an
+                // on-disk completion fact before the best-effort native signal.
+                let ready_marker = completed
+                    .first()
+                    .and_then(|(_, final_path, _, _)| final_path.parent())
+                    .map(|root| root.join(".ready"));
+                let marker_result = match ready_marker {
+                    Some(path) => std::fs::write(path, b""),
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "Explorer clipboard cache has no root",
+                    )),
+                };
+                if let Err(err) = marker_result {
+                    for (_, final_path, _, _) in &completed {
+                        let _ = std::fs::remove_file(final_path);
+                    }
+                    notify_parallel_clipboard_cache(&cache_transfer_id, false);
+                    send_raw(
+                        new_parallel_error(id, file_num, &transfer_id, &err.to_string()),
+                        &primary_tx,
+                    );
+                    return;
+                }
                 notify_parallel_clipboard_cache(&cache_transfer_id, true);
                 log::info!(
                     "parallel Explorer clipboard cache {} published to Windows Explorer",
@@ -2677,6 +2767,7 @@ mod tests {
             files: HashMap::from([(
                 0,
                 ParallelFileWriteState {
+                    cache_index: 0,
                     file_size: 32,
                     modified_time: 123,
                     final_path: final_path.clone(),
@@ -2716,6 +2807,11 @@ mod tests {
         let unsafe_map = vec![("..\\escape.bin".to_owned(), 1, 0)];
         assert!(parallel_clipboard_cache_root(&transfer_id, &unsafe_map).is_err());
         assert!(parallel_clipboard_cache_root("not-a-uuid", &files).is_err());
+        let oversized = vec![
+            ("00000000.mdclip".to_owned(), u64::MAX, 0),
+            ("00000001.mdclip".to_owned(), 1, 0),
+        ];
+        assert!(parallel_clipboard_cache_root(&transfer_id, &oversized).is_err());
     }
 
     #[test]

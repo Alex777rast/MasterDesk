@@ -7324,7 +7324,8 @@ dependencies = [
  "runas",
  "rust-pulsectl",
  "samplerate",
- "sciter-rs",
+ "sciter-rs 0.5.57 (git+https://github.com/rustdesk-org/rust-sciter?branch=dyn)",
+ "sciter-rs 0.5.57 (git+https://github.com/rustdesk-org/rust-sciter?branch=dyn_x86)",
  "scrap",
  "serde 1.0.228",
  "serde_derive",
@@ -7555,6 +7556,17 @@ dependencies = [
 name = "sciter-rs"
 version = "0.5.57"
 source = "git+https://github.com/rustdesk-org/rust-sciter?branch=dyn#5322f3a755a0e6bf999fbc60d1efc35246c0f821"
+dependencies = [
+ "lazy_static",
+ "libc",
+ "objc",
+ "objc-foundation",
+]
+
+[[package]]
+name = "sciter-rs"
+version = "0.5.57"
+source = "git+https://github.com/rustdesk-org/rust-sciter?branch=dyn_x86#674e07d3066ca9a92ced3816203ab6b652629d1e"
 dependencies = [
  "lazy_static",
  "libc",

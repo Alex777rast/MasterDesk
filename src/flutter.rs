@@ -1503,7 +1503,23 @@ pub fn update_file_clipboard_required() {
 }
 
 #[cfg(not(target_os = "ios"))]
-pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
+fn should_deliver_text_clipboard(
+    source_peer_id: Option<&str>,
+    candidate_peer_id: &str,
+    is_default: bool,
+    is_connected: bool,
+    is_required: bool,
+) -> bool {
+    is_default
+        && is_required
+        && source_peer_id
+            .map(|source| is_connected && candidate_peer_id != source)
+            .unwrap_or(true)
+}
+
+#[cfg(not(target_os = "ios"))]
+fn send_clipboard_msg_impl(msg: Message, _is_file: bool, source_peer_id: Option<&str>) -> usize {
+    let mut delivered = 0;
     for s in sessions::get_sessions() {
         if !s.is_default() {
             continue;
@@ -1514,10 +1530,21 @@ pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
                 && s.is_file_clipboard_required()
             {
                 s.send(Data::Message(msg.clone()));
+                delivered += 1;
             }
             continue;
         }
-        if s.is_text_clipboard_required() {
+        let candidate_peer_id = s.get_id();
+        let is_connected = source_peer_id
+            .map(|_| s.connection_round_state.lock().unwrap().is_connected())
+            .unwrap_or(true);
+        if should_deliver_text_clipboard(
+            source_peer_id,
+            &candidate_peer_id,
+            true,
+            is_connected,
+            s.is_text_clipboard_required(),
+        ) {
             // Check if the client supports multi clipboards
             if let Some(message::Union::MultiClipboards(multi_clipboards)) = &msg.union {
                 let version = s.ui_handler.peer_info.read().unwrap().version.clone();
@@ -1528,11 +1555,76 @@ pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
                     multi_clipboards,
                 ) {
                     s.send(Data::Message(msg_out));
+                    delivered += 1;
                     continue;
                 }
             }
             s.send(Data::Message(msg.clone()));
+            delivered += 1;
         }
+    }
+    delivered
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn send_clipboard_msg(msg: Message, _is_file: bool) {
+    send_clipboard_msg_impl(msg, _is_file, None);
+}
+
+#[cfg(not(target_os = "ios"))]
+pub fn relay_remote_text_clipboard(source_peer_id: &str, msg: Message) {
+    let delivered = send_clipboard_msg_impl(msg, false, Some(source_peer_id));
+    log::debug!(
+        "Relayed remote text clipboard from {} to {} other connected Viewer session(s)",
+        source_peer_id,
+        delivered
+    );
+}
+
+#[cfg(test)]
+mod clipboard_routing_tests {
+    use super::should_deliver_text_clipboard;
+
+    #[test]
+    fn remote_text_clipboard_targets_only_other_connected_viewers() {
+        assert!(!should_deliver_text_clipboard(
+            Some("source"),
+            "source",
+            true,
+            true,
+            true
+        ));
+        assert!(!should_deliver_text_clipboard(
+            Some("source"),
+            "target",
+            true,
+            false,
+            true
+        ));
+        assert!(!should_deliver_text_clipboard(
+            Some("source"),
+            "target",
+            false,
+            true,
+            true
+        ));
+        assert!(!should_deliver_text_clipboard(
+            Some("source"),
+            "target",
+            true,
+            true,
+            false
+        ));
+        assert!(should_deliver_text_clipboard(
+            Some("source"),
+            "target",
+            true,
+            true,
+            true
+        ));
+        assert!(should_deliver_text_clipboard(
+            None, "source", true, false, true
+        ));
     }
 }
 

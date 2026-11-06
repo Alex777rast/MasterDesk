@@ -279,6 +279,25 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("wayland-soft-keyboard-input-label", "Soft keyboard input"),
         ("wayland-keyboard-input-reset-choice-tip", "Reset keyboard input choice"),
         ("remember-wayland-keyboard-choice-tip", "Don't ask again for this remote computer"),
-        ("conn-e2ee-unavailable-tip", "Could not verify end-to-end encryption.\nThe remote device may still be setting up. Try again later.\nIf this keeps happening, the server may be untrusted.\nContinue anyway?")
+        ("conn-e2ee-unavailable-tip", "Could not verify end-to-end encryption.\nThe remote device may still be setting up. Try again later.\nIf this keeps happening, the server may be untrusted.\nContinue anyway?"),
+        ("Protected profile", "Protected profile"),
+        ("protected-profile-description", "Saved connection passwords are protected for this Windows account and computer. Create an encrypted profile to transfer settings, connection history and saved passwords to another computer."),
+        ("master-password-not-stored", "The master password is not stored and cannot be recovered."),
+        ("Create master password and export profile", "Create master password and export profile"),
+        ("Import protected profile", "Import protected profile"),
+        ("Create master password", "Create master password"),
+        ("Enter master password", "Enter master password"),
+        ("Master password", "Master password"),
+        ("Confirm master password", "Confirm master password"),
+        ("Master passwords do not match", "Master passwords do not match"),
+        ("Export protected profile", "Export protected profile"),
+        ("Protected profile exported successfully", "Protected profile exported successfully"),
+        ("Protected profile imported successfully", "Protected profile imported successfully"),
+        ("Restart MasterDesk to apply all imported settings.", "Restart MasterDesk to apply all imported settings."),
+        ("Profile export failed", "Profile export failed"),
+        ("Profile import failed", "Profile import failed"),
+        ("Export", "Export"),
+        ("Import", "Import"),
+        ("length>=12", "12+ characters")
     ].iter().cloned().collect();
 }

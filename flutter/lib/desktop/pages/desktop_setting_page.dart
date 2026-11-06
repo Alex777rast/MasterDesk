@@ -7,6 +7,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/common/widgets/audio_input.dart';
+import 'package:flutter_hbb/common/widgets/custom_password.dart';
 import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
@@ -908,6 +909,7 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
               child: Column(children: [
                 permissions(context),
                 password(context),
+                if (isWindows) protectedProfile(context),
                 _Card(title: '2FA', children: [tfa()]),
                 if (!isChangeIdDisabled())
                   _Card(title: 'ID', children: [changeId()]),
@@ -1297,6 +1299,243 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             if (usePassword) radios[2],
           ]);
         })));
+  }
+
+  Widget protectedProfile(BuildContext context) {
+    return _Card(title: 'Protected profile', children: [
+      Text(
+        translate('protected-profile-description'),
+        style: TextStyle(color: disabledTextColor(context, !locked)),
+      ).marginOnly(left: _kContentHMargin),
+      Text(
+        translate('master-password-not-stored'),
+        style: TextStyle(color: disabledTextColor(context, !locked)),
+      ).marginOnly(left: _kContentHMargin),
+      Wrap(
+        spacing: 10,
+        runSpacing: 8,
+        children: [
+          ElevatedButton.icon(
+            onPressed: locked ? null : _exportProtectedProfile,
+            icon: const Icon(Icons.lock_outline),
+            label: Text(
+              translate('Create master password and export profile'),
+            ),
+          ),
+          OutlinedButton.icon(
+            onPressed: locked ? null : _importProtectedProfile,
+            icon: const Icon(Icons.file_download_outlined),
+            label: Text(translate('Import protected profile')),
+          ),
+        ],
+      ).marginOnly(left: _kContentHMargin),
+    ]);
+  }
+
+  Future<String?> _requestProfileMasterPassword({
+    required bool creating,
+  }) async {
+    final passwordController = TextEditingController();
+    final confirmationController = TextEditingController();
+    final password = ''.obs;
+    final confirmation = ''.obs;
+    final obscurePassword = true.obs;
+    final obscureConfirmation = true.obs;
+    final rules = masterPasswordValidationRules();
+
+    try {
+      return await showDialog<String>(
+        context: context,
+        barrierDismissible: false,
+        builder: (dialogContext) => AlertDialog(
+          title: Text(translate(
+              creating ? 'Create master password' : 'Enter master password')),
+          content: ConstrainedBox(
+            constraints: const BoxConstraints(minWidth: 430, maxWidth: 520),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Obx(() => TextField(
+                      controller: passwordController,
+                      autofocus: true,
+                      obscureText: obscurePassword.value,
+                      autocorrect: false,
+                      enableSuggestions: false,
+                      maxLength: 128,
+                      onChanged: (value) => password.value = value,
+                      decoration: InputDecoration(
+                        labelText: translate('Master password'),
+                        suffixIcon: IconButton(
+                          onPressed: () =>
+                              obscurePassword.value = !obscurePassword.value,
+                          icon: Icon(obscurePassword.value
+                              ? Icons.visibility_off
+                              : Icons.visibility),
+                        ),
+                      ),
+                      onSubmitted: (_) {
+                        if (!creating && password.value.isNotEmpty) {
+                          Navigator.of(dialogContext).pop(password.value);
+                        }
+                      },
+                    ).workaroundFreezeLinuxMint()),
+                if (creating) ...[
+                  Obx(() => TextField(
+                        controller: confirmationController,
+                        obscureText: obscureConfirmation.value,
+                        autocorrect: false,
+                        enableSuggestions: false,
+                        maxLength: 128,
+                        onChanged: (value) => confirmation.value = value,
+                        decoration: InputDecoration(
+                          labelText: translate('Confirm master password'),
+                          suffixIcon: IconButton(
+                            onPressed: () => obscureConfirmation.value =
+                                !obscureConfirmation.value,
+                            icon: Icon(obscureConfirmation.value
+                                ? Icons.visibility_off
+                                : Icons.visibility),
+                          ),
+                        ),
+                      ).workaroundFreezeLinuxMint()),
+                  PasswordStrengthIndicator(password: password),
+                  const SizedBox(height: 10),
+                  Obx(() => Wrap(
+                        spacing: 12,
+                        runSpacing: 4,
+                        children: rules
+                            .map((rule) => Row(
+                                  mainAxisSize: MainAxisSize.min,
+                                  children: [
+                                    Icon(
+                                      rule.validate(password.value)
+                                          ? Icons.check_circle
+                                          : Icons.radio_button_unchecked,
+                                      color: rule.validate(password.value)
+                                          ? Colors.green
+                                          : Colors.grey,
+                                      size: 16,
+                                    ),
+                                    const SizedBox(width: 4),
+                                    Text(rule.name),
+                                  ],
+                                ))
+                            .toList(),
+                      )),
+                  Obx(() => Offstage(
+                        offstage: confirmation.value.isEmpty ||
+                            confirmation.value == password.value,
+                        child: Text(
+                          translate('Master passwords do not match'),
+                          style: const TextStyle(color: Colors.red),
+                        ),
+                      )),
+                ],
+                const SizedBox(height: 8),
+                Text(translate('master-password-not-stored')),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(),
+              child: Text(translate('Cancel')),
+            ),
+            Obx(() {
+              final enabled = creating
+                  ? isValidMasterPassword(password.value) &&
+                      confirmation.value == password.value
+                  : password.value.isNotEmpty;
+              return ElevatedButton(
+                onPressed: enabled
+                    ? () => Navigator.of(dialogContext).pop(password.value)
+                    : null,
+                child: Text(translate(creating ? 'Export' : 'Import')),
+              );
+            }),
+          ],
+        ),
+      );
+    } finally {
+      password.value = '';
+      confirmation.value = '';
+      passwordController.clear();
+      confirmationController.clear();
+      passwordController.dispose();
+      confirmationController.dispose();
+    }
+  }
+
+  Map<String, dynamic> _profileTransferResult(String value) {
+    try {
+      final result = jsonDecode(value);
+      return result is Map<String, dynamic>
+          ? result
+          : <String, dynamic>{'ok': false};
+    } catch (_) {
+      return <String, dynamic>{'ok': false};
+    }
+  }
+
+  Future<void> _exportProtectedProfile() async {
+    final masterPassword = await _requestProfileMasterPassword(creating: true);
+    if (masterPassword == null || masterPassword.isEmpty || !mounted) return;
+
+    final timestamp = DateTime.now().toIso8601String().replaceAll(':', '-');
+    final path = await FilePicker.platform.saveFile(
+      dialogTitle: translate('Export protected profile'),
+      fileName: 'MasterDesk-profile-$timestamp.mdprofile',
+      allowedExtensions: const ['mdprofile'],
+      type: FileType.custom,
+    );
+    if (path == null || path.isEmpty || !mounted) return;
+
+    final raw = await bind.mainExportPortableProfile(
+      path: path,
+      masterPassword: masterPassword,
+    );
+    final result = _profileTransferResult(raw);
+    if (result['ok'] == true) {
+      showToast(translate('Protected profile exported successfully'));
+    } else {
+      final detail = result['error']?.toString() ?? '';
+      showToast(
+          '${translate('Profile export failed')}${detail.isEmpty ? '' : ': $detail'}');
+    }
+  }
+
+  Future<void> _importProtectedProfile() async {
+    final selection = await FilePicker.platform.pickFiles(
+      dialogTitle: translate('Import protected profile'),
+      type: FileType.custom,
+      allowedExtensions: const ['mdprofile'],
+      allowMultiple: false,
+    );
+    final path = selection?.files.single.path;
+    if (path == null || path.isEmpty || !mounted) return;
+
+    final masterPassword = await _requestProfileMasterPassword(creating: false);
+    if (masterPassword == null || masterPassword.isEmpty || !mounted) return;
+
+    final raw = await bind.mainImportPortableProfile(
+      path: path,
+      masterPassword: masterPassword,
+    );
+    final result = _profileTransferResult(raw);
+    if (result['ok'] == true) {
+      await Future.wait([
+        bind.mainLoadRecentPeers(),
+        bind.mainLoadFavPeers(),
+      ]);
+      showToast(
+        '${translate('Protected profile imported successfully')}\n${translate('Restart MasterDesk to apply all imported settings.')}',
+      );
+    } else {
+      final detail = result['error']?.toString() ?? '';
+      showToast(
+          '${translate('Profile import failed')}${detail.isEmpty ? '' : ': $detail'}');
+    }
   }
 
   Widget more(BuildContext context) {

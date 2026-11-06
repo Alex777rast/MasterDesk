@@ -31,6 +31,15 @@ lazy_static::lazy_static! {
     static ref CLIPBOARD_CTX: Arc<Mutex<Option<ClipboardContext>>> = Arc::new(Mutex::new(None));
 }
 
+lazy_static::lazy_static! {
+    // A controller may have more than one Viewer process (notably the x86 Sciter
+    // build).  Include a per-process token in client-side owner markers so the
+    // process that wrote a remote clipboard update can suppress its own echo,
+    // while another Viewer process can forward that update to its peer.
+    static ref CLIENT_CLIPBOARD_OWNER_TOKEN: Vec<u8> =
+        uuid::Uuid::new_v4().as_bytes().to_vec();
+}
+
 #[cfg(not(target_os = "android"))]
 const CLIPBOARD_GET_MAX_RETRY: usize = 3;
 #[cfg(not(target_os = "android"))]
@@ -575,20 +584,38 @@ pub enum ClipboardSide {
 }
 
 impl ClipboardSide {
-    // 01: the clipboard is owned by the host
-    // 10: the clipboard is owned by the client
+    // 01: the clipboard is owned by the host.
+    // 10 + token: the clipboard is owned by one client process. Legacy one-byte
+    // client markers remain process-wide to avoid replaying clipboard data left
+    // by an older build.
     fn get_owner_data(&self) -> Vec<u8> {
         match self {
             ClipboardSide::Host => vec![0b01],
-            ClipboardSide::Client => vec![0b10],
+            ClipboardSide::Client => {
+                let mut data = Vec::with_capacity(1 + CLIENT_CLIPBOARD_OWNER_TOKEN.len());
+                data.push(0b10);
+                data.extend_from_slice(&CLIENT_CLIPBOARD_OWNER_TOKEN);
+                data
+            }
         }
     }
 
     fn is_owner(&self, data: &[u8]) -> bool {
-        if data.len() == 0 {
+        if data.is_empty() || data[0] & 0b11 == 0 {
             return false;
         }
-        data[0] & 0b11 != 0
+        match self {
+            // Preserve the host service's process-wide loop suppression.
+            ClipboardSide::Host => true,
+            ClipboardSide::Client => {
+                // Host-originated markers and legacy client markers must not be
+                // retransmitted by an outgoing Viewer.
+                if data[0] & 0b01 != 0 || data.len() == 1 {
+                    return true;
+                }
+                data[1..] == CLIENT_CLIPBOARD_OWNER_TOKEN[..]
+            }
+        }
     }
 }
 
@@ -602,6 +629,26 @@ impl std::fmt::Display for ClipboardSide {
 }
 
 pub use proto::get_msg_if_not_support_multi_clip;
+
+#[cfg(test)]
+mod clipboard_owner_tests {
+    use super::{ClipboardSide, CLIENT_CLIPBOARD_OWNER_TOKEN};
+
+    #[test]
+    fn client_owner_marker_is_process_scoped_and_legacy_safe() {
+        let own = ClipboardSide::Client.get_owner_data();
+        assert!(ClipboardSide::Client.is_owner(&own));
+        assert!(ClipboardSide::Client.is_owner(&[0b10]));
+        assert!(ClipboardSide::Client.is_owner(&[0b01]));
+        assert!(!ClipboardSide::Client.is_owner(&[]));
+
+        let mut foreign = vec![0b10];
+        foreign.extend_from_slice(&CLIENT_CLIPBOARD_OWNER_TOKEN);
+        foreign[1] ^= 0xff;
+        assert!(!ClipboardSide::Client.is_owner(&foreign));
+    }
+}
+
 mod proto {
     #[cfg(not(target_os = "android"))]
     use arboard::ClipboardData;

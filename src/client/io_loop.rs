@@ -41,7 +41,7 @@ use hbb_common::{
     timeout,
     tokio::{
         self,
-        sync::{mpsc, oneshot},
+        sync::{mpsc, oneshot, Semaphore},
         time::{self, Duration, Instant},
     },
     ResultType, Stream,
@@ -163,11 +163,11 @@ static PARALLEL_CLIPBOARD_CACHE_SUPPORTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "windows")]
 pub(crate) fn refresh_parallel_clipboard_cache_mode() {
-    let enabled = PARALLEL_CLIPBOARD_CACHE_SUPPORTED.load(Ordering::Acquire)
-        && !matches!(configured_parallel_mode(), ParallelMode::Fixed(1));
+    let (mode_enabled, minimum_total_bytes) = configured_parallel_clipboard_cache_policy();
+    let enabled = PARALLEL_CLIPBOARD_CACHE_SUPPORTED.load(Ordering::Acquire) && mode_enabled;
     if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
         context
-            .set_parallel_file_cache_enabled(enabled)
+            .set_parallel_file_cache_enabled(enabled, minimum_total_bytes)
             .map_err(|err| err.into())
     }) {
         log::debug!(
@@ -477,6 +477,8 @@ struct ParallelDownloadArgs {
     remote_path: String,
     destination: PathBuf,
     file: FileEntry,
+    target_name: Option<String>,
+    clipboard_cache_file_index: Option<u32>,
 }
 
 struct ParallelReceiveJob {
@@ -487,17 +489,193 @@ struct ParallelReceiveJob {
     received: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
     file: Option<FileEntry>,
+    target_name: Option<String>,
+    clipboard_cache_root: Option<PathBuf>,
     started: bool,
     completion: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ParallelDownloadArgs {
     fn target_path(&self) -> ResultType<PathBuf> {
-        fs::resolve_transfer_path(&self.destination, &self.file.name)
+        fs::resolve_transfer_path(
+            &self.destination,
+            self.target_name.as_deref().unwrap_or(&self.file.name),
+        )
     }
 }
 
-type ParallelChunkQueue = Arc<Mutex<VecDeque<ParallelWorkItem>>>;
+#[cfg(target_os = "windows")]
+fn notify_parallel_download_cache_progress(
+    transfer_id: &str,
+    file_index: u32,
+    available_bytes: u64,
+) {
+    if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+        context
+            .update_parallel_file_cache_progress(transfer_id, file_index, available_bytes)
+            .map_err(|err| err.into())
+    }) {
+        log::warn!(
+            "Failed to publish received Explorer cache {} progress for file {}: {}",
+            transfer_id,
+            file_index,
+            err
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn notify_parallel_download_cache_progress(
+    _transfer_id: &str,
+    _file_index: u32,
+    _available_bytes: u64,
+) {
+}
+
+#[cfg(target_os = "windows")]
+fn cancel_received_parallel_clipboard_cache(job: &ParallelReceiveJob) {
+    if job.clipboard_cache_root.is_none() {
+        return;
+    }
+    if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+        context
+            .cancel_parallel_file_cache(&job.transfer_id)
+            .map_err(|err| err.into())
+    }) {
+        log::warn!(
+            "Failed to cancel received Explorer cache {}: {}",
+            job.transfer_id,
+            err
+        );
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn cancel_received_parallel_clipboard_cache(_job: &ParallelReceiveJob) {}
+
+struct ParallelWorkQueue {
+    pending: Mutex<VecDeque<ParallelWorkItem>>,
+    in_flight: AtomicUsize,
+}
+
+impl ParallelWorkQueue {
+    fn new(items: VecDeque<ParallelWorkItem>) -> Self {
+        Self {
+            pending: Mutex::new(items),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn take(&self, queued_chunks: &AtomicUsize) -> ResultType<Option<ParallelWorkItem>> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| hbb_common::anyhow::anyhow!("parallel chunk queue lock is poisoned"))?;
+        let work = pending.pop_front();
+        if work.is_some() {
+            self.in_flight.fetch_add(1, Ordering::Release);
+            queued_chunks.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(work)
+    }
+
+    fn retry(&self, work: ParallelWorkItem, queued_chunks: &AtomicUsize) -> ResultType<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| hbb_common::anyhow::anyhow!("parallel chunk queue lock is poisoned"))?;
+        pending.push_front(work);
+        queued_chunks.fetch_add(1, Ordering::Relaxed);
+        self.in_flight.fetch_sub(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn complete_one(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+    }
+
+    fn is_complete(&self) -> ResultType<bool> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| hbb_common::anyhow::anyhow!("parallel chunk queue lock is poisoned"))?;
+        Ok(pending.is_empty() && self.in_flight.load(Ordering::Acquire) == 0)
+    }
+}
+
+type ParallelChunkQueue = Arc<ParallelWorkQueue>;
+
+struct ParallelDownloadQueue {
+    pending: Mutex<VecDeque<(u64, u64)>>,
+    in_flight: AtomicUsize,
+}
+
+impl ParallelDownloadQueue {
+    fn new(ranges: VecDeque<(u64, u64)>) -> Self {
+        Self {
+            pending: Mutex::new(ranges),
+            in_flight: AtomicUsize::new(0),
+        }
+    }
+
+    fn take(&self, queued_chunks: &AtomicUsize) -> ResultType<Option<(u64, u64)>> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| hbb_common::anyhow::anyhow!("parallel download queue lock is poisoned"))?;
+        let range = pending.pop_front();
+        if range.is_some() {
+            self.in_flight.fetch_add(1, Ordering::Release);
+            queued_chunks.fetch_sub(1, Ordering::Relaxed);
+        }
+        Ok(range)
+    }
+
+    fn retry(&self, range: (u64, u64), queued_chunks: &AtomicUsize) -> ResultType<()> {
+        let mut pending = self
+            .pending
+            .lock()
+            .map_err(|_| hbb_common::anyhow::anyhow!("parallel download queue lock is poisoned"))?;
+        pending.push_front(range);
+        queued_chunks.fetch_add(1, Ordering::Relaxed);
+        self.in_flight.fetch_sub(1, Ordering::Release);
+        Ok(())
+    }
+
+    fn complete_one(&self) {
+        self.in_flight.fetch_sub(1, Ordering::Release);
+    }
+
+    fn is_complete(&self) -> ResultType<bool> {
+        let pending = self
+            .pending
+            .lock()
+            .map_err(|_| hbb_common::anyhow::anyhow!("parallel download queue lock is poisoned"))?;
+        Ok(pending.is_empty() && self.in_flight.load(Ordering::Acquire) == 0)
+    }
+}
+
+fn parallel_download_terminal_error(
+    queue_complete: bool,
+    cancelled: bool,
+    first_worker_error: Option<&str>,
+) -> Option<String> {
+    if cancelled {
+        return Some(
+            first_worker_error
+                .unwrap_or("parallel download cancelled")
+                .to_owned(),
+        );
+    }
+    if !queue_complete {
+        return Some(
+            first_worker_error
+                .unwrap_or("parallel download ended before all ranges were acknowledged")
+                .to_owned(),
+        );
+    }
+    None
+}
 
 struct ParallelWorkerCommand {
     transfer_id: String,
@@ -522,6 +700,11 @@ impl ParallelWorkerPool {
     fn new<T: InvokeUiSession>(handler: Session<T>, key: String, token: String) -> Self {
         let mut workers = Vec::with_capacity(8);
         let open_connections = Arc::new(AtomicUsize::new(0));
+        // hbbs correlates one pending rendezvous request per peer. Starting all eight
+        // auxiliary handshakes at the same instant can overwrite that state and leave
+        // seven workers retrying until they fail. Keep the established streams
+        // parallel, but serialize only their short connection/login handshakes.
+        let connect_gate = Arc::new(Semaphore::new(1));
         for worker in 1..=8u32 {
             let (tx, rx) = mpsc::unbounded_channel();
             workers.push(tx);
@@ -532,6 +715,7 @@ impl ParallelWorkerPool {
                 worker,
                 rx,
                 open_connections.clone(),
+                connect_gate.clone(),
             ));
         }
         Self {
@@ -561,6 +745,28 @@ fn parallel_mode_from_value(value: &str) -> ParallelMode {
         "8" => ParallelMode::Fixed(8),
         _ => ParallelMode::Auto,
     }
+}
+
+fn parallel_transfer_is_eligible(mode: ParallelMode, file_count: usize, total_size: u64) -> bool {
+    match mode {
+        ParallelMode::Fixed(1) => false,
+        ParallelMode::Fixed(_) => file_count > 0,
+        ParallelMode::Auto => file_count > 1 || total_size >= PARALLEL_FILE_MIN_SIZE,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn parallel_clipboard_cache_policy(mode: ParallelMode) -> (bool, u64) {
+    match mode {
+        ParallelMode::Fixed(1) => (false, PARALLEL_FILE_MIN_SIZE),
+        ParallelMode::Auto => (true, PARALLEL_FILE_MIN_SIZE),
+        ParallelMode::Fixed(_) => (true, 0),
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn configured_parallel_clipboard_cache_policy() -> (bool, u64) {
+    parallel_clipboard_cache_policy(configured_parallel_mode())
 }
 
 fn split_parallel_chunks(start: u64, len: u64, streams: usize) -> VecDeque<(u64, u64)> {
@@ -598,7 +804,7 @@ fn split_parallel_work_items(
             let file_start = overlap_start.saturating_sub(global_start);
             let file_len = overlap_end.saturating_sub(overlap_start);
             let source = args.source_path(index, file);
-            let ranges = if file.size <= PARALLEL_DYNAMIC_CHUNK_SIZE {
+            let ranges = if args.files.len() > 1 && file.size <= PARALLEL_DYNAMIC_CHUNK_SIZE {
                 VecDeque::from([(file_start, file_len)])
             } else {
                 split_parallel_chunks(file_start, file_len, streams)
@@ -648,7 +854,7 @@ async fn run_parallel_stage(
     let streams = streams.max(1).min(pool.workers.len());
     let chunks = split_parallel_work_items(args, start, len, streams);
     let queued_chunks = Arc::new(AtomicUsize::new(chunks.len()));
-    let chunks = Arc::new(Mutex::new(chunks));
+    let chunks = Arc::new(ParallelWorkQueue::new(chunks));
     begin_parallel_telemetry_stage(
         transfer_id,
         streams,
@@ -679,6 +885,8 @@ async fn run_parallel_stage(
         }
         completions.push((completed, telemetry));
     }
+    let mut successful_workers = 0usize;
+    let mut worker_errors = Vec::new();
     for (completed, telemetry) in completions {
         let result = match completed.await {
             Ok(result) => result,
@@ -694,9 +902,25 @@ async fn run_parallel_stage(
                 Ordering::Relaxed,
             );
         }
-        if let Err(err) = result {
-            hbb_common::bail!("{err}");
+        match result {
+            Ok(()) => successful_workers += 1,
+            Err(err) => worker_errors.push(err),
         }
+    }
+    let queue_complete = chunks.is_complete()?;
+    if queue_complete && successful_workers > 0 {
+        if !worker_errors.is_empty() {
+            log::warn!(
+                "parallel file transfer {} completed with {} surviving worker(s); {} worker(s) failed",
+                transfer_id,
+                successful_workers,
+                worker_errors.len()
+            );
+        }
+    } else if let Some(err) = worker_errors.into_iter().next() {
+        hbb_common::bail!("{err}");
+    } else {
+        hbb_common::bail!("parallel transfer stopped before every queued range was acknowledged");
     }
     Ok(started.elapsed())
 }
@@ -910,6 +1134,7 @@ async fn run_parallel_pool_worker<T: InvokeUiSession>(
     worker: u32,
     mut receiver: mpsc::UnboundedReceiver<ParallelWorkerCommand>,
     open_connections: Arc<AtomicUsize>,
+    connect_gate: Arc<Semaphore>,
 ) {
     let mut connection: Option<ParallelWorkerConnection> = None;
     let mut heartbeat = time::interval(PARALLEL_POOL_HEARTBEAT_INTERVAL);
@@ -939,7 +1164,17 @@ async fn run_parallel_pool_worker<T: InvokeUiSession>(
             }
         };
         let result = async {
+            if command.chunks.is_complete()? {
+                return Ok(());
+            }
             if connection.is_none() {
+                let permit = connect_gate.acquire().await.map_err(|_| {
+                    hbb_common::anyhow::anyhow!("parallel connection gate is closed")
+                })?;
+                if command.chunks.is_complete()? {
+                    drop(permit);
+                    return Ok(());
+                }
                 let connected = connect_parallel_worker(
                     handler.clone(),
                     &key,
@@ -949,6 +1184,7 @@ async fn run_parallel_pool_worker<T: InvokeUiSession>(
                     &command.auth_token,
                 )
                 .await?;
+                drop(permit);
                 connection = Some(connected);
                 open_connections.fetch_add(1, Ordering::Relaxed);
             }
@@ -958,7 +1194,17 @@ async fn run_parallel_pool_worker<T: InvokeUiSession>(
             run_parallel_worker_command(active, worker, &command).await
         }
         .await;
-        let result = result.map_err(|err| err.to_string());
+        let result = match result {
+            Err(err) if command.chunks.is_complete().unwrap_or(false) => {
+                log::warn!(
+                    "parallel worker {} became unavailable after all queued ranges were acknowledged: {}",
+                    worker,
+                    err
+                );
+                Ok(())
+            }
+            result => result.map_err(|err| err.to_string()),
+        };
         if result.is_err() {
             if connection.take().is_some() {
                 open_connections.fetch_sub(1, Ordering::Relaxed);
@@ -987,14 +1233,14 @@ async fn run_parallel_worker_command(
         if command.cancelled.load(Ordering::Relaxed) {
             hbb_common::bail!("parallel transfer cancelled");
         }
-        let chunk = match command.chunks.lock() {
-            Ok(mut chunks) => chunks.pop_front(),
-            Err(_) => hbb_common::bail!("parallel chunk queue lock is poisoned"),
-        };
+        let chunk = command.chunks.take(&command.queued_chunks)?;
         let Some(work) = chunk else {
-            return Ok(());
+            if command.chunks.is_complete()? {
+                return Ok(());
+            }
+            time::sleep(Duration::from_millis(20)).await;
+            continue;
         };
-        command.queued_chunks.fetch_sub(1, Ordering::Relaxed);
         if open_source
             .as_ref()
             .map(|(path, _)| path != &work.source)
@@ -1013,145 +1259,171 @@ async fn run_parallel_worker_command(
         let range_start = work.range_start;
         let range_len = work.range_len;
         let range_end = range_start.saturating_add(range_len);
-        if let Some((telemetry, phase)) = &command.telemetry {
-            telemetry.range_start.store(range_start, Ordering::Relaxed);
-            telemetry.range_end.store(range_end, Ordering::Relaxed);
-            telemetry
-                .state
-                .store(PARALLEL_WORKER_TRANSFERRING, Ordering::Relaxed);
-            phase.store(PARALLEL_PHASE_TRANSFERRING, Ordering::Relaxed);
-        }
-
-        let reattach = connection.active_transfer_id != command.transfer_id;
-        let mut action = FileAction::new();
-        action.set_receive(FileTransferReceiveRequest {
-            id: command.args.id,
-            path: command.args.destination.clone(),
-            file_num: work.file_num,
-            parallel_transfer_id: command.transfer_id.clone(),
-            parallel_auth_token: if reattach {
-                command.auth_token.clone()
-            } else {
-                String::new()
-            },
-            range_start,
-            range_len,
-            parallel_worker: worker,
-            ..Default::default()
-        });
-        let mut attach = Message::new();
-        attach.set_file_action(action);
-        connection.peer.send(&attach).await?;
-        connection.active_transfer_id = command.transfer_id.clone();
-
-        file.seek(std::io::SeekFrom::Start(range_start)).await?;
-        let mut offset = range_start;
-        while offset < range_end {
-            if command.cancelled.load(Ordering::Relaxed) {
-                hbb_common::bail!("parallel transfer cancelled");
+        let mut attempt_sent = 0u64;
+        let result: ResultType<()> = async {
+            if let Some((telemetry, phase)) = &command.telemetry {
+                telemetry.range_start.store(range_start, Ordering::Relaxed);
+                telemetry.range_end.store(range_end, Ordering::Relaxed);
+                telemetry
+                    .state
+                    .store(PARALLEL_WORKER_TRANSFERRING, Ordering::Relaxed);
+                phase.store(PARALLEL_PHASE_TRANSFERRING, Ordering::Relaxed);
             }
-            let wanted = (range_end - offset).min(buffer.len() as u64) as usize;
-            let read = file.read(&mut buffer[..wanted]).await?;
-            if read == 0 {
-                hbb_common::bail!("unexpected end of source file in parallel chunk");
+
+            let reattach = connection.active_transfer_id != command.transfer_id;
+            let mut action = FileAction::new();
+            action.set_receive(FileTransferReceiveRequest {
+                id: command.args.id,
+                path: command.args.destination.clone(),
+                file_num: work.file_num,
+                parallel_transfer_id: command.transfer_id.clone(),
+                parallel_auth_token: if reattach {
+                    command.auth_token.clone()
+                } else {
+                    String::new()
+                },
+                range_start,
+                range_len,
+                parallel_worker: worker,
+                ..Default::default()
+            });
+            let mut attach = Message::new();
+            attach.set_file_action(action);
+            connection.peer.send(&attach).await?;
+            connection.active_transfer_id = command.transfer_id.clone();
+
+            file.seek(std::io::SeekFrom::Start(range_start)).await?;
+            let mut offset = range_start;
+            while offset < range_end {
+                if command.cancelled.load(Ordering::Relaxed) {
+                    hbb_common::bail!("parallel transfer cancelled");
+                }
+                let wanted = (range_end - offset).min(buffer.len() as u64) as usize;
+                let read = file.read(&mut buffer[..wanted]).await?;
+                if read == 0 {
+                    hbb_common::bail!("unexpected end of source file in parallel chunk");
+                }
+                let mut response = FileResponse::new();
+                response.set_block(FileTransferBlock {
+                    id: command.args.id,
+                    file_num: work.file_num,
+                    data: buffer[..read].to_vec().into(),
+                    offset,
+                    parallel_transfer_id: command.transfer_id.clone(),
+                    parallel_worker: worker,
+                    ..Default::default()
+                });
+                let mut message = Message::new();
+                message.set_file_response(response);
+                connection.peer.send(&message).await?;
+                offset += read as u64;
+                attempt_sent += read as u64;
+                command.sent.fetch_add(read as u64, Ordering::Relaxed);
+                if let Some((telemetry, _)) = &command.telemetry {
+                    telemetry
+                        .bytes_transferred
+                        .fetch_add(read as u64, Ordering::Relaxed);
+                }
+            }
+
+            if let Some((telemetry, _)) = &command.telemetry {
+                telemetry
+                    .state
+                    .store(PARALLEL_WORKER_AWAITING_ACK, Ordering::Relaxed);
             }
             let mut response = FileResponse::new();
-            response.set_block(FileTransferBlock {
+            response.set_done(FileTransferDone {
                 id: command.args.id,
                 file_num: work.file_num,
-                data: buffer[..read].to_vec().into(),
-                offset,
                 parallel_transfer_id: command.transfer_id.clone(),
                 parallel_worker: worker,
                 ..Default::default()
             });
-            let mut message = Message::new();
-            message.set_file_response(response);
-            connection.peer.send(&message).await?;
-            offset += read as u64;
-            command.sent.fetch_add(read as u64, Ordering::Relaxed);
+            let mut done = Message::new();
+            done.set_file_response(response);
+            connection.peer.send(&done).await?;
+            log::debug!(
+                "parallel file transfer {} worker {} sent range completion for file {} [{}, {})",
+                command.transfer_id,
+                worker,
+                work.file_num,
+                range_start,
+                range_end
+            );
+            loop {
+                let bytes = match time::timeout(Duration::from_secs(1), connection.peer.next()).await {
+                    Ok(Some(bytes)) => bytes?,
+                    Ok(None) => hbb_common::bail!(
+                        "parallel auxiliary connection closed before acknowledgement"
+                    ),
+                    Err(_) if command.cancelled.load(Ordering::Relaxed) => {
+                        hbb_common::bail!("parallel transfer cancelled")
+                    }
+                    // The receiver persists blocks before acknowledging the range. On a slow
+                    // destination all eight workers can finish sending while its serialized
+                    // disk queue is still draining, so a fixed 30-second acknowledgement
+                    // deadline incorrectly restarted an otherwise complete transfer.
+                    Err(_) => continue,
+                };
+                if bytes.is_empty() {
+                    connection.peer.send_bytes(bytes::Bytes::new()).await?;
+                    continue;
+                }
+                let message = Message::parse_from_bytes(&bytes)?;
+                match message.union {
+                    Some(message::Union::FileResponse(response)) => match response.union {
+                        Some(file_response::Union::Done(done)) => {
+                            if done.worker_ack
+                                && done.parallel_transfer_id == command.transfer_id
+                                && done.parallel_worker == worker
+                                && done.file_num == work.file_num
+                            {
+                                log::debug!(
+                                    "parallel file transfer {} worker {} received range acknowledgement for file {}",
+                                    command.transfer_id,
+                                    worker,
+                                    work.file_num
+                                );
+                                break;
+                            }
+                            log::warn!(
+                                "parallel file transfer {} worker {} ignored mismatched acknowledgement: transfer={} worker={} file={} worker_ack={} finalize={} transfer_complete={}",
+                                command.transfer_id,
+                                worker,
+                                done.parallel_transfer_id,
+                                done.parallel_worker,
+                                done.file_num,
+                                done.worker_ack,
+                                done.finalize,
+                                done.transfer_complete
+                            );
+                        }
+                        Some(file_response::Union::Error(err)) => {
+                            hbb_common::bail!("parallel receiver error: {}", err.error)
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            command.sent.fetch_sub(attempt_sent, Ordering::Relaxed);
             if let Some((telemetry, _)) = &command.telemetry {
                 telemetry
                     .bytes_transferred
-                    .fetch_add(read as u64, Ordering::Relaxed);
+                    .fetch_sub(attempt_sent, Ordering::Relaxed);
             }
+            command.chunks.retry(work, &command.queued_chunks)?;
+            return Err(err);
         }
-
+        command.chunks.complete_one();
         if let Some((telemetry, _)) = &command.telemetry {
-            telemetry
-                .state
-                .store(PARALLEL_WORKER_AWAITING_ACK, Ordering::Relaxed);
-        }
-        let mut response = FileResponse::new();
-        response.set_done(FileTransferDone {
-            id: command.args.id,
-            file_num: work.file_num,
-            parallel_transfer_id: command.transfer_id.clone(),
-            parallel_worker: worker,
-            ..Default::default()
-        });
-        let mut done = Message::new();
-        done.set_file_response(response);
-        connection.peer.send(&done).await?;
-        log::debug!(
-            "parallel file transfer {} worker {} sent range completion for file {} [{}, {})",
-            command.transfer_id,
-            worker,
-            work.file_num,
-            range_start,
-            range_end
-        );
-        loop {
-            let Some(bytes) =
-                time::timeout(Duration::from_secs(30), connection.peer.next()).await?
-            else {
-                hbb_common::bail!("parallel auxiliary connection closed before acknowledgement");
-            };
-            let bytes = bytes?;
-            if bytes.is_empty() {
-                connection.peer.send_bytes(bytes::Bytes::new()).await?;
-                continue;
-            }
-            let message = Message::parse_from_bytes(&bytes)?;
-            match message.union {
-                Some(message::Union::FileResponse(response)) => match response.union {
-                    Some(file_response::Union::Done(done)) => {
-                        if done.worker_ack
-                            && done.parallel_transfer_id == command.transfer_id
-                            && done.parallel_worker == worker
-                            && done.file_num == work.file_num
-                        {
-                            log::debug!(
-                                "parallel file transfer {} worker {} received range acknowledgement for file {}",
-                                command.transfer_id,
-                                worker,
-                                work.file_num
-                            );
-                            if let Some((telemetry, _)) = &command.telemetry {
-                                telemetry.chunks_completed.fetch_add(1, Ordering::Relaxed);
-                                telemetry.jobs_completed.fetch_add(1, Ordering::Relaxed);
-                            }
-                            break;
-                        }
-                        log::warn!(
-                            "parallel file transfer {} worker {} ignored mismatched acknowledgement: transfer={} worker={} file={} worker_ack={} finalize={} transfer_complete={}",
-                            command.transfer_id,
-                            worker,
-                            done.parallel_transfer_id,
-                            done.parallel_worker,
-                            done.file_num,
-                            done.worker_ack,
-                            done.finalize,
-                            done.transfer_complete
-                        );
-                    }
-                    Some(file_response::Union::Error(err)) => {
-                        hbb_common::bail!("parallel receiver error: {}", err.error)
-                    }
-                    _ => {}
-                },
-                _ => {}
-            }
+            telemetry.chunks_completed.fetch_add(1, Ordering::Relaxed);
+            telemetry.jobs_completed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1164,9 +1436,10 @@ async fn run_parallel_download_worker<T: InvokeUiSession>(
     transfer_id: String,
     auth_token: String,
     args: ParallelDownloadArgs,
-    chunks: Arc<Mutex<VecDeque<(u64, u64)>>>,
+    chunks: Arc<ParallelDownloadQueue>,
     queued_chunks: Arc<AtomicUsize>,
     open_connections: Arc<AtomicUsize>,
+    connect_gate: Arc<Semaphore>,
     completed: Arc<Mutex<Vec<(u64, u64)>>>,
     received: Arc<AtomicU64>,
     cancelled: Arc<AtomicBool>,
@@ -1174,8 +1447,29 @@ async fn run_parallel_download_worker<T: InvokeUiSession>(
 ) -> ResultType<()> {
     use hbb_common::tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-    let mut connection =
-        connect_parallel_worker(handler, &key, &token, worker, &transfer_id, &auth_token).await?;
+    let permit = connect_gate
+        .acquire()
+        .await
+        .map_err(|_| hbb_common::anyhow::anyhow!("parallel download connection gate is closed"))?;
+    if chunks.is_complete()? {
+        drop(permit);
+        return Ok(());
+    }
+    let connected =
+        connect_parallel_worker(handler, &key, &token, worker, &transfer_id, &auth_token).await;
+    drop(permit);
+    let mut connection = match connected {
+        Ok(connection) => connection,
+        Err(err) if chunks.is_complete().unwrap_or(false) => {
+            log::warn!(
+                "parallel download worker {} became unavailable after all ranges were acknowledged: {}",
+                worker,
+                err
+            );
+            return Ok(());
+        }
+        Err(err) => return Err(err),
+    };
     open_connections.fetch_add(1, Ordering::Relaxed);
     let open_connections_on_drop = open_connections.clone();
     let _open_connection_guard = crate::SimpleCallOnReturn {
@@ -1196,115 +1490,147 @@ async fn run_parallel_download_worker<T: InvokeUiSession>(
         if cancelled.load(Ordering::Relaxed) {
             hbb_common::bail!("parallel download cancelled");
         }
-        let next = match chunks.lock() {
-            Ok(mut chunks) => chunks.pop_front(),
-            Err(_) => hbb_common::bail!("parallel download queue lock is poisoned"),
-        };
+        let next = chunks.take(&queued_chunks)?;
         let Some((range_start, range_len)) = next else {
-            output.sync_all().await?;
-            if let Some((worker_stats, _)) = &telemetry {
+            if chunks.is_complete()? {
+                output.sync_all().await?;
+                if let Some((worker_stats, _)) = &telemetry {
+                    worker_stats
+                        .state
+                        .store(PARALLEL_WORKER_COMPLETE, Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+            time::sleep(Duration::from_millis(20)).await;
+            continue;
+        };
+        let range_end = range_start.saturating_add(range_len);
+        let range = (range_start, range_len);
+        let mut attempt_received = 0u64;
+        let result: ResultType<()> = async {
+            if let Some((worker_stats, phase)) = &telemetry {
+                worker_stats
+                    .range_start
+                    .store(range_start, Ordering::Relaxed);
+                worker_stats.range_end.store(range_end, Ordering::Relaxed);
                 worker_stats
                     .state
-                    .store(PARALLEL_WORKER_COMPLETE, Ordering::Relaxed);
+                    .store(PARALLEL_WORKER_TRANSFERRING, Ordering::Relaxed);
+                phase.store(PARALLEL_PHASE_TRANSFERRING, Ordering::Relaxed);
             }
-            return Ok(());
-        };
-        queued_chunks.fetch_sub(1, Ordering::Relaxed);
-        let range_end = range_start.saturating_add(range_len);
-        if let Some((worker_stats, phase)) = &telemetry {
-            worker_stats
-                .range_start
-                .store(range_start, Ordering::Relaxed);
-            worker_stats.range_end.store(range_end, Ordering::Relaxed);
-            worker_stats
-                .state
-                .store(PARALLEL_WORKER_TRANSFERRING, Ordering::Relaxed);
-            phase.store(PARALLEL_PHASE_TRANSFERRING, Ordering::Relaxed);
-        }
 
-        let mut action = FileAction::new();
-        action.set_send(FileTransferSendRequest {
-            id: args.id,
-            path: args.remote_path.clone(),
-            include_hidden: false,
-            file_num: 0,
-            file_type: file_transfer_send_request::FileType::Generic.into(),
-            parallel_transfer_id: transfer_id.clone(),
-            range_start,
-            range_len,
-            parallel_worker: worker,
-            ..Default::default()
-        });
-        let mut request = Message::new();
-        request.set_file_action(action);
-        connection.peer.send(&request).await?;
+            let mut action = FileAction::new();
+            action.set_send(FileTransferSendRequest {
+                id: args.id,
+                path: args.remote_path.clone(),
+                include_hidden: false,
+                file_num: 0,
+                file_type: file_transfer_send_request::FileType::Generic.into(),
+                parallel_transfer_id: transfer_id.clone(),
+                range_start,
+                range_len,
+                parallel_worker: worker,
+                parallel_clipboard_cache: args.clipboard_cache_file_index.is_some(),
+                ..Default::default()
+            });
+            let mut request = Message::new();
+            request.set_file_action(action);
+            connection.peer.send(&request).await?;
 
-        let mut expected_offset = range_start;
-        loop {
-            let bytes = match time::timeout(Duration::from_secs(1), connection.peer.next()).await {
-                Ok(Some(bytes)) => bytes?,
-                Ok(None) => hbb_common::bail!("parallel download connection closed"),
-                Err(_) if cancelled.load(Ordering::Relaxed) => {
-                    hbb_common::bail!("parallel download cancelled")
+            let mut expected_offset = range_start;
+            loop {
+                let bytes =
+                    match time::timeout(Duration::from_secs(1), connection.peer.next()).await {
+                        Ok(Some(bytes)) => bytes?,
+                        Ok(None) => hbb_common::bail!("parallel download connection closed"),
+                        Err(_) if cancelled.load(Ordering::Relaxed) => {
+                            hbb_common::bail!("parallel download cancelled")
+                        }
+                        Err(_) => continue,
+                    };
+                if bytes.is_empty() {
+                    connection.peer.send_bytes(bytes::Bytes::new()).await?;
+                    continue;
                 }
-                Err(_) => continue,
-            };
-            if bytes.is_empty() {
-                connection.peer.send_bytes(bytes::Bytes::new()).await?;
-                continue;
-            }
-            let message = Message::parse_from_bytes(&bytes)?;
-            match message.union {
-                Some(message::Union::FileResponse(response)) => match response.union {
-                    Some(file_response::Union::Dir(_)) => {}
-                    Some(file_response::Union::Block(block)) => {
-                        if block.parallel_transfer_id != transfer_id
-                            || block.parallel_worker != worker
-                            || block.offset != expected_offset
-                            || block.offset.saturating_add(block.data.len() as u64) > range_end
-                        {
-                            hbb_common::bail!("invalid parallel download block");
-                        }
-                        output.seek(std::io::SeekFrom::Start(block.offset)).await?;
-                        output.write_all(&block.data).await?;
-                        expected_offset = expected_offset.saturating_add(block.data.len() as u64);
-                        received.fetch_add(block.data.len() as u64, Ordering::Relaxed);
-                        if let Some((worker_stats, _)) = &telemetry {
-                            worker_stats
-                                .bytes_transferred
-                                .fetch_add(block.data.len() as u64, Ordering::Relaxed);
-                        }
-                    }
-                    Some(file_response::Union::Done(done)) => {
-                        if done.worker_ack
-                            && done.parallel_transfer_id == transfer_id
-                            && done.parallel_worker == worker
-                        {
-                            if expected_offset != range_end {
-                                hbb_common::bail!("parallel download range ended early");
+                let message = Message::parse_from_bytes(&bytes)?;
+                match message.union {
+                    Some(message::Union::FileResponse(response)) => match response.union {
+                        Some(file_response::Union::Dir(_)) => {}
+                        Some(file_response::Union::Block(block)) => {
+                            if block.parallel_transfer_id != transfer_id
+                                || block.parallel_worker != worker
+                                || block.offset != expected_offset
+                                || block.offset.saturating_add(block.data.len() as u64) > range_end
+                            {
+                                hbb_common::bail!("invalid parallel download block");
                             }
-                            if let Ok(mut ranges) = completed.lock() {
-                                ranges.push((range_start, range_end));
-                            }
+                            output.seek(std::io::SeekFrom::Start(block.offset)).await?;
+                            output.write_all(&block.data).await?;
+                            expected_offset =
+                                expected_offset.saturating_add(block.data.len() as u64);
+                            attempt_received += block.data.len() as u64;
+                            received.fetch_add(block.data.len() as u64, Ordering::Relaxed);
                             if let Some((worker_stats, _)) = &telemetry {
                                 worker_stats
-                                    .chunks_completed
-                                    .fetch_add(1, Ordering::Relaxed);
-                                worker_stats.jobs_completed.fetch_add(1, Ordering::Relaxed);
-                                worker_stats
-                                    .state
-                                    .store(PARALLEL_WORKER_AWAITING_ACK, Ordering::Relaxed);
+                                    .bytes_transferred
+                                    .fetch_add(block.data.len() as u64, Ordering::Relaxed);
                             }
-                            break;
                         }
-                    }
-                    Some(file_response::Union::Error(err)) => {
-                        hbb_common::bail!("parallel sender error: {}", err.error)
-                    }
+                        Some(file_response::Union::Done(done)) => {
+                            if done.worker_ack
+                                && done.parallel_transfer_id == transfer_id
+                                && done.parallel_worker == worker
+                            {
+                                if expected_offset != range_end {
+                                    hbb_common::bail!("parallel download range ended early");
+                                }
+                                if let Ok(mut ranges) = completed.lock() {
+                                    ranges.push((range_start, range_end));
+                                    if let Some(file_index) = args.clipboard_cache_file_index {
+                                        let prefix = contiguous_completed_prefix(0, ranges.clone());
+                                        notify_parallel_download_cache_progress(
+                                            &transfer_id,
+                                            file_index,
+                                            prefix,
+                                        );
+                                    }
+                                }
+                                if let Some((worker_stats, _)) = &telemetry {
+                                    worker_stats
+                                        .state
+                                        .store(PARALLEL_WORKER_AWAITING_ACK, Ordering::Relaxed);
+                                }
+                                break;
+                            }
+                        }
+                        Some(file_response::Union::Error(err)) => {
+                            hbb_common::bail!("parallel sender error: {}", err.error)
+                        }
+                        _ => {}
+                    },
                     _ => {}
-                },
-                _ => {}
+                }
             }
+            Ok(())
+        }
+        .await;
+
+        if let Err(err) = result {
+            received.fetch_sub(attempt_received, Ordering::Relaxed);
+            if let Some((worker_stats, _)) = &telemetry {
+                worker_stats
+                    .bytes_transferred
+                    .fetch_sub(attempt_received, Ordering::Relaxed);
+            }
+            chunks.retry(range, &queued_chunks)?;
+            return Err(err);
+        }
+        chunks.complete_one();
+        if let Some((worker_stats, _)) = &telemetry {
+            worker_stats
+                .chunks_completed
+                .fetch_add(1, Ordering::Relaxed);
+            worker_stats.jobs_completed.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -1345,15 +1671,18 @@ async fn run_parallel_download<T: InvokeUiSession>(
     }
     .max(1)
     .min(8);
-    let chunks = Arc::new(Mutex::new(split_parallel_chunks(
+    let pending_chunks = split_parallel_chunks(
         resume_offset,
         args.file.size.saturating_sub(resume_offset),
         streams,
-    )));
-    let queued_chunks = Arc::new(AtomicUsize::new(
-        chunks.lock().map(|chunks| chunks.len()).unwrap_or_default(),
-    ));
+    );
+    let queued_chunks = Arc::new(AtomicUsize::new(pending_chunks.len()));
+    let chunks = Arc::new(ParallelDownloadQueue::new(pending_chunks));
     let open_connections = Arc::new(AtomicUsize::new(0));
+    // hbbs correlates one pending rendezvous request per peer. Mirror the
+    // upload worker pool by serializing only the short auxiliary connection
+    // and login phase while keeping established download streams parallel.
+    let connect_gate = Arc::new(Semaphore::new(1));
     begin_parallel_telemetry_stage(
         &transfer_id,
         streams,
@@ -1365,7 +1694,8 @@ async fn run_parallel_download<T: InvokeUiSession>(
     for index in 0..streams {
         let worker = index as u32 + 1;
         let telemetry = register_parallel_worker(&transfer_id, worker, resume_offset, 0);
-        tasks.push(tokio::spawn(run_parallel_download_worker(
+        let worker_telemetry = telemetry.as_ref().map(|(stats, _)| stats.clone());
+        let task = tokio::spawn(run_parallel_download_worker(
             handler.clone(),
             key.clone(),
             token.clone(),
@@ -1376,28 +1706,56 @@ async fn run_parallel_download<T: InvokeUiSession>(
             chunks.clone(),
             queued_chunks.clone(),
             open_connections.clone(),
+            connect_gate.clone(),
             completed.clone(),
             received.clone(),
             cancelled.clone(),
             telemetry,
-        )));
+        ));
+        tasks.push((worker, worker_telemetry, task));
     }
 
     let mut first_error = None;
-    for task in tasks {
+    for (worker, worker_telemetry, task) in tasks {
         match task.await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                cancelled.store(true, Ordering::Relaxed);
+                if let Some(telemetry) = worker_telemetry {
+                    telemetry
+                        .state
+                        .store(PARALLEL_WORKER_ERROR, Ordering::Relaxed);
+                }
+                log::warn!(
+                    "parallel download {} worker {} failed: {}",
+                    transfer_id,
+                    worker,
+                    err
+                );
                 first_error.get_or_insert_with(|| err.to_string());
             }
             Err(err) => {
-                cancelled.store(true, Ordering::Relaxed);
+                if let Some(telemetry) = worker_telemetry {
+                    telemetry
+                        .state
+                        .store(PARALLEL_WORKER_ERROR, Ordering::Relaxed);
+                }
+                log::warn!(
+                    "parallel download {} worker {} task failed: {}",
+                    transfer_id,
+                    worker,
+                    err
+                );
                 first_error.get_or_insert_with(|| err.to_string());
             }
         }
     }
-    if let Some(err) = first_error {
+    let queue_complete = chunks.is_complete()?;
+    if let Some(err) = parallel_download_terminal_error(
+        queue_complete,
+        cancelled.load(Ordering::Relaxed),
+        first_error.as_deref(),
+    ) {
+        cancelled.store(true, Ordering::Relaxed);
         let ranges = completed
             .lock()
             .map(|ranges| ranges.clone())
@@ -1408,6 +1766,13 @@ async fn run_parallel_download<T: InvokeUiSession>(
             .open(&download)?
             .set_len(prefix)?;
         hbb_common::bail!("{err}");
+    }
+    if let Some(err) = first_error {
+        log::warn!(
+            "parallel download {} completed all ranges despite an auxiliary worker failure: {}",
+            transfer_id,
+            err
+        );
     }
 
     std::fs::OpenOptions::new()
@@ -1467,6 +1832,8 @@ pub struct Remote<T: InvokeUiSession> {
     connection_token: String,
     #[cfg(target_os = "windows")]
     local_parallel_clipboard_generation_expected: bool,
+    #[cfg(target_os = "windows")]
+    remote_parallel_clipboard_generation_expected: bool,
 }
 
 #[derive(Default)]
@@ -1524,6 +1891,8 @@ impl<T: InvokeUiSession> Remote<T> {
             connection_token: String::new(),
             #[cfg(target_os = "windows")]
             local_parallel_clipboard_generation_expected: false,
+            #[cfg(target_os = "windows")]
+            remote_parallel_clipboard_generation_expected: false,
         }
     }
 
@@ -1758,6 +2127,7 @@ impl<T: InvokeUiSession> Remote<T> {
             }
         }
         for job in self.parallel_receive_jobs.values() {
+            cancel_received_parallel_clipboard_cache(job);
             job.cancelled.store(true, Ordering::Relaxed);
         }
         let completions = self
@@ -1802,18 +2172,22 @@ impl<T: InvokeUiSession> Remote<T> {
         msg: Option<clipboard::ClipboardFile>,
     ) {
         match msg {
-            Some(clip) => {
+            Some(mut clip) => {
                 #[cfg(target_os = "windows")]
-                if let clipboard::ClipboardFile::FormatList { format_list } = &clip {
-                    self.local_parallel_clipboard_generation_expected = format_list
-                        .iter()
-                        .any(|(_, name)| name == "MasterDeskParallelFileCacheV1");
+                if let clipboard::ClipboardFile::FormatList { format_list } = &mut clip {
+                    let (mode_enabled, minimum_total_bytes) =
+                        configured_parallel_clipboard_cache_policy();
                     let enabled = self.peer_info.support_parallel_clipboard_cache
                         && self.peer_info.platform == "Windows"
-                        && !matches!(configured_parallel_mode(), ParallelMode::Fixed(1));
+                        && mode_enabled;
+                    self.local_parallel_clipboard_generation_expected =
+                        crate::clipboard_file::filter_parallel_clipboard_cache_format(
+                            format_list,
+                            enabled,
+                        );
                     let _ = ContextSend::proc(|context| -> ResultType<()> {
                         context
-                            .set_parallel_file_cache_enabled(enabled)
+                            .set_parallel_file_cache_enabled(enabled, minimum_total_bytes)
                             .map_err(|err| err.into())
                     });
                 }
@@ -1913,6 +2287,7 @@ impl<T: InvokeUiSession> Remote<T> {
 
     fn parallel_upload_supported(&self, job: &fs::TransferJob) -> bool {
         let lc = self.handler.lc.read().unwrap();
+        let mode = configured_parallel_mode();
         let supported = lc
             .features
             .as_ref()
@@ -1922,8 +2297,7 @@ impl<T: InvokeUiSession> Remote<T> {
             && self.peer_info.platform == "Windows"
             && job.r#type == fs::JobType::Generic
             && !job.files().is_empty()
-            && (job.files().len() > 1 || job.total_size() >= PARALLEL_FILE_MIN_SIZE)
-            && !matches!(configured_parallel_mode(), ParallelMode::Fixed(1))
+            && parallel_transfer_is_eligible(mode, job.files().len(), job.total_size())
     }
 
     fn parallel_download_supported(&self, job_type: fs::JobType) -> bool {
@@ -1944,6 +2318,7 @@ impl<T: InvokeUiSession> Remote<T> {
         include_hidden: bool,
         transfer_id: String,
         auth_token: String,
+        parallel_clipboard_cache: bool,
     ) -> Message {
         let mut action = FileAction::new();
         action.set_send(FileTransferSendRequest {
@@ -1955,6 +2330,7 @@ impl<T: InvokeUiSession> Remote<T> {
             parallel_transfer_id: transfer_id,
             parallel_initialize: true,
             parallel_auth_token: auth_token,
+            parallel_clipboard_cache,
             ..Default::default()
         });
         let mut message = Message::new();
@@ -1967,6 +2343,15 @@ impl<T: InvokeUiSession> Remote<T> {
             return;
         };
         job.cancelled.store(true, Ordering::Relaxed);
+        #[cfg(target_os = "windows")]
+        if job.clipboard_cache_root.is_some() {
+            let _ = ContextSend::proc(|context| -> ResultType<()> {
+                context
+                    .complete_parallel_file_cache(&job.transfer_id, false)
+                    .map_err(|err| err.into())
+            });
+            fs::remove_job(id, &mut self.write_jobs);
+        }
         let mut action = FileAction::new();
         action.set_cancel(FileTransferCancel {
             id,
@@ -1993,7 +2378,8 @@ impl<T: InvokeUiSession> Remote<T> {
         let Some(file) = pending.file.clone() else {
             return false;
         };
-        if file.size < PARALLEL_FILE_MIN_SIZE {
+        let target_name = pending.target_name.clone();
+        if !parallel_transfer_is_eligible(pending.mode, 1, file.size) {
             self.cancel_pending_parallel_download(digest.id, peer).await;
             return false;
         }
@@ -2009,7 +2395,10 @@ impl<T: InvokeUiSession> Remote<T> {
                 return false;
             }
         };
-        let target = match fs::resolve_transfer_path(&destination, &file.name) {
+        let target = match fs::resolve_transfer_path(
+            &destination,
+            target_name.as_deref().unwrap_or(&file.name),
+        ) {
             Ok(path) => path,
             Err(err) => {
                 self.handle_job_status(digest.id, digest.file_num, Some(err.to_string()));
@@ -2075,6 +2464,8 @@ impl<T: InvokeUiSession> Remote<T> {
             remote_path,
             destination,
             file,
+            target_name,
+            clipboard_cache_file_index: pending.clipboard_cache_root.as_ref().map(|_| 0),
         };
         let id = digest.id;
         let completion = tokio::spawn(async move {
@@ -2201,6 +2592,129 @@ impl<T: InvokeUiSession> Remote<T> {
             mode
         );
         allow_err!(peer.send(&message).await);
+    }
+
+    #[cfg(target_os = "windows")]
+    fn fail_remote_parallel_clipboard_cache_generation(&self) {
+        if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+            context
+                .fail_pending_parallel_file_cache()
+                .map_err(|err| err.into())
+        }) {
+            log::warn!(
+                "Failed to release pending Explorer clipboard cache to the legacy path: {}",
+                err
+            );
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    async fn start_remote_parallel_clipboard_cache(
+        &mut self,
+        files: Vec<(String, u64)>,
+        peer: &mut Stream,
+    ) {
+        if !self.remote_parallel_clipboard_generation_expected {
+            return;
+        }
+        self.remote_parallel_clipboard_generation_expected = false;
+        let mode = configured_parallel_mode();
+        let total_size = files.iter().map(|(_, size)| *size).sum::<u64>();
+        let eligible = files.len() == 1
+            && files[0].1 > 0
+            && PathBuf::from(&files[0].0).is_absolute()
+            && parallel_transfer_is_eligible(mode, files.len(), total_size)
+            && self.parallel_download_supported(fs::JobType::Generic);
+        if !eligible {
+            self.fail_remote_parallel_clipboard_cache_generation();
+            log::info!(
+                "remote Explorer clipboard cache kept legacy path, mode={:?}, files={}, bytes={}",
+                mode,
+                files.len(),
+                total_size
+            );
+            return;
+        }
+
+        let id = NEXT_PARALLEL_CLIPBOARD_JOB_ID.fetch_sub(1, Ordering::Relaxed);
+        let transfer_id = uuid::Uuid::new_v4().to_string();
+        let auth_token = uuid::Uuid::new_v4().to_string();
+        let root = match crate::platform::parallel_clipboard_cache_root(&transfer_id, total_size) {
+            Ok(root) => root,
+            Err(err) => {
+                log::warn!("Failed to select received Explorer cache: {}", err);
+                self.fail_remote_parallel_clipboard_cache_generation();
+                return;
+            }
+        };
+        if let Err(err) = std::fs::create_dir_all(&root) {
+            log::warn!(
+                "Failed to create received Explorer cache {}: {}",
+                root.display(),
+                err
+            );
+            self.fail_remote_parallel_clipboard_cache_generation();
+            return;
+        }
+        let root_string = root.to_string_lossy().to_string();
+        if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+            context
+                .begin_parallel_file_cache(&transfer_id, &root_string, 1)
+                .map_err(|err| err.into())
+        }) {
+            log::warn!(
+                "Failed to bind received Explorer cache {}: {}",
+                transfer_id,
+                err
+            );
+            let _ = std::fs::remove_dir(&root);
+            self.fail_remote_parallel_clipboard_cache_generation();
+            return;
+        }
+
+        let remote_path = files[0].0.clone();
+        let od = can_enable_overwrite_detection(self.handler.lc.read().unwrap().version);
+        self.write_jobs.push(fs::TransferJob::new_write(
+            id,
+            fs::JobType::Generic,
+            remote_path.clone(),
+            fs::DataSource::FilePath(root.clone()),
+            0,
+            false,
+            true,
+            od,
+        ));
+        self.parallel_receive_jobs.insert(
+            id,
+            ParallelReceiveJob {
+                transfer_id: transfer_id.clone(),
+                auth_token: auth_token.clone(),
+                remote_path: remote_path.clone(),
+                mode,
+                received: Arc::new(AtomicU64::new(0)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                file: None,
+                target_name: Some("00000000.mdclip".to_owned()),
+                clipboard_cache_root: Some(root),
+                started: false,
+                completion: None,
+            },
+        );
+        let request = Self::parallel_download_request(
+            id,
+            remote_path,
+            0,
+            false,
+            transfer_id.clone(),
+            auth_token,
+            true,
+        );
+        log::info!(
+            "received Explorer clipboard cache {} negotiated parallel download, mode={:?}",
+            transfer_id,
+            mode
+        );
+        allow_err!(peer.send(&request).await);
     }
 
     async fn start_legacy_upload(&mut self, args: ParallelUploadArgs, peer: &mut Stream) {
@@ -2510,6 +3024,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             include_hidden,
                             transfer_id.clone(),
                             auth_token.clone(),
+                            false,
                         );
                         self.parallel_receive_jobs.insert(
                             id,
@@ -2521,6 +3036,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                 received: Arc::new(AtomicU64::new(0)),
                                 cancelled: Arc::new(AtomicBool::new(false)),
                                 file: None,
+                                target_name: None,
+                                clipboard_cache_root: None,
                                 started: false,
                                 completion: None,
                             },
@@ -2708,6 +3225,7 @@ impl<T: InvokeUiSession> Remote<T> {
                                 job.show_hidden,
                                 transfer_id.clone(),
                                 auth_token.clone(),
+                                false,
                             );
                             self.parallel_receive_jobs.insert(
                                 id,
@@ -2719,6 +3237,8 @@ impl<T: InvokeUiSession> Remote<T> {
                                     received: Arc::new(AtomicU64::new(0)),
                                     cancelled: Arc::new(AtomicBool::new(false)),
                                     file: None,
+                                    target_name: None,
+                                    clipboard_cache_root: None,
                                     started: false,
                                     completion: None,
                                 },
@@ -2944,6 +3464,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     return true;
                 }
                 if let Some(mut job) = self.parallel_receive_jobs.remove(&id) {
+                    cancel_received_parallel_clipboard_cache(&job);
                     job.cancelled.store(true, Ordering::Relaxed);
                     mark_parallel_transfer_phase(&job.transfer_id, PARALLEL_PHASE_FALLBACK);
                     let mut action = FileAction::new();
@@ -3166,7 +3687,7 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
             }
-            Data::ParallelDownloadFinished((id, file_num, transfer_id, error)) => {
+            Data::ParallelDownloadFinished((id, file_num, transfer_id, mut error)) => {
                 let matches = self
                     .parallel_receive_jobs
                     .get(&id)
@@ -3174,6 +3695,29 @@ impl<T: InvokeUiSession> Remote<T> {
                     == Some(transfer_id.as_str());
                 if matches {
                     let completed_job = self.parallel_receive_jobs.remove(&id);
+                    let clipboard_cache_root = completed_job
+                        .as_ref()
+                        .and_then(|job| job.clipboard_cache_root.clone());
+                    #[cfg(target_os = "windows")]
+                    if let Some(root) = &clipboard_cache_root {
+                        if error.is_none() {
+                            if let Err(err) = std::fs::write(root.join(".ready"), b"") {
+                                error = Some(err.to_string());
+                            }
+                        }
+                        let success = error.is_none();
+                        if let Err(err) = ContextSend::proc(|context| -> ResultType<()> {
+                            context
+                                .complete_parallel_file_cache(&transfer_id, success)
+                                .map_err(|err| err.into())
+                        }) {
+                            log::warn!(
+                                "Failed to complete received Explorer cache {}: {}",
+                                transfer_id,
+                                err
+                            );
+                        }
+                    }
                     let mut action = FileAction::new();
                     action.set_cancel(FileTransferCancel {
                         id,
@@ -3187,7 +3731,16 @@ impl<T: InvokeUiSession> Remote<T> {
                     match error {
                         Some(err) => {
                             mark_parallel_transfer_phase(&transfer_id, PARALLEL_PHASE_FALLBACK);
-                            self.handle_job_status(id, file_num, Some(err));
+                            if clipboard_cache_root.is_some() {
+                                fs::remove_job(id, &mut self.write_jobs);
+                                log::warn!(
+                                    "received Explorer clipboard cache {} fell back to legacy: {}",
+                                    transfer_id,
+                                    err
+                                );
+                            } else {
+                                self.handle_job_status(id, file_num, Some(err));
+                            }
                         }
                         None => {
                             mark_parallel_transfer_phase(&transfer_id, PARALLEL_PHASE_COMPLETE);
@@ -3296,6 +3849,7 @@ impl<T: InvokeUiSession> Remote<T> {
             job.remove_download_file();
         }
         if let Some(job) = self.parallel_receive_jobs.remove(&id) {
+            cancel_received_parallel_clipboard_cache(&job);
             job.cancelled.store(true, Ordering::Relaxed);
         }
         let _ = fs::remove_job(id, &mut self.read_jobs);
@@ -3603,12 +4157,14 @@ impl<T: InvokeUiSession> Remote<T> {
                         self.set_peer_info(&pi);
                         #[cfg(target_os = "windows")]
                         {
+                            let (mode_enabled, minimum_total_bytes) =
+                                configured_parallel_clipboard_cache_policy();
                             let enabled = self.peer_info.support_parallel_clipboard_cache
                                 && self.peer_info.platform == "Windows"
-                                && !matches!(configured_parallel_mode(), ParallelMode::Fixed(1));
+                                && mode_enabled;
                             let _ = ContextSend::proc(|context| -> ResultType<()> {
                                 context
-                                    .set_parallel_file_cache_enabled(enabled)
+                                    .set_parallel_file_cache_enabled(enabled, minimum_total_bytes)
                                     .map_err(|err| err.into())
                             });
                         }
@@ -3707,6 +4263,15 @@ impl<T: InvokeUiSession> Remote<T> {
                         !lc.disable_clipboard.v && !lc.view_only.v
                     };
                     if clipboard_allowed {
+                        #[cfg(feature = "flutter")]
+                        {
+                            let mut relay = Message::new();
+                            relay.set_clipboard(cb.clone());
+                            crate::flutter::relay_remote_text_clipboard(
+                                &self.handler.get_id(),
+                                relay,
+                            );
+                        }
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(vec![cb], ClipboardSide::Client);
                         #[cfg(target_os = "ios")]
@@ -3730,6 +4295,15 @@ impl<T: InvokeUiSession> Remote<T> {
                         !lc.disable_clipboard.v && !lc.view_only.v
                     };
                     if clipboard_allowed {
+                        #[cfg(feature = "flutter")]
+                        {
+                            let mut relay = Message::new();
+                            relay.set_multi_clipboards(_mcb.clone());
+                            crate::flutter::relay_remote_text_clipboard(
+                                &self.handler.get_id(),
+                                relay,
+                            );
+                        }
                         #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         update_clipboard(_mcb.clipboards, ClipboardSide::Client);
                         #[cfg(target_os = "ios")]
@@ -4512,9 +5086,24 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler.set_platform_additions(&pi.platform_additions);
                 }
                 Some(message::Union::ScreenshotResponse(response)) => {
-                    crate::client::screenshot::set_screenshot(response.data);
-                    self.handler
-                        .handle_screenshot_resp(response.sid, response.msg);
+                    if let Some(sid) =
+                        crate::client::screenshot::wallpaper_preview_response_session_id(
+                            &response.sid,
+                        )
+                    {
+                        self.handler.handle_screenshot_resp(
+                            sid.to_owned(),
+                            "The remote version does not support wallpaper-only thumbnails."
+                                .to_owned(),
+                        );
+                    } else {
+                        crate::client::screenshot::set_screenshot(
+                            response.sid.clone(),
+                            response.data,
+                        );
+                        self.handler
+                            .handle_screenshot_resp(response.sid, response.msg);
+                    }
                 }
                 Some(message::Union::TerminalResponse(response)) => {
                     use hbb_common::message_proto::terminal_response::Union;
@@ -4758,7 +5347,7 @@ impl<T: InvokeUiSession> Remote<T> {
     async fn handle_cliprdr_msg(
         &mut self,
         clip: hbb_common::message_proto::Cliprdr,
-        _peer: &mut Stream,
+        peer: &mut Stream,
     ) {
         log::debug!("handling cliprdr msg from server peer");
         #[cfg(feature = "flutter")]
@@ -4770,10 +5359,25 @@ impl<T: InvokeUiSession> Remote<T> {
             }
         }
 
+        #[cfg(target_os = "windows")]
+        if let Some(hbb_common::message_proto::cliprdr::Union::FormatList(data)) = &clip.union {
+            self.remote_parallel_clipboard_generation_expected = data
+                .formats
+                .iter()
+                .any(|format| format.format == "MasterDeskParallelFileCacheV1");
+        }
+
         let Some(clip) = crate::clipboard_file::msg_2_clip(clip) else {
             log::warn!("failed to decode cliprdr msg from server peer");
             return;
         };
+
+        #[cfg(target_os = "windows")]
+        if let clipboard::ClipboardFile::Files { files } = &clip {
+            self.start_remote_parallel_clipboard_cache(files.clone(), peer)
+                .await;
+            return;
+        }
 
         let is_stopping_allowed = clip.is_beginning_message();
         let file_transfer_enabled = self.handler.is_file_clipboard_required();
@@ -4986,6 +5590,27 @@ mod parallel_file_transfer_tests {
     }
 
     #[test]
+    fn fixed_parallel_small_single_file_is_split_across_workers() {
+        let args = ParallelUploadArgs {
+            id: 8,
+            file_num: 0,
+            source_selection: PathBuf::from("small.bin"),
+            destination: "target".to_owned(),
+            files: vec![FileEntry {
+                name: "small.bin".to_owned(),
+                size: 1024,
+                ..Default::default()
+            }],
+            include_hidden: false,
+            source_paths: None,
+            clipboard_cache: false,
+        };
+        let work = split_parallel_work_items(&args, 0, args.total_size(), 8);
+        assert_eq!(work.len(), 8);
+        assert_eq!(work.iter().map(|item| item.range_len).sum::<u64>(), 1024);
+    }
+
+    #[test]
     fn parallel_file_transfer_large_file_has_dynamic_tail_work() {
         let total = 965 * 1024 * 1024u64;
         let ranges = split_parallel_chunks(0, total, 8);
@@ -4993,6 +5618,86 @@ mod parallel_file_transfer_tests {
         assert!(ranges
             .iter()
             .all(|(_, len)| *len <= PARALLEL_DYNAMIC_CHUNK_SIZE));
+    }
+
+    #[test]
+    fn parallel_work_queue_retries_failed_range_without_finishing_early() {
+        let queued = AtomicUsize::new(2);
+        let queue = ParallelWorkQueue::new(VecDeque::from([
+            ParallelWorkItem {
+                file_num: 0,
+                source: PathBuf::from("first.bin"),
+                file_size: 2,
+                range_start: 0,
+                range_len: 1,
+            },
+            ParallelWorkItem {
+                file_num: 0,
+                source: PathBuf::from("first.bin"),
+                file_size: 2,
+                range_start: 1,
+                range_len: 1,
+            },
+        ]));
+
+        let first = queue.take(&queued).unwrap().unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert!(!queue.is_complete().unwrap());
+
+        queue.retry(first, &queued).unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 2);
+        assert!(!queue.is_complete().unwrap());
+
+        let retried = queue.take(&queued).unwrap().unwrap();
+        assert_eq!(retried.range_start, 0);
+        queue.complete_one();
+        let second = queue.take(&queued).unwrap().unwrap();
+        assert_eq!(second.range_start, 1);
+        assert!(!queue.is_complete().unwrap());
+        queue.complete_one();
+
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        assert!(queue.is_complete().unwrap());
+    }
+
+    #[test]
+    fn parallel_download_queue_retries_failed_range_with_surviving_worker() {
+        let queued = AtomicUsize::new(2);
+        let queue = ParallelDownloadQueue::new(VecDeque::from([(0, 8), (8, 8)]));
+
+        let first = queue.take(&queued).unwrap().unwrap();
+        let failed = queue.take(&queued).unwrap().unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        assert!(!queue.is_complete().unwrap());
+
+        queue.complete_one();
+        queue.retry(failed, &queued).unwrap();
+        assert_eq!(queued.load(Ordering::Relaxed), 1);
+        assert!(!queue.is_complete().unwrap());
+
+        let retried = queue.take(&queued).unwrap().unwrap();
+        assert_eq!(first, (0, 8));
+        assert_eq!(retried, (8, 8));
+        queue.complete_one();
+
+        assert_eq!(queued.load(Ordering::Relaxed), 0);
+        assert!(queue.is_complete().unwrap());
+    }
+
+    #[test]
+    fn parallel_download_complete_queue_tolerates_auxiliary_worker_failure() {
+        assert_eq!(
+            parallel_download_terminal_error(true, false, Some("rendezvous failed")),
+            None
+        );
+        assert_eq!(
+            parallel_download_terminal_error(false, false, Some("rendezvous failed")),
+            Some("rendezvous failed".to_owned())
+        );
+        assert_eq!(
+            parallel_download_terminal_error(true, true, None),
+            Some("parallel download cancelled".to_owned())
+        );
     }
 
     #[test]
@@ -5109,6 +5814,76 @@ mod parallel_file_transfer_tests {
         assert_eq!(parallel_mode_from_value("8"), ParallelMode::Fixed(8));
         assert_eq!(parallel_mode_from_value("auto"), ParallelMode::Auto);
         assert_eq!(parallel_mode_from_value("16"), ParallelMode::Auto);
+    }
+
+    #[test]
+    fn fixed_parallel_mode_includes_small_single_files_but_auto_keeps_threshold() {
+        let small = PARALLEL_FILE_MIN_SIZE - 1;
+        assert!(!parallel_transfer_is_eligible(
+            ParallelMode::Fixed(1),
+            1,
+            small
+        ));
+        assert!(parallel_transfer_is_eligible(
+            ParallelMode::Fixed(2),
+            1,
+            small
+        ));
+        assert!(parallel_transfer_is_eligible(
+            ParallelMode::Fixed(4),
+            1,
+            small
+        ));
+        assert!(parallel_transfer_is_eligible(
+            ParallelMode::Fixed(8),
+            1,
+            small
+        ));
+        assert!(!parallel_transfer_is_eligible(ParallelMode::Auto, 1, small));
+        assert!(parallel_transfer_is_eligible(
+            ParallelMode::Auto,
+            1,
+            PARALLEL_FILE_MIN_SIZE
+        ));
+        assert!(parallel_transfer_is_eligible(ParallelMode::Auto, 2, small));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn explorer_parallel_marker_uses_the_same_small_file_policy() {
+        assert_eq!(
+            parallel_clipboard_cache_policy(ParallelMode::Fixed(1)),
+            (false, PARALLEL_FILE_MIN_SIZE)
+        );
+        assert_eq!(
+            parallel_clipboard_cache_policy(ParallelMode::Auto),
+            (true, PARALLEL_FILE_MIN_SIZE)
+        );
+        assert_eq!(
+            parallel_clipboard_cache_policy(ParallelMode::Fixed(8)),
+            (true, 0)
+        );
+    }
+
+    #[test]
+    fn received_clipboard_cache_uses_indexed_target_name() {
+        let args = ParallelDownloadArgs {
+            id: -1_000_001,
+            file_num: 0,
+            remote_path: r"C:\source\example.bin".to_owned(),
+            destination: PathBuf::from(r"C:\cache"),
+            file: FileEntry {
+                name: "example.bin".to_owned(),
+                size: 31 * 1024 * 1024,
+                ..Default::default()
+            },
+            target_name: Some("00000000.mdclip".to_owned()),
+            clipboard_cache_file_index: Some(0),
+        };
+        assert_eq!(
+            args.target_path().unwrap(),
+            PathBuf::from(r"C:\cache\00000000.mdclip")
+        );
     }
 
     #[test]

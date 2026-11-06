@@ -9,6 +9,21 @@ abstract class ValidationRule {
   bool validate(String value);
 }
 
+List<ValidationRule> masterPasswordValidationRules() => [
+      MinCharactersValidationRule(12),
+      UppercaseValidationRule(),
+      LowercaseValidationRule(),
+      DigitValidationRule(),
+      SpecialCharacterValidationRule(),
+    ];
+
+bool isValidMasterPassword(String value) {
+  return value.runes.length <= 128 &&
+      value.trim() == value &&
+      !value.runes.any((rune) => rune < 0x20 || (rune >= 0x7f && rune <= 0x9f)) &&
+      masterPasswordValidationRules().every((rule) => rule.validate(value));
+}
+
 class UppercaseValidationRule extends ValidationRule {
   @override
   String get name => translate('uppercase');

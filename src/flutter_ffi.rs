@@ -33,6 +33,11 @@ use std::{
 
 pub type SessionID = uuid::Uuid;
 
+// flutter_rust_bridge 1.80.1 can omit this opaque alias when libclang treats
+// Dart's forward declaration as private. Generated dummy bindings import it.
+#[allow(non_camel_case_types)]
+pub(crate) type Dart_Handle = *mut std::ffi::c_void;
+
 lazy_static::lazy_static! {
     static ref TEXTURE_RENDER_KEY: Arc<AtomicI32> = Arc::new(AtomicI32::new(0));
 }
@@ -283,11 +288,14 @@ pub fn session_take_screenshot(session_id: SessionID, display: usize) {
     }
 }
 
-pub fn session_handle_screenshot(
-    #[allow(unused_variables)] session_id: SessionID,
-    action: String,
-) -> String {
-    crate::client::screenshot::handle_screenshot(action)
+pub fn session_take_peer_thumbnail(session_id: SessionID, display: usize) {
+    if let Some(s) = sessions::get_session_by_session_id(&session_id) {
+        s.take_peer_thumbnail(display as _, session_id.to_string());
+    }
+}
+
+pub fn session_handle_screenshot(session_id: SessionID, action: String) -> String {
+    crate::client::screenshot::handle_screenshot_for(&session_id.to_string(), action)
 }
 
 pub fn session_is_multi_ui_session(session_id: SessionID) -> SyncReturn<bool> {
@@ -1041,6 +1049,45 @@ pub fn main_get_options() -> String {
 
 pub fn main_get_options_sync() -> SyncReturn<String> {
     SyncReturn(get_options())
+}
+
+fn profile_transfer_result_json(
+    result: hbb_common::ResultType<config::ProfileTransferSummary>,
+) -> String {
+    match result {
+        Ok(summary) => serde_json::json!({
+            "ok": true,
+            "peer_count": summary.peer_count,
+            "address_book_entry_count": summary.address_book_entry_count,
+            "group_peer_count": summary.group_peer_count,
+        })
+        .to_string(),
+        Err(error) => serde_json::json!({
+            "ok": false,
+            "error": format!("{error:#}"),
+        })
+        .to_string(),
+    }
+}
+
+fn wipe_profile_master_password(value: &mut String) {
+    // Replacing bytes with NUL preserves UTF-8 validity while removing the
+    // backend copy before its allocation is released.
+    unsafe {
+        value.as_bytes_mut().fill(0);
+    }
+}
+
+pub fn main_export_portable_profile(path: String, mut master_password: String) -> String {
+    let result = config::export_portable_profile(&path, &master_password);
+    wipe_profile_master_password(&mut master_password);
+    profile_transfer_result_json(result)
+}
+
+pub fn main_import_portable_profile(path: String, mut master_password: String) -> String {
+    let result = config::import_portable_profile(&path, &master_password);
+    wipe_profile_master_password(&mut master_password);
+    profile_transfer_result_json(result)
 }
 
 pub fn main_set_options(json: String) {

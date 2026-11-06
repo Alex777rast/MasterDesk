@@ -1,18 +1,31 @@
 # MasterDesk Code signing policy
 
-This policy is intended for the SignPath Foundation open-source application
-and the subsequent GitHub Actions integration.
+Status: **preparation only; Foundation approval and an active certificate have
+not been verified**. The current workflow creates unsigned x64 evidence only.
+It does not submit signing requests, publish releases, or update the website.
 
-Free code signing provided by [SignPath.io](https://signpath.io/), certificate
-by [SignPath Foundation](https://signpath.org/).
+If approved and activated, the attribution will be: "Free code signing provided
+by [SignPath.io](https://signpath.io/), certificate by
+[SignPath Foundation](https://signpath.org/)." This is not a claim that present
+releases have that signature or that SmartScreen warnings are guaranteed absent.
 
 ## Scope
 
 Only release artifacts built from the public
 `Alex777rast/MasterDesk` repository may be signed with the MasterDesk
-certificate. The current signing target is:
+certificate after approval. The proposed outer x64 signing target is:
 
-`MasterDesk-1.4.9-RDS-x86_64.exe`
+`MasterDesk-<version>-beta-<N>-<YYYY-MM-DD>-RDS-x86_64.exe`
+
+Only new betas greater than the published versions may enter preparation.
+Published beta105 assets/tags are immutable. x86/Sciter, WinPE images, lab
+helpers and externally uploaded binaries are outside this application scope.
+
+The proposed owned payload scope is `MasterDesk.exe`, `libmasterdesk.dll`, and
+`dylib_virtual_display.dll`, built from the reviewed fork. Unmodified Flutter
+and other upstream binaries may be included subject to license review but must
+not be signed as if they were maintained by this project. SignPath must review
+and approve the artifact scope and the relationship to signed upstream builds.
 
 The project will not sign externally uploaded binaries, local developer
 builds, pull-request artifacts, forks owned by third parties, debug builds, or
@@ -20,7 +33,8 @@ artifacts whose source commit cannot be identified.
 
 ## Trusted build
 
-- source and build scripts are public;
+- complete corresponding source, build scripts and modified submodule commits
+  must be published and reviewed before an eligible build;
 - release builds run on GitHub-hosted Windows runners;
 - the workflow checks out the release commit and recursive submodules;
 - toolchain versions and the vcpkg baseline are pinned;
@@ -28,6 +42,19 @@ artifacts whose source commit cannot be identified.
   to SignPath;
 - the SignPath GitHub connector verifies build origin;
 - the signed output is published together with SHA-256 and source commit.
+
+These are requirements, not a claim that existing locally built betas already
+meet them. The manual `masterdesk-windows.yml` workflow first verifies clean
+source/submodules and a new beta, builds on GitHub-hosted Windows, and uploads
+the unsigned package, payload and provenance/inventory for review. It has
+read-only repository permissions and no signing secret or publication step.
+
+Before signing can be enabled, review the dependency licenses/SBOM, origin
+policies, artifact restrictions, timestamp/chain checks and manual approval.
+The future signing order is owned payload first, rebuild its hash manifest,
+pack the signed payload, then sign and verify the outer package. No file may
+be modified after its signature except transformations explicitly covered by
+the reviewed signing pipeline. Do not submit a local EXE as a hosted build.
 
 ## Authorization
 
@@ -37,7 +64,7 @@ artifacts whose source commit cannot be identified.
   project maintainer;
 - production signing requests require the SignPath policy configured for the
   Foundation project;
-- `.github/workflows/`, `.signpath/`, `CODEOWNERS`, and this policy are treated
+- `.github/workflows/`, `.signpath/`, signing/build helpers, `CODEOWNERS`, and this policy are treated
   as security-sensitive files.
 
 ## Team roles

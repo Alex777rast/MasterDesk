@@ -5,6 +5,7 @@ param(
     [switch]$IncrementalRustOnly,
     [switch]$DiagnosticRustLibraryOnly,
     [switch]$RefreshFlutterAot,
+    [switch]$PrepareSigning,
     [ValidateRange(0, 999999)]
     [int]$BetaNumber = 0,
     [string]$OutputFileName = ''
@@ -97,6 +98,7 @@ $ExpectedVcpkgCommit = '120deac3062162151622ca4860575a33844ba10b'
 $FlutterEngineZip = Join-Path $ToolsRoot 'windows-x64-release.zip'
 $FlutterEngineExtract = Join-Path $ToolsRoot 'custom-flutter-engine'
 $FlutterEngineUrl = 'https://github.com/rustdesk/engine/releases/download/main/windows-x64-release.zip'
+$SigningEngineSha256 = 'EC8CABF36EE4FF24C8D98DE25B00E70781EB03876265AEE84D0FE554A110036E'
 $FlutterEngineTarget = Join-Path $FlutterRoot 'bin\cache\artifacts\engine\windows-x64-release'
 $ReleaseDirectory = Join-Path $ProjectRoot 'flutter\build\windows\x64\runner\Release'
 $DistDirectory = Join-Path $ProjectRoot 'dist'
@@ -126,6 +128,32 @@ if ([string]::IsNullOrWhiteSpace($OutputFileName)) {
     throw "OutputFileName must follow the build identity rule: $expectedOutputFileName"
 }
 $OutputExe = Join-Path $DistDirectory $OutputFileName
+if ($PrepareSigning -and ($BetaNumber -lt 106 -or $BetaNumber -gt 65535 -or $DiagnosticRustLibraryOnly)) {
+    throw 'Signing preparation requires a new beta106..65535, not a diagnostic-only build.'
+}
+if (Test-Path -LiteralPath $OutputExe) {
+    throw "Refusing to overwrite an issued package: $OutputExe"
+}
+
+function Initialize-SigningPayloadMetadata {
+    # Keep later ordinary incremental builds consistent too: their cached
+    # runner must not retain the preceding beta's PE version.
+    if ($BetaNumber -lt 106) { return }
+    foreach ($name in @('MasterDesk.exe','libmasterdesk.dll','dylib_virtual_display.dll')) {
+        & (Join-Path $PSScriptRoot 'Set-MasterDeskPeMetadata.ps1') `
+            -Path (Join-Path $ReleaseDirectory $name) -BetaNumber $BetaNumber -BuildDate $BuildDate
+    }
+    foreach ($name in @('NOTICE','PRIVACY.md')) {
+        Copy-Item -LiteralPath (Join-Path $ProjectRoot $name) -Destination $ReleaseDirectory -Force
+    }
+}
+
+function Initialize-SigningPackageMetadata {
+    if ($BetaNumber -ge 106) {
+        & (Join-Path $PSScriptRoot 'Set-MasterDeskPeMetadata.ps1') `
+            -Path $OutputExe -BetaNumber $BetaNumber -BuildDate $BuildDate
+    }
+}
 
 function Invoke-Checked {
     param(
@@ -218,6 +246,9 @@ function Initialize-Flutter {
         )
     }
 
+    if ($PrepareSigning -and (Get-FileHash -LiteralPath $FlutterEngineZip).Hash -cne $SigningEngineSha256) {
+        throw 'Pinned Flutter engine archive hash mismatch; signing preparation stopped without clearing caches.'
+    }
     New-Item -ItemType Directory -Path $FlutterEngineExtract -Force | Out-Null
     Expand-Archive -LiteralPath $FlutterEngineZip -DestinationPath $FlutterEngineExtract -Force
     New-Item -ItemType Directory -Path $FlutterEngineTarget -Force | Out-Null
@@ -553,6 +584,7 @@ function Build-PortableExecutable {
 
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENCE') -Destination $ReleaseDirectory -Force
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'CUSTOM_BUILD.md') -Destination $ReleaseDirectory -Force
+        Initialize-SigningPayloadMetadata
         Write-BuildConsistencyManifest
 
         Push-Location (Join-Path $ProjectRoot 'libs\portable')
@@ -574,6 +606,7 @@ function Build-PortableExecutable {
         }
         New-Item -ItemType Directory -Path $DistDirectory -Force | Out-Null
         Move-Item -LiteralPath $packedExe -Destination $OutputExe -Force
+        Initialize-SigningPackageMetadata
 
         $hash = (Get-FileHash -LiteralPath $OutputExe -Algorithm SHA256).Hash
         $hashLine = "$hash  $([System.IO.Path]::GetFileName($OutputExe))"
@@ -663,15 +696,11 @@ function Invoke-IncrementalFlutterAotBuild {
 
         $generatedAssetRoot = Join-Path $FlutterProject 'build\flutter_assets'
         $generatedAssetsReady = Test-FlutterReleaseAssetBundle -AssetRoot $generatedAssetRoot
-        $generatedAssetManifest = Join-Path $generatedAssetRoot 'AssetManifest.bin'
-        $generatedFontManifest = Join-Path $generatedAssetRoot 'FontManifest.json'
-        $freshOutput = $latestAot -and (
-            $latestAot.LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2) -or
-            ((Test-Path -LiteralPath $generatedAssetManifest) -and
-                (Get-Item -LiteralPath $generatedAssetManifest).LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2)) -or
-            ((Test-Path -LiteralPath $generatedFontManifest) -and
-                (Get-Item -LiteralPath $generatedFontManifest).LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2))
-        )
+        # Fresh asset manifests do not prove that gen_snapshot has refreshed
+        # app.so. Waiting for the AOT file itself prevents the watchdog from
+        # stopping tool_backend while an updated snapshot is still pending.
+        $freshOutput = $latestAot -and
+            $latestAot.LastWriteTimeUtc -ge $startedUtc.AddSeconds(-2)
         $aotAlreadyCurrent = $latestAot -and (
             -not $newestAotInput -or
             $latestAot.LastWriteTimeUtc -ge $newestAotInput.LastWriteTimeUtc
@@ -853,6 +882,11 @@ function Build-IncrementalRustPortableExecutable {
                     -FlutterProject $flutterProject
                 $releaseAot = Join-Path $ReleaseDirectory 'data\app.so'
                 Copy-Item -LiteralPath $aotOutput.FullName -Destination $releaseAot -Force
+                # The backend can validly reuse an unchanged Dart snapshot when
+                # only the Rust implementation behind the generated bridge was
+                # edited. Stamp the copied release artifact after the successful
+                # backend run so the consistency manifest records this refresh.
+                [System.IO.File]::SetLastWriteTimeUtc($releaseAot, [DateTime]::UtcNow)
                 $generatedAssetRoot = Join-Path $flutterProject 'build\flutter_assets'
                 $releaseAssetRoot = Join-Path $ReleaseDirectory 'data\flutter_assets'
                 New-Item -ItemType Directory -Path $releaseAssetRoot -Force | Out-Null
@@ -904,6 +938,7 @@ function Build-IncrementalRustPortableExecutable {
         Remove-LegacyWindowsBundleNames
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'LICENCE') -Destination $ReleaseDirectory -Force
         Copy-Item -LiteralPath (Join-Path $ProjectRoot 'CUSTOM_BUILD.md') -Destination $ReleaseDirectory -Force
+        Initialize-SigningPayloadMetadata
         Write-BuildConsistencyManifest
 
         Push-Location (Join-Path $ProjectRoot 'libs\portable')
@@ -924,6 +959,7 @@ function Build-IncrementalRustPortableExecutable {
         }
         New-Item -ItemType Directory -Path $DistDirectory -Force | Out-Null
         Move-Item -LiteralPath $packedExe -Destination $OutputExe -Force
+        Initialize-SigningPackageMetadata
 
         $hash = (Get-FileHash -LiteralPath $OutputExe -Algorithm SHA256).Hash
         $hashLine = "$hash  $([System.IO.Path]::GetFileName($OutputExe))"

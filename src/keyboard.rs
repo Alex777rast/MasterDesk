@@ -32,6 +32,16 @@ const OS_LOWER_MACOS: &str = "macos";
 #[allow(dead_code)]
 const OS_LOWER_ANDROID: &str = "android";
 
+#[cfg(all(target_os = "windows", not(feature = "flutter")))]
+mod input_source {
+    pub const CONFIG_INPUT_SOURCE_1: &str = "Input source 1";
+    pub const CONFIG_INPUT_SOURCE_2: &str = "Input source 2";
+
+    pub fn get_cur_session_input_source() -> String {
+        CONFIG_INPUT_SOURCE_1.to_string()
+    }
+}
+
 #[cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))]
 static KEYBOARD_HOOKED: AtomicBool = AtomicBool::new(false);
 
@@ -39,11 +49,9 @@ static KEYBOARD_HOOKED: AtomicBool = AtomicBool::new(false);
 static WINDOWS_LAYOUT_TRACE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
-const WINDOWS_LAYOUT_SYNC_POLL_INTERVAL: std::time::Duration =
-    std::time::Duration::from_millis(20);
+const WINDOWS_LAYOUT_SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 #[cfg(target_os = "windows")]
-const WINDOWS_LAYOUT_SYNC_SETTLE_DELAY: std::time::Duration =
-    std::time::Duration::from_millis(60);
+const WINDOWS_LAYOUT_SYNC_SETTLE_DELAY: std::time::Duration = std::time::Duration::from_millis(60);
 #[cfg(target_os = "windows")]
 const WINDOWS_LAYOUT_SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1_000);
 
@@ -93,8 +101,7 @@ impl WindowsLayoutHotkeyState {
         }
         let shift = self.shift_left || self.shift_right;
         let chord = shift && (self.alt_left || self.control_left || self.control_right);
-        let any_layout_modifier =
-            shift || self.alt_left || self.control_left || self.control_right;
+        let any_layout_modifier = shift || self.alt_left || self.control_left || self.control_right;
         let transition = if chord && !self.chord_active && !self.sync_pending {
             self.sync_pending = true;
             WindowsLayoutHotkeyTransition::Started
@@ -200,16 +207,15 @@ fn windows_layout_sync_source_matches_selection(
 ) -> bool {
     matches!(
         (event_source, selected_input_source),
-        (
-            "input-source-1-rdev",
-            input_source::CONFIG_INPUT_SOURCE_1
-        ) | (
-            "input-source-2-flutter",
-            input_source::CONFIG_INPUT_SOURCE_1
-        ) | (
-            "input-source-2-flutter",
-            input_source::CONFIG_INPUT_SOURCE_2
-        )
+        ("input-source-1-rdev", input_source::CONFIG_INPUT_SOURCE_1)
+            | (
+                "input-source-2-flutter",
+                input_source::CONFIG_INPUT_SOURCE_1
+            )
+            | (
+                "input-source-2-flutter",
+                input_source::CONFIG_INPUT_SOURCE_2
+            )
     )
 }
 

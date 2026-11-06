@@ -102,21 +102,30 @@ const TERMINAL_OS_LOGIN_FAILED_MSG: &str = "Incorrect username or password.";
 fn allow_parallel_clipboard_cache_on_control_session(
     file_permission: bool,
     clipboard_permission: bool,
+    clipboard_paths: &HashSet<String>,
     action: &FileAction,
 ) -> bool {
     if !(file_permission && clipboard_permission) {
         return false;
     }
 
-    matches!(
-        action.union.as_ref(),
-        Some(file_action::Union::Receive(receive))
-            if receive.parallel_initialize
+    match action.union.as_ref() {
+        Some(file_action::Union::Receive(receive)) => {
+            receive.parallel_initialize
                 && receive.parallel_clipboard_cache
                 && !receive.parallel_transfer_id.is_empty()
                 && !receive.parallel_auth_token.is_empty()
                 && !receive.files.is_empty()
-    )
+        }
+        Some(file_action::Union::Send(send)) => {
+            send.parallel_initialize
+                && send.parallel_clipboard_cache
+                && !send.parallel_transfer_id.is_empty()
+                && !send.parallel_auth_token.is_empty()
+                && clipboard_paths.contains(&send.path)
+        }
+        _ => false,
+    }
 }
 
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -422,6 +431,7 @@ pub struct Connection {
     parallel_worker: u32,
     parallel_auth_token: String,
     parallel_primary_transfers: HashSet<String>,
+    parallel_clipboard_paths: HashSet<String>,
     view_camera: bool,
     terminal: bool,
     port_forward_socket: Option<Framed<TcpStream, BytesCodec>>,
@@ -627,6 +637,7 @@ impl Connection {
             parallel_worker: 0,
             parallel_auth_token: String::new(),
             parallel_primary_transfers: HashSet::new(),
+            parallel_clipboard_paths: HashSet::new(),
             view_camera: false,
             terminal: false,
             port_forward_socket: None,
@@ -939,21 +950,45 @@ impl Connection {
                             allow_err!(conn.stream.send_raw(bytes).await);
                         }
                         #[cfg(target_os = "windows")]
-                        ipc::Data::ClipboardFile(clip) => {
+                        ipc::Data::ClipboardFile(mut clip) => {
                             if !conn.is_remote() {
                                 continue;
                             }
+                            let parallel_clipboard_cache_supported =
+                                crate::platform::is_parallel_file_transfer_supported()
+                                    && conn
+                                        .lr
+                                        .features
+                                        .as_ref()
+                                        .map(|features| features.parallel_clipboard_cache_v1)
+                                        .unwrap_or(false);
+                            if let clipboard::ClipboardFile::FormatList { format_list } = &mut clip {
+                                conn.parallel_clipboard_paths.clear();
+                                crate::clipboard_file::filter_parallel_clipboard_cache_format(
+                                    format_list,
+                                    parallel_clipboard_cache_supported,
+                                );
+                            }
                             match clip {
                                 clipboard::ClipboardFile::Files { files } => {
-                                    let files = files.into_iter().map(|(f, s)| {
-                                        (f, s as i64)
+                                    let audit_files = files.iter().map(|(f, s)| {
+                                        (f.clone(), *s as i64)
                                     }).collect::<Vec<_>>();
                                     conn.post_file_audit(
                                         FileAuditType::RemoteSend,
                                         "",
-                                        files,
+                                        audit_files,
                                         json!({}),
                                     );
+                                    if parallel_clipboard_cache_supported {
+                                        conn.parallel_clipboard_paths = files
+                                            .iter()
+                                            .map(|(path, _)| path.clone())
+                                            .collect();
+                                    }
+                                    allow_err!(conn.stream.send(&clip_2_msg(
+                                        clipboard::ClipboardFile::Files { files }
+                                    )).await);
                                 }
                                 _ => {
                                     allow_err!(conn.stream.send(&clip_2_msg(clip)).await);
@@ -1979,9 +2014,9 @@ impl Connection {
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             terminal,
             safe_mode_reboot,
-            parallel_file_transfer_v1: cfg!(target_os = "windows"),
-            parallel_clipboard_cache_v1: cfg!(target_os = "windows"),
-            parallel_file_download_v1: cfg!(target_os = "windows"),
+            parallel_file_transfer_v1: crate::platform::is_parallel_file_transfer_supported(),
+            parallel_clipboard_cache_v1: crate::platform::is_parallel_file_transfer_supported(),
+            parallel_file_download_v1: crate::platform::is_parallel_file_transfer_supported(),
             ..Default::default()
         })
         .into();
@@ -2255,6 +2290,13 @@ impl Connection {
             privacy_mode: self.privacy_mode,
             from_switch: self.from_switch,
             parallel_auxiliary: !self.parallel_transfer_id.is_empty(),
+            parallel_clipboard_cache: crate::platform::is_parallel_file_transfer_supported()
+                && self
+                    .lr
+                    .features
+                    .as_ref()
+                    .map(|features| features.parallel_clipboard_cache_v1)
+                    .unwrap_or(false),
         });
     }
 
@@ -2616,6 +2658,7 @@ impl Connection {
         self.parallel_worker = 0;
         self.parallel_auth_token.clear();
         self.parallel_primary_transfers.clear();
+        self.parallel_clipboard_paths.clear();
         self.view_camera = false;
         self.terminal = false;
         self.port_forward_address.clear();
@@ -3353,6 +3396,7 @@ impl Connection {
                             && allow_parallel_clipboard_cache_on_control_session(
                                 self.file,
                                 self.clipboard,
+                                &self.parallel_clipboard_paths,
                                 &fa,
                             ));
                     if !handle_fa {
@@ -3437,6 +3481,19 @@ impl Connection {
                             Some(file_action::Union::Send(s)) => {
                                 // server to client
                                 let id = s.id;
+                                if self.file_transfer.is_none()
+                                    && s.parallel_initialize
+                                    && s.parallel_clipboard_cache
+                                    && !self.parallel_clipboard_paths.remove(&s.path)
+                                {
+                                    self.send(fs::new_error(
+                                        id,
+                                        "parallel clipboard source is no longer authorized",
+                                        s.file_num,
+                                    ))
+                                    .await;
+                                    return true;
+                                }
                                 let path = s.path.clone();
                                 let job_type = JobType::from_proto(s.file_type);
                                 match job_type {
@@ -4147,13 +4204,21 @@ impl Connection {
                 }
                 Some(message::Union::ScreenshotRequest(request)) => {
                     if let Some(tx) = self.inner.tx.clone() {
-                        crate::video_service::set_take_screenshot(
-                            self.video_source(),
-                            request.display as _,
-                            request.sid.clone(),
-                            tx,
-                        );
-                        self.refresh_video_display(Some(request.display as usize));
+                        if let Some(sid) =
+                            crate::client::screenshot::wallpaper_preview_response_session_id(
+                                &request.sid,
+                            )
+                        {
+                            crate::video_service::send_wallpaper_preview(sid.to_owned(), tx);
+                        } else {
+                            crate::video_service::set_take_screenshot(
+                                self.video_source(),
+                                request.display as _,
+                                request.sid.clone(),
+                                tx,
+                            );
+                            self.refresh_video_display(Some(request.display as usize));
+                        }
                     }
                 }
                 Some(message::Union::TerminalAction(action)) => {
@@ -7343,15 +7408,25 @@ mod test {
 
     #[test]
     fn control_session_only_accepts_authorized_parallel_clipboard_cache_initialization() {
+        let clipboard_paths = HashSet::new();
         let action = parallel_clipboard_cache_action();
         assert!(allow_parallel_clipboard_cache_on_control_session(
-            true, true, &action
+            true,
+            true,
+            &clipboard_paths,
+            &action
         ));
         assert!(!allow_parallel_clipboard_cache_on_control_session(
-            false, true, &action
+            false,
+            true,
+            &clipboard_paths,
+            &action
         ));
         assert!(!allow_parallel_clipboard_cache_on_control_session(
-            true, false, &action
+            true,
+            false,
+            &clipboard_paths,
+            &action
         ));
 
         let mut ordinary_receive = FileAction::new();
@@ -7366,6 +7441,7 @@ mod test {
         assert!(!allow_parallel_clipboard_cache_on_control_session(
             true,
             true,
+            &clipboard_paths,
             &ordinary_receive
         ));
 
@@ -7374,7 +7450,33 @@ mod test {
         assert!(!allow_parallel_clipboard_cache_on_control_session(
             true,
             true,
+            &clipboard_paths,
             &missing_secret
+        ));
+
+        let source = r"C:\Users\tester\Downloads\clipboard.bin".to_owned();
+        let mut authorized_paths = HashSet::new();
+        authorized_paths.insert(source.clone());
+        let mut download = FileAction::new();
+        download.set_send(FileTransferSendRequest {
+            path: source,
+            parallel_initialize: true,
+            parallel_transfer_id: "clipboard-download-transfer".to_owned(),
+            parallel_auth_token: "clipboard-download-secret".to_owned(),
+            parallel_clipboard_cache: true,
+            ..Default::default()
+        });
+        assert!(allow_parallel_clipboard_cache_on_control_session(
+            true,
+            true,
+            &authorized_paths,
+            &download
+        ));
+        assert!(!allow_parallel_clipboard_cache_on_control_session(
+            true,
+            true,
+            &HashSet::new(),
+            &download
         ));
     }
 

@@ -540,6 +540,13 @@ impl<T: InvokeUiSession> Session<T> {
         self.send(Data::TakeScreenshot((display, sid)));
     }
 
+    pub fn take_peer_thumbnail(&self, display: i32, sid: String) {
+        self.send(Data::TakeScreenshot((
+            display,
+            crate::client::screenshot::wallpaper_preview_request_sid(&sid),
+        )));
+    }
+
     pub fn is_recording(&self) -> bool {
         self.lc.read().unwrap().record_state
     }

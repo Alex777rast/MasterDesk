@@ -43,10 +43,14 @@ fn split_build_version(value: &str) -> (&str, u64) {
     }
 }
 
-pub fn masterdesk_update_asset_version(file_name: &str) -> Option<String> {
+#[cfg(all(target_os = "windows", target_arch = "x86"))]
+const MASTERDESK_UPDATE_ASSET_SUFFIX: &str = "-RDS-x86-sciter.exe";
+#[cfg(not(all(target_os = "windows", target_arch = "x86")))]
+const MASTERDESK_UPDATE_ASSET_SUFFIX: &str = "-RDS-x86_64.exe";
+
+fn masterdesk_update_asset_version_for_suffix(file_name: &str, suffix: &str) -> Option<String> {
     const PREFIX: &str = "MasterDesk-";
-    const SUFFIX: &str = "-RDS-x86_64.exe";
-    let value = file_name.strip_prefix(PREFIX)?.strip_suffix(SUFFIX)?;
+    let value = file_name.strip_prefix(PREFIX)?.strip_suffix(suffix)?;
     let (base, beta_and_date) = value.split_once("-beta-")?;
     if base.is_empty() || hbb_common::get_version_number(base) <= 0 {
         return None;
@@ -65,6 +69,10 @@ pub fn masterdesk_update_asset_version(file_name: &str) -> Option<String> {
         return None;
     }
     Some(format!("{base} beta {beta}"))
+}
+
+pub fn masterdesk_update_asset_version(file_name: &str) -> Option<String> {
+    masterdesk_update_asset_version_for_suffix(file_name, MASTERDESK_UPDATE_ASSET_SUFFIX)
 }
 
 pub fn is_expected_masterdesk_update_asset(file_name: &str) -> bool {
@@ -377,8 +385,16 @@ mod tests {
     #[test]
     fn parses_current_github_windows_asset_name() {
         assert_eq!(
-            masterdesk_update_asset_version(
-                "MasterDesk-1.4.9-10-beta-60-2026-09-04-RDS-x86_64.exe"
+            masterdesk_update_asset_version_for_suffix(
+                "MasterDesk-1.4.9-10-beta-60-2026-09-04-RDS-x86_64.exe",
+                "-RDS-x86_64.exe",
+            ),
+            Some("1.4.9-10 beta 60".to_owned())
+        );
+        assert_eq!(
+            masterdesk_update_asset_version_for_suffix(
+                "MasterDesk-1.4.9-10-beta-60-2026-09-04-RDS-x86-sciter.exe",
+                "-RDS-x86-sciter.exe",
             ),
             Some("1.4.9-10 beta 60".to_owned())
         );

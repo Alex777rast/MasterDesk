@@ -1947,6 +1947,11 @@ class RustdeskImpl {
     throw UnimplementedError("sessionTakeScreenshot");
   }
 
+  Future<void> sessionTakePeerThumbnail(
+      {required UuidValue sessionId, required int display, dynamic hint}) {
+    throw UnimplementedError("sessionTakePeerThumbnail");
+  }
+
   Future<void> sessionOpenTerminal(
       {required UuidValue sessionId,
       required int terminalId,

@@ -1,6 +1,10 @@
+import 'dart:io';
+import 'dart:math' as math;
+
 import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_hbb/common/peer_thumbnail_cache.dart';
 import 'package:flutter_hbb/common/widgets/dialog.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
@@ -14,7 +18,6 @@ import '../../models/peer_model.dart';
 import '../../models/platform_model.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
 import '../../desktop/widgets/popup_menu.dart';
-import 'dart:math' as math;
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
     Function(BuildContext);
@@ -50,6 +53,9 @@ class _PeerCardState extends State<_PeerCard>
   final double _cardRadius = 16;
   final double _tileRadius = 5;
   final double _borderWidth = 2;
+  String _thumbnailPeerId = '';
+  String _thumbnailFileName = '';
+  Future<String?> _thumbnailPath = Future.value(null);
 
   @override
   Widget build(BuildContext context) {
@@ -281,6 +287,108 @@ class _PeerCardState extends State<_PeerCard>
     );
   }
 
+  void _refreshThumbnailPath(Peer peer) {
+    final fileName = bind.mainGetPeerFlutterOptionSync(
+      id: peer.id,
+      k: peerThumbnailOptionKey,
+    );
+    if (_thumbnailPeerId == peer.id && _thumbnailFileName == fileName) return;
+    _thumbnailPeerId = peer.id;
+    _thumbnailFileName = fileName;
+    _thumbnailPath = resolvePeerThumbnailPath(peer.id, fileName);
+  }
+
+  Widget _buildPeerPreview(Peer peer, String name) {
+    _refreshThumbnailPath(peer);
+    final fallbackColor = str2color('${peer.id}${peer.platform}', 0x7f);
+    return Stack(
+      fit: StackFit.expand,
+      children: [
+        ColoredBox(
+          color: fallbackColor,
+          child: Center(child: getPlatformImage(peer.platform, size: 60)),
+        ),
+        FutureBuilder<String?>(
+          future: _thumbnailPath,
+          builder: (context, snapshot) {
+            final thumbnailPath = snapshot.data;
+            if (thumbnailPath == null) return const SizedBox.shrink();
+            return Image.file(
+              File(thumbnailPath),
+              key: ValueKey(thumbnailPath),
+              fit: BoxFit.cover,
+              filterQuality: FilterQuality.medium,
+              cacheWidth: 640,
+              gaplessPlayback: true,
+              errorBuilder: (_, __, ___) => const SizedBox.shrink(),
+            );
+          },
+        ),
+        const DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [Colors.transparent, Color(0xCC000000)],
+              stops: [0.42, 1.0],
+            ),
+          ),
+        ),
+        Positioned(
+          left: 10,
+          right: 10,
+          bottom: 7,
+          child: Row(
+            children: [
+              getPlatformImage(peer.platform, size: 22),
+              const SizedBox(width: 7),
+              Expanded(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Tooltip(
+                      message: name,
+                      waitDuration: const Duration(seconds: 1),
+                      child: Text(
+                        name,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 12,
+                          fontWeight: FontWeight.w500,
+                          shadows: [Shadow(blurRadius: 3, color: Colors.black)],
+                        ),
+                      ),
+                    ),
+                    if (_showNote(peer))
+                      Tooltip(
+                        message: peer.note,
+                        waitDuration: const Duration(seconds: 1),
+                        child: Text(
+                          peer.note,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(
+                            color: Colors.white70,
+                            fontSize: 10,
+                            shadows: [
+                              Shadow(blurRadius: 3, color: Colors.black)
+                            ],
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildPeerCard(
       BuildContext context, Peer peer, Rx<BoxDecoration?> deco) {
     hideUsernameOnCard ??=
@@ -305,61 +413,7 @@ class _PeerCardState extends State<_PeerCard>
               mainAxisAlignment: MainAxisAlignment.center,
               children: [
                 Expanded(
-                  child: Container(
-                    color: str2color('${peer.id}${peer.platform}', 0x7f),
-                    child: Row(
-                      children: [
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.center,
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.all(6),
-                                child:
-                                    getPlatformImage(peer.platform, size: 60),
-                              ),
-                              Row(
-                                children: [
-                                  Expanded(
-                                    child: Tooltip(
-                                      message: name,
-                                      waitDuration: const Duration(seconds: 1),
-                                      child: Text(
-                                        name,
-                                        style: const TextStyle(
-                                            color: Colors.white70,
-                                            fontSize: 12),
-                                        textAlign: TextAlign.center,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              ),
-                              if (_showNote(peer))
-                                Row(
-                                  children: [
-                                    Expanded(
-                                        child: Tooltip(
-                                      message: peer.note,
-                                      waitDuration: const Duration(seconds: 1),
-                                      child: Text(
-                                        peer.note,
-                                        style: const TextStyle(
-                                            color: Colors.white38,
-                                            fontSize: 10),
-                                        textAlign: TextAlign.center,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ))
-                                  ],
-                                ),
-                            ],
-                          ).paddingOnly(top: 4.0, left: 4.0, right: 4.0),
-                        ),
-                      ],
-                    ),
-                  ),
+                  child: _buildPeerPreview(peer, name),
                 ),
                 Container(
                   color: Theme.of(context).colorScheme.background,
@@ -878,6 +932,11 @@ abstract class BasePeerCard extends StatelessWidget {
         onSubmit() async {
           switch (tab) {
             case PeerTabIndex.recent:
+              final thumbnailFileName = bind.mainGetPeerFlutterOptionSync(
+                id: id,
+                k: peerThumbnailOptionKey,
+              );
+              await deletePeerThumbnail(id, thumbnailFileName);
               await bind.mainRemovePeer(id: id);
               bind.mainLoadRecentPeers();
               break;

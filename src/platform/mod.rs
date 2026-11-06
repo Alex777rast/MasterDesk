@@ -56,6 +56,39 @@ pub fn is_xfce() -> bool {
     }
 }
 
+fn supports_parallel_file_transfer(is_windows: bool, _is_windows_pe: bool) -> bool {
+    // WinPE has the same positioned file I/O as Windows. Missing WTS users must
+    // be handled by session selection, not by disabling the transfer protocol.
+    is_windows
+}
+
+pub(crate) fn parallel_clipboard_cache_root(
+    transfer_id: &str,
+    total_size: u64,
+) -> hbb_common::ResultType<std::path::PathBuf> {
+    let id = uuid::Uuid::parse_str(transfer_id)?;
+    #[cfg(windows)]
+    if is_windows_pe() {
+        return windows::create_winpe_clipboard_cache(&id.to_string(), total_size);
+    }
+    let _ = total_size;
+    Ok(std::env::temp_dir()
+        .join("MasterDesk")
+        .join("clipboard-cache")
+        .join(id.to_string()))
+}
+
+pub fn is_parallel_file_transfer_supported() -> bool {
+    #[cfg(windows)]
+    {
+        return supports_parallel_file_transfer(true, is_windows_pe());
+    }
+    #[cfg(not(windows))]
+    {
+        return supports_parallel_file_transfer(false, false);
+    }
+}
+
 pub fn breakdown_callback() {
     #[cfg(target_os = "linux")]
     crate::input_service::clear_remapped_keycode();
@@ -213,6 +246,15 @@ pub fn get_pids_of_process_with_first_arg<S1: AsRef<str>, S2: AsRef<str>>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_file_transfer_is_supported_in_windows_pe() {
+        assert!(supports_parallel_file_transfer(true, false));
+        assert!(supports_parallel_file_transfer(true, true));
+        assert!(!supports_parallel_file_transfer(false, false));
+        assert!(!supports_parallel_file_transfer(false, true));
+    }
+
     #[test]
     fn test_cursor_data() {
         for _ in 0..30 {

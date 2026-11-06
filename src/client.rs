@@ -123,11 +123,9 @@ pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "ubuntu-21-04-required";
 #[cfg(target_os = "linux")]
-pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
-    "wayland-requires-higher-linux-version";
+pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-linux-version";
 #[cfg(target_os = "linux")]
-pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
-    "xdp-portal-unavailable";
+pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
@@ -2781,16 +2779,15 @@ impl LoginConfigHandler {
         };
         let mut avatar = get_builtin_option(keys::OPTION_AVATAR);
         if avatar.is_empty() {
-            avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
-                "user_info",
-            ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
+            avatar =
+                serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
+                    .ok()
+                    .and_then(|x| {
+                        x.get("avatar")
+                            .and_then(|x| x.as_str())
+                            .map(|x| x.trim().to_owned())
+                    })
+                    .unwrap_or_default();
         }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
@@ -2853,6 +2850,14 @@ impl LoginConfigHandler {
             .into(),
             hwid,
             avatar,
+            features: Some(Features {
+                parallel_file_transfer_v1: crate::platform::is_parallel_file_transfer_supported(),
+                parallel_clipboard_cache_v1:
+                    crate::platform::is_parallel_file_transfer_supported(),
+                parallel_file_download_v1: crate::platform::is_parallel_file_transfer_supported(),
+                ..Default::default()
+            })
+            .into(),
             ..Default::default()
         };
         match self.conn_type {
@@ -3571,11 +3576,7 @@ async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
         return false;
     }
     match conn.next_timeout(1000).await {
-        Ok(Some(crate::ipc::Data::SwitchSidesUuid(
-            returned_uuid,
-            returned_id,
-            Some(true),
-        ))) => {
+        Ok(Some(crate::ipc::Data::SwitchSidesUuid(returned_uuid, returned_id, Some(true)))) => {
             returned_uuid == uuid && returned_id == id
         }
         _ => false,
@@ -3883,7 +3884,12 @@ pub trait Interface: Send + Clone + 'static + Sized {
             log::info!("Restart remote device, suppress connection error: {err}");
             // Flutter treats this as a reconnect control event. The text is kept
             // for legacy UI and existing translation reuse.
-            self.msgbox("restarting", "Restarting remote device", "Connection in progress. Please wait.", "");
+            self.msgbox(
+                "restarting",
+                "Restarting remote device",
+                "Connection in progress. Please wait.",
+                "",
+            );
             return;
         }
 
@@ -4539,9 +4545,7 @@ mod masterdesk_restart_message_tests {
 
 #[cfg(test)]
 mod masterdesk_keyboard_mode_tests {
-    use super::{
-        migrate_masterdesk_windows_keyboard_mode, MASTERDESK_WINDOWS_MAP_MODE_MIGRATION,
-    };
+    use super::{migrate_masterdesk_windows_keyboard_mode, MASTERDESK_WINDOWS_MAP_MODE_MIGRATION};
     use hbb_common::{config::PeerConfig, get_version_number};
 
     #[test]
@@ -4590,11 +4594,7 @@ mod masterdesk_keyboard_mode_tests {
             keyboard_mode: "translate".to_owned(),
             ..Default::default()
         };
-        migrate_masterdesk_windows_keyboard_mode(
-            &mut linux,
-            get_version_number("1.4.9"),
-            "Linux",
-        );
+        migrate_masterdesk_windows_keyboard_mode(&mut linux, get_version_number("1.4.9"), "Linux");
         assert_eq!(linux.keyboard_mode, "translate");
         assert!(!linux
             .options

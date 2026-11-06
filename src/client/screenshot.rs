@@ -1,10 +1,22 @@
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use crate::clipboard::{update_clipboard, ClipboardSide};
 use hbb_common::{message_proto::*, ResultType};
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 lazy_static::lazy_static! {
     static ref SCREENSHOT: Mutex<Screenshot> = Default::default();
+}
+
+const WALLPAPER_PREVIEW_SID_PREFIX: &str = "wallpaper-preview:";
+
+pub fn wallpaper_preview_request_sid(sid: &str) -> String {
+    format!("{WALLPAPER_PREVIEW_SID_PREFIX}{sid}")
+}
+
+pub fn wallpaper_preview_response_session_id(sid: &str) -> Option<&str> {
+    sid.strip_prefix(WALLPAPER_PREVIEW_SID_PREFIX)
+        .filter(|sid| !sid.is_empty())
 }
 
 pub enum ScreenshotAction {
@@ -49,16 +61,16 @@ impl Into<String> for ScreenshotAction {
 
 #[derive(Default)]
 pub struct Screenshot {
-    data: Option<bytes::Bytes>,
+    data: HashMap<String, bytes::Bytes>,
 }
 
 impl Screenshot {
-    fn set_screenshot(&mut self, data: bytes::Bytes) {
-        self.data.replace(data);
+    fn set_screenshot(&mut self, sid: String, data: bytes::Bytes) {
+        self.data.insert(sid, data);
     }
 
-    fn handle_screenshot(&mut self, action: String) -> String {
-        let Some(data) = self.data.take() else {
+    fn handle_screenshot(&mut self, sid: &str, action: String) -> String {
+        let Some(data) = self.data.remove(sid) else {
             return "No cached screenshot".to_owned();
         };
         match Self::handle_screenshot_(data, action) {
@@ -90,10 +102,48 @@ impl Screenshot {
     }
 }
 
-pub fn set_screenshot(data: bytes::Bytes) {
-    SCREENSHOT.lock().unwrap().set_screenshot(data);
+pub fn set_screenshot(sid: String, data: bytes::Bytes) {
+    SCREENSHOT.lock().unwrap().set_screenshot(sid, data);
 }
 
 pub fn handle_screenshot(action: String) -> String {
-    SCREENSHOT.lock().unwrap().handle_screenshot(action)
+    handle_screenshot_for("", action)
+}
+
+pub fn handle_screenshot_for(sid: &str, action: String) -> String {
+    SCREENSHOT.lock().unwrap().handle_screenshot(sid, action)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screenshot_cache_is_scoped_by_session() {
+        let mut screenshots = Screenshot::default();
+        screenshots.set_screenshot("one".to_owned(), bytes::Bytes::from_static(b"one"));
+        screenshots.set_screenshot("two".to_owned(), bytes::Bytes::from_static(b"two"));
+
+        assert_eq!(screenshots.handle_screenshot("one", "2".to_owned()), "");
+        assert_eq!(
+            screenshots.handle_screenshot("one", "2".to_owned()),
+            "No cached screenshot"
+        );
+        assert_eq!(screenshots.handle_screenshot("two", "2".to_owned()), "");
+    }
+
+    #[test]
+    fn wallpaper_preview_sid_is_explicit_and_round_trips() {
+        let request_sid = wallpaper_preview_request_sid("session-id");
+        assert_eq!(request_sid, "wallpaper-preview:session-id");
+        assert_eq!(
+            wallpaper_preview_response_session_id(&request_sid),
+            Some("session-id")
+        );
+        assert_eq!(wallpaper_preview_response_session_id("session-id"), None);
+        assert_eq!(
+            wallpaper_preview_response_session_id(WALLPAPER_PREVIEW_SID_PREFIX),
+            None
+        );
+    }
 }

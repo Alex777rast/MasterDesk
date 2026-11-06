@@ -9,6 +9,10 @@ The combined work is distributed under the GNU Affero General Public License,
 version 3. MasterDesk releases are clearly identified as modified builds and
 are not official RustDesk releases.
 
-The complete corresponding source for every MasterDesk release, including the
-modified hbb_common submodule and build scripts, is published in the linked
-GitHub repositories and release tag.
+Corresponding source must include the actual modified hbb_common submodule and
+build scripts. Check each release's SOURCE_ATTRIBUTION.md for its provenance;
+a historical base commit or GitHub's automatic source archive must not be
+represented as the exact source of a binary built from a modified worktree.
+Signing preparation requires a reviewed, published source snapshot and a
+verifiable GitHub-hosted build. This notice does not certify that historical
+local beta builds already satisfy those requirements.
