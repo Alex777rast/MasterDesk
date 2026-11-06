@@ -5,10 +5,10 @@ on:
   workflow_dispatch:
     inputs:
       beta_number:
-        description: "New beta newer than every release (minimum 108; 106/107 are reserved proofs)"
+        description: "New builds: minimum 109 (106..108 reserved); artifact-only proof may select 108"
         required: true
         type: string
-        default: "108"
+        default: "109"
       proof_run_id:
         description: "Optional: verify existing successful preparation artifacts only; do not rebuild"
         required: false
@@ -58,7 +58,7 @@ jobs:
           if ($env:PROOF_SOURCE_COMMIT) { throw 'Artifact-only proof needs both proof inputs; no build started' }
           if ($env:REQUESTED_BETA -notmatch '^[1-9][0-9]{0,4}$') { throw 'Invalid beta input' }
           $beta = [int]$env:REQUESTED_BETA
-          if ($beta -lt 108 -or $beta -gt 65535) { throw 'Beta must be 108..65535; local106 and hosted107 are already reserved' }
+          if ($beta -lt 109 -or $beta -gt 65535) { throw 'New builds require 109..65535; proof candidates106..108 are reserved' }
           $headers = @{Authorization="Bearer $env:GITHUB_TOKEN";'User-Agent'='MasterDesk-signing-preparation'}
           $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/Alex777rast/MasterDesk/releases?per_page=100'
           foreach ($release in $releases) {

@@ -68,6 +68,8 @@ checks payload hashes/PE identity, and runs only runner/core `--version` and
 `--build-date` on a disposable hosted Windows VM. It uploads a report, not a new
 package. This avoids touching the maintainer's installed application/config.
 It is not GUI/install/update/remote-session or SmartScreen acceptance.
+Candidate108 is assigned to the current build. Subsequent new full builds use
+109+; selecting108 in artifact-only mode verifies existing bytes, never rebuilds.
 
 An optional local new-beta verification build can use the existing caches:
 
