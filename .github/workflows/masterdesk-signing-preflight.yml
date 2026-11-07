@@ -1,0 +1,79 @@
+name: MasterDesk signing preflight (no signing)
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Successful reviewed unsigned build run; never an uploaded file or URL
+        required: true
+        type: string
+      build_commit:
+        description: Exact reviewed source commit (40 lowercase hex)
+        required: true
+        type: string
+      beta:
+        description: New candidate, 110 or later (105..109 immutable)
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: masterdesk-signing-preflight-${{ inputs.build_run_id }}
+  cancel-in-progress: false
+jobs:
+  preflight:
+    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref == 'refs/heads/codex/x64-signing-source-20261106' }}
+    runs-on: windows-2022
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Test inert preparation and integrity guards
+        run: python -m unittest discover -s scripts/signing -p test_*.py -v
+      - name: Retrieve authenticated build attribution only
+        id: origin
+        shell: pwsh
+        env:
+          BUILD_RUN: ${{ inputs.build_run_id }}
+          BUILD_COMMIT: ${{ inputs.build_commit }}
+          BUILD_BETA: ${{ inputs.beta }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:BUILD_BETA -notmatch '^[1-9][0-9]{0,4}$') { throw 'Invalid beta' }
+          ./scripts/signing/Read-TrustedSigningArtifact.ps1 -RunId $env:BUILD_RUN -ExpectedCommit $env:BUILD_COMMIT -Beta ([int]$env:BUILD_BETA) -OutputDirectory artifacts/signing-preflight/origin
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          artifact-ids: ${{ steps.origin.outputs.payload-id }}
+          path: artifacts/signing-preflight/payload
+          digest-mismatch: error
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ inputs.build_run_id }}
+          artifact-ids: ${{ steps.origin.outputs.unsigned-id }}
+          path: artifacts/signing-preflight/evidence
+          digest-mismatch: error
+      - name: Verify origin structure and every byte against build-time manifest
+        shell: pwsh
+        env:
+          BUILD_COMMIT: ${{ inputs.build_commit }}
+          BUILD_BETA: ${{ inputs.beta }}
+        run: |
+          python scripts/signing/preflight.py --root artifacts/signing-preflight --commit $env:BUILD_COMMIT --beta $env:BUILD_BETA
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: signing-preflight-${{ inputs.build_run_id }}-${{ github.sha }}
+          path: artifacts/signing-preflight/*.json
+          if-no-files-found: error
+          retention-days: 30
+# No signing job exists here. The hard-disabled fragment lives outside the
+# workflows directory in .signpath/ and needs a separate reviewed activation.

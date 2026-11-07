@@ -1,0 +1,8 @@
+<!-- DRAFT; validate Foundation origin continuity through custom repacking first. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="packageName" required="true" />
+    <parameter name="productVersion" required="true" />
+  </parameters>
+  <pe-file path="${packageName}" product-name="MasterDesk" product-version="${productVersion}" company-name="MasterDesk contributors"><authenticode-sign /></pe-file>
+</artifact-configuration>

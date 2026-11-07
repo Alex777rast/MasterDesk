@@ -1,0 +1,36 @@
+# NOT A WORKFLOW. Do not copy/enable until the runbook and provider review pass.
+# Fragment only: needs a same-run hosted build/verification job and approved
+# payload/outer origin continuity. No arbitrary artifact-id workflow input.
+sign_owned_payload:
+  if: ${{ false }}
+  needs: verify_owned_payload
+  runs-on: windows-2022
+  environment: masterdesk-signing
+  permissions:
+    contents: read
+    actions: read
+  steps:
+    # Upload EXACT verified selected files before invoking the connector.
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      id: unsigned_owned
+      with:
+        name: owned-payload-${{ github.sha }}
+        path: artifacts/verified-owned/*
+        if-no-files-found: error
+    # Official v3 resolved 2026-11-08; re-review immutable source before activation.
+    - uses: signpath/github-action-submit-signing-request@f6d04783b4569d051e0c80105fe66e82819d0092
+      with:
+        api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+        organization-id: SET_AFTER_APPROVAL
+        project-slug: SET_AFTER_APPROVAL
+        signing-policy-slug: SET_AFTER_APPROVAL
+        artifact-configuration-slug: SET_AFTER_PROVIDER_REVIEW
+        github-artifact-id: ${{ steps.unsigned_owned.outputs.artifact-id }}
+        parameters: |
+          productVersion: ${{ toJSON(needs.verify_owned_payload.outputs.product-version) }}
+        wait-for-completion: true
+        skip-decompress: true
+        output-artifact-directory: artifacts/signed-owned
+# Mandatory next jobs (not faked here): verify certificates and unchanged PE
+# content, restore signed payload, refresh build manifest, repack on hosted runner,
+# origin review for outer wrapper, upload/sign outer, decode and verify final bytes.

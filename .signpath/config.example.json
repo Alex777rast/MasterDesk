@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "enabled": false,
+  "foundationApproval": "NEEDS_SIGNPATH",
+  "organizationId": "SET_AFTER_APPROVAL",
+  "projectSlug": "SET_AFTER_APPROVAL",
+  "payloadPolicySlug": "SET_AFTER_APPROVAL",
+  "outerPolicySlug": "SET_AFTER_APPROVAL",
+  "artifactConfigurationSlug": "SET_AFTER_PROVIDER_REVIEW",
+  "signerSubject": "SET_FROM_APPROVED_CERTIFICATE",
+  "signerCertificateSha256": "SET_FROM_APPROVED_CERTIFICATE",
+  "approvedScope": [],
+  "candidateScope": ["MasterDesk.exe", "libmasterdesk.dll", "dylib_virtual_display.dll"],
+  "environment": "masterdesk-signing",
+  "note": "NO signing implementation enabled; scope is empty until licensing/fork/provider review"
+}

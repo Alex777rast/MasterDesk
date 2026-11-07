@@ -1,0 +1,10 @@
+<!-- DRAFT for provider validation, NOT an activated configuration.
+     Candidate ownership is not licensing/fork approval. No wildcard DLL scope. -->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters><parameter name="productVersion" required="true" /></parameters>
+  <zip-file>
+    <pe-file path="MasterDesk.exe" product-name="MasterDesk" product-version="${productVersion}" company-name="MasterDesk contributors"><authenticode-sign /></pe-file>
+    <pe-file path="libmasterdesk.dll" product-name="MasterDesk" product-version="${productVersion}" company-name="MasterDesk contributors"><authenticode-sign /></pe-file>
+    <pe-file path="dylib_virtual_display.dll" product-name="MasterDesk" product-version="${productVersion}" company-name="MasterDesk contributors"><authenticode-sign /></pe-file>
+  </zip-file>
+</artifact-configuration>
