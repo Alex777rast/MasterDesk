@@ -10,7 +10,6 @@ import os
 from pathlib import Path
 import re
 import subprocess
-import tomllib
 from urllib.parse import unquote, urlparse, quote
 import uuid
 
@@ -24,8 +23,33 @@ def run(*args, cwd=None):
 
 
 def license_files(root):
-    return [p for p in sorted(root.iterdir()) if p.is_file() and
+    return [p for p in sorted(root.iterdir()) if p.is_file() and not p.is_symlink() and
             re.match(r'^(licen[cs]e|copying|notice|copyright)([._-].*)?$', p.name, re.I)]
+
+
+def dart_lock_evidence(lock):
+    # Read a small scalar subset, not a general YAML implementation. Unknown
+    # structures remain in the hashed original lockfile, never inferred.
+    records = {}
+    starts = list(re.finditer(r'^  ([a-zA-Z0-9_]+):\s*$', lock, re.M))
+    for index, start in enumerate(starts):
+        block = lock[start.end():starts[index+1].start() if index+1<len(starts) else len(lock)]
+        fields = {}
+        for name, pattern in [('source',r'^    source:\s*(.+)$'),
+                              ('resolvedGitCommit',r'^      resolved-ref:\s*(.+)$'),
+                              ('hostedArchiveSha256',r'^      sha256:\s*(.+)$')]:
+            match = re.search(pattern,block,re.M)
+            if match:
+                fields[name] = match[1].strip().strip('"\'')
+        url = re.search(r'^      url:\s*(.+)$',block,re.M)
+        if url:
+            value=url[1].strip().strip('"\'')
+            parsed=urlparse(value)
+            if parsed.scheme=='https' and not parsed.username and not parsed.password and not parsed.query:
+                fields['publicSourceUrl']=value
+        fields['recordSha256']=hashlib.sha256(block.encode('utf-8')).hexdigest()
+        records[start[1]]=fields
+    return records
 
 
 def collect(repo, out, flutter, native):
@@ -76,12 +100,13 @@ def collect(repo, out, flutter, native):
         files = license_files(root)
         if p.get('license_file'):
             explicit = (root/p['license_file']).resolve()
-            if explicit.is_file() and explicit not in files:
+            if explicit.is_relative_to(root.resolve()) and explicit.is_file() and not explicit.is_symlink() and explicit not in files:
                 files.append(explicit)
         add('cargo', p['name'], p['version'], p['source'] or 'workspace (dirty attribution below)',
             root, p.get('license'), p['id'], files)
     cfgpath = repo/'flutter/.dart_tool/package_config.json'
     cfg = json.loads(cfgpath.read_text(encoding='utf-8'))
+    locked_dart=dart_lock_evidence((repo/'flutter/pubspec.lock').read_text(encoding='utf-8'))
     for p in cfg['packages']:
         uri = p['rootUri']
         if uri.startswith('file:'):
@@ -92,6 +117,9 @@ def collect(repo, out, flutter, native):
         version = re.search(r'^version:\s*([^\r\n#]+)', pubspec.read_text(encoding='utf-8'), re.M) if pubspec.exists() else None
         add('dart-resolved-including-dev', p['name'], version[1].strip() if version else None,
             'local resolved SDK/cache; see pubspec.lock', root)
+        inventory[-1]['lockEvidence']=locked_dart.get(p['name'], {'source':'NOT_IN_LOCK'})
+        for key,value in inventory[-1]['lockEvidence'].items():
+            components[-1]['properties'].append({'name':'masterdesk:dart-lock:'+key,'value':value})
     share = native/'installed/x64-windows-static/share'
     for port in sorted(p for p in share.iterdir() if p.is_dir()):
         spdxfile = port/'vcpkg.spdx.json'
@@ -113,6 +141,7 @@ def collect(repo, out, flutter, native):
               'submodules': run('git', 'submodule', 'status', '--recursive', cwd=repo),
               'nativeCommit': run('git', 'rev-parse', 'HEAD', cwd=native),
               'nativeTrackedDirty': bool(run('git', 'status', '--porcelain', '--untracked-files=no', cwd=native)),
+              'flutterSdkCommit':run('git','rev-parse','HEAD',cwd=flutter),
               'inputs': {p: digest(repo/p) for p in ['Cargo.lock', 'Cargo.toml', 'flutter/pubspec.lock', 'vcpkg.json']},
               'components': inventory}
     cdx = {'bomFormat': 'CycloneDX', 'specVersion': '1.5', 'serialNumber': 'urn:uuid:'+str(uuid.uuid4()), 'version': 1,

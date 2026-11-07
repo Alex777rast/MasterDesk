@@ -6,6 +6,7 @@ import unittest
 import zipfile
 import pipeline as p
 import preflight
+from collect_inventory import dart_lock_evidence
 
 
 class IntegrityTests(unittest.TestCase):
@@ -103,6 +104,12 @@ class IntegrityTests(unittest.TestCase):
         for config in ({}, {'enabled': True}, {'enabled': True, 'foundationApproval': 'yes',
                         'approvedScope': sorted(p.OWNED)}):
             with self.assertRaisesRegex(ValueError, 'BLOCKED'): p.activation_guard(config)
+
+    def test_dart_lock_revision_and_private_url_omission(self):
+        records=dart_lock_evidence('packages:\n  demo:\n    description:\n      resolved-ref: "'+('a'*40)+'"\n      url: "https://example.org/public"\n    source: git\n  private:\n    description:\n      url: "https://user:synthetic@example.invalid/repo"\n    source: git\nsdks:\n  dart: ">=3"\n')
+        self.assertEqual(records['demo']['resolvedGitCommit'],'a'*40)
+        self.assertEqual(records['demo']['publicSourceUrl'],'https://example.org/public')
+        self.assertNotIn('publicSourceUrl',records['private'])
 
     def origin(self):
         run = {'repository': {'full_name': 'Alex777rast/MasterDesk'},
