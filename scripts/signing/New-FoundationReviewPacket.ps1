@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param([Parameter(Mandatory)][string]$EvidenceDirectory,
-      [Parameter(Mandatory)][string]$OutputDirectory)
+      [Parameter(Mandatory)][string]$OutputDirectory,
+      [string[]]$EvidenceFiles)
 $ErrorActionPreference='Stop'
 $repo=[IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $output=[IO.Path]::GetFullPath($OutputDirectory)
@@ -12,17 +13,40 @@ $evidence=(Resolve-Path -LiteralPath $EvidenceDirectory).Path
 if(-not $evidence.StartsWith((Join-Path $repo 'artifacts')+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){
     throw 'Unexpected evidence location'
 }
+$sourceCommit=(& git -C $repo rev-parse HEAD).Trim()
+if($LASTEXITCODE -or @(& git -C $repo status --porcelain --untracked-files=all).Count){
+    throw 'Review packet requires committed clean source; do not label dirty source as reviewed'
+}
+if(-not $EvidenceFiles.Count){
+    $EvidenceFiles=@('github-controls-final.json','workflows-audit.json','license-risk-evidence.json',
+        'sbom-detailed-validation.json','provider-xml-dotnet.json','beta108-content-recheck.json','native-configuration.json',
+        'all-signing-tests-complete.log','actionlint-final.log','actionlint-all.log','final-attribution.json',
+        'dependencies-detailed/inventory.json','dependencies-detailed/source-build-graph.cdx.json',
+        'dependencies-detailed/THIRD-PARTY-NOTICES.txt','safety-packet/result.json')
+}
 $sources=@(Get-ChildItem -LiteralPath (Join-Path $repo 'docs/signing') -Filter '*.md' -File)
 $sources+=@(Get-ChildItem -LiteralPath $PSScriptRoot -File|Where-Object {$_.Extension -in '.ps1','.py'})
 $sources+=@(Get-ChildItem -LiteralPath (Join-Path $repo '.signpath') -File)
-$sources+=@(foreach($relative in @('github-controls-final.json','workflows-audit.json','license-risk-evidence.json',
-    'sbom-detailed-validation.json','provider-xml-dotnet.json','beta108-content-recheck.json','native-configuration.json',
-    'all-signing-tests-complete.log','actionlint-final.log','actionlint-all.log','final-attribution.json',
-    'dependencies-detailed/inventory.json','dependencies-detailed/source-build-graph.cdx.json',
-    'dependencies-detailed/THIRD-PARTY-NOTICES.txt','safety-packet/result.json')){
-        Get-Item -LiteralPath (Join-Path $evidence $relative)
+$sources+=@(foreach($relative in @('LICENCE','NOTICE','PRIVACY.md','SIGNING_POLICY.md','.github/CODEOWNERS',
+    '.github/workflows/masterdesk-windows.yml','.github/workflows/masterdesk-signing-preflight.yml')){
+    Get-Item -LiteralPath (Join-Path $repo $relative)
+})
+$sources+=@(foreach($relative in $EvidenceFiles){
+    $selected=[IO.Path]::GetFullPath((Join-Path $evidence $relative))
+    if([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)|:' -or
+       -not $selected.StartsWith($evidence+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){
+        throw 'Evidence selection must stay inside the explicit evidence directory'
+    }
+    Get-Item -LiteralPath $selected
 })
 $rows=@(foreach($file in $sources){
+    $ancestor=$file.Directory
+    while($ancestor){
+        if($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint){throw 'Reparse ancestor in review selection'}
+        if($ancestor.FullName -ieq $repo){break}
+        $ancestor=$ancestor.Parent
+    }
+    if(-not $ancestor){throw 'Review selection outside repository'}
     if(($file.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $file.Length -gt 30MB){throw 'Unexpected/reparse/oversized review file'}
     $relative=[IO.Path]::GetRelativePath($repo,$file.FullName).Replace('\','/')
     if($relative.StartsWith('../') -or $relative -match '(?i)\.(exe|dll|sys|iso|key|pfx|p12)$'){throw 'Disallowed review payload'}
@@ -41,7 +65,8 @@ try{
     foreach($row in $rows){[IO.Compression.ZipFileExtensions]::CreateEntryFromFile($zip,$row.Source,$row.Path,[IO.Compression.CompressionLevel]::Optimal)|Out-Null}
     $entry=$zip.CreateEntry('REVIEW-MANIFEST.json')
     $writer=[IO.StreamWriter]::new($entry.Open(),[Text.UTF8Encoding]::new($false))
-    try{$writer.Write((@{Status='DRAFT_NOT_SENT';Files=@($rows|Select-Object Path,SHA256,Size);SigningEnabled=$false}|ConvertTo-Json -Depth 6))}finally{$writer.Dispose()}
+    try{$writer.Write((@{Status='DRAFT_NOT_SENT';SourceCommit=$sourceCommit;
+        Files=@($rows|Select-Object Path,SHA256,Size);SigningEnabled=$false}|ConvertTo-Json -Depth 6))}finally{$writer.Dispose()}
 }finally{$zip.Dispose()}
 # Re-open and hash each archived text without extracting or executing anything.
 $zip=[IO.Compression.ZipFile]::OpenRead($zipPath)

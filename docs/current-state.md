@@ -33,8 +33,16 @@ required PR/codeowner enforcement. No default/release writes; default SHA and
 release metadata unchanged. Setup backup/results under original workspace
 artifacts/signpath-integration-20261109. No unrelated settings/automations touched.
 
-Source-only push and hosted tooling check pending at this checkpoint. Do NOT
-infer full hosted build/preflight/real reservation acceptance from local fixtures.
+Source-only branch published, hosted tooling run42526916619 PASS at integration
+commit61d8e96c0365a7ec22c88c7caf345b1195443d23 (first attempt, hosted Windows):
+45 Python tests,6 PS syntax/2 real signature rejections,7 metadata guards,
+4 source/4 ownership cases,13 defaults-scope fixtures. All reserve/build/product
+proof jobs SKIPPED as intended for tooling_only=true. Logs retrieved with no
+authorization forwarded to storage; new5 product hash checks PASS unchanged.
+Later changes are handoff/docs and review-packet helper only (locally checked).
+Review packer now binds committed clean source, includes actual policies/CI,
+supports explicit bounded evidence selection and rejects reparse ancestors.
+Do NOT infer full hosted build/preflight/real reservation acceptance from this run.
 Owner steps and independent external blockers: docs/signing/INTEGRATION-STATUS.md.
 
 105..109 remain reserved/immutable; the next actual product identity is110+.

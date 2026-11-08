@@ -25,6 +25,14 @@
 
 ## GitHub: что проверить владельцу сейчас
 
+Фактически настроено и повторно прочитано: rulesets26814262/26814264 Active,
+без bypass; environment26655560539 с owner reviewer/admin bypassfalse и одной
+branch policy65980450. Ветка опубликована. Hosted tooling
+[run42526916619](https://github.com/Alex777rast/MasterDesk/actions/runs/42526916619)
+прошёл на61d8e96 (45 Python + PS/metadata/source/ownership/defaults fixtures).
+Номер beta не резервировался, EXE не собирался и не подписывался. Нынешние docs
+и packet-helper дополнительно проверены локально; это не новый hosted product run.
+
 1. Открыть https://github.com/settings/security → Two-factor authentication →
    Enable/проверить Enabled. Recovery codes сохранить у себя, не в чате/репозитории.
 2. Открыть репозиторий → Settings → Rules → Rulesets. Для новой интеграционной
@@ -89,6 +97,17 @@
 -14 inherited actionlint diagnostics/4 чужих workflow остаются отдельным FAIL,
   а private server compatibility assertion — отдельным прежним FAIL; они не
   ослаблены и не скрыты client-only подготовкой.
+
+## Границы и откат новых GitHub настроек
+
+Основная ветка, старые release refs/assets и настройки других веток не менялись.
+Новые правила не требуют PR approval: решение о втором reviewer/solo ещё нужно.
+При необходимости остановки сначала оставить environment без signing secret и
+не активировать template. Для отката ТОЛЬКО новых правил: Settings → Rules →
+Rulesets → указанные выше имена → Enforcement status → Disabled → Save changes.
+Старые правила не редактировать. Снимок исходного состояния и точные ответы API
+сохранены локально; оба ruleset были новыми, environment ранее отсутствовал.
+Не удалять beta reservations ради повторного выпуска номера.
 
 Официальные инструкции: [GitHub environments](https://docs.github.com/en/actions/how-tos/deploy/configure-and-manage-deployments/manage-environments),
 [rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/creating-rulesets-for-a-repository),
