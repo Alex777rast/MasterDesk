@@ -1,5 +1,23 @@
 # Current public source state
 
+## 2026-11-09 owner selected solo-maintainer policy
+
+Owner explicitly answered solo. No second reviewer/code owner is required or
+invented. SIGNING_POLICY and current owner steps now record that this is NOT
+independent peer review. Existing owner CODEOWNERS remains unchanged; external
+contributors still need owner review. Future public payload/outer SignPath
+requests each require the owner's human approval, never automated approval.
+
+Fresh GET-only GitHub confirmation PASS: masterdesk-signing has exactly one
+owner reviewer, prevent_self_review=false, admin bypass=false, one exact allowed
+integration branch; no mandatory PR reviewer rule. Existing remote settings
+already fit the explicit solo decision, so NO settings mutation was needed.
+Evidence in original workspace artifacts/signpath-solo-policy-20261109-020553-429.
+This closes reviewer-choice only, not MFA, licensing or Foundation acceptance.
+Documentation-only follow-up; no product/CI/sign/release/site/production change,
+no rerun of the previously passing hosted build/tooling. Old review ZIP remains
+an immutable93f8430 snapshot; use this source decision as a supplement.
+
 ## 2026-11-09 clean SignPath integration; signing remains BLOCKED
 
 Owner requested the available technical work after final review. Clean worktree
@@ -27,7 +45,7 @@ Remote exact-scoped setup verified: active branch ruleset26814262 forbids
 deletion/force-push ONLY for this integration branch; active tag ruleset26814264
 forbids update/deletion ONLY masterdesk-beta-reserved/*, no bypass. Environment
 masterdesk-signing26655560539 has owner required reviewer, admin bypassfalse,
-prevent-self-reviewfalse pending second reviewer/solo choice, exactly one allowed
+prevent-self-reviewfalse (solo now explicitly selected), exactly one allowed
 Branch policy for this integration branch, no secret created. This is NOT
 required PR/codeowner enforcement. No default/release writes; default SHA and
 release metadata unchanged. Setup backup/results under original workspace

@@ -73,6 +73,15 @@ the reviewed signing pipeline. Do not submit a local EXE as a hosted build.
 
 ## Team roles
 
+The owner explicitly selected solo-maintainer mode on 2026-11-09. There is no
+second code owner or mandatory approval of the owner's own pull request. This
+is not independent peer review and does not waive Foundation approval or MFA.
+The GitHub signing environment keeps the owner as its required reviewer,
+prevents administrator bypass, and allows owner-triggered runs to be reviewed
+by that owner. Automation must not approve public signing requests on their
+behalf. After provider approval/activation, each payload and outer signing
+request still requires the owner's explicit human approval in SignPath.
+
 - Committer and reviewer:
   [Alex777rast](https://github.com/Alex777rast)
 - Signing approver:

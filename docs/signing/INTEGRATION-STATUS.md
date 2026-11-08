@@ -43,14 +43,15 @@ branch policy65980450. Ветка опубликована. Hosted tooling
 3. Settings → Environments → masterdesk-signing: Required reviewers — владелец,
    Allow administrators to bypass — выключено, Deployment branches and tags →
    Selected branches → только `codex/signpath-integration-20261109` (Branch, не Tag).
-   Пока нет подтверждённого второго человека, Prevent self-review не включать:
+   Владелец явно выбрал `solo` 2026-11-09. Prevent self-review оставить выключенным:
    workflow-trigger и release approval могут выполняться тем же владельцем,
    но каждый публичный SignPath request обязан получить явное ручное одобрение.
-4. Сообщить логин второго доверенного reviewer либо явно выбрать solo policy.
-   Автор не может одобрить собственный PR. Не добавлять фиктивного reviewer и
-   не считать CODEOWNERS обязательным review без enforcement. Настроить
-   Require pull request / code-owner review / checks только после выбора модели
-   и успешного стабильного CI, иначе можно заблокировать собственные изменения.
+4. Выбор `solo` подтверждён: второй reviewer/code owner не назначается,
+   обязательное approval собственного PR не включается. CODEOWNERS сохраняет
+   владельца для чувствительных файлов, но не означает независимый peer review.
+   Для внешних участников остаётся review владельца. На будущие публичные
+   signing requests нужно его ручное подтверждение; автоматизация не одобряет
+   подписи от его имени. Foundation ещё должна принять такую модель проекта.
 5. Actions → MasterDesk x64 signing preparation (unsigned) → Run workflow →
    Branch: новая интеграционная → tooling_only:true → Run workflow. Это безопасная
    проверка tooling, без beta reservation/build/sign/release. Для настоящего
@@ -101,7 +102,10 @@ branch policy65980450. Ветка опубликована. Hosted tooling
 ## Границы и откат новых GitHub настроек
 
 Основная ветка, старые release refs/assets и настройки других веток не менялись.
-Новые правила не требуют PR approval: решение о втором reviewer/solo ещё нужно.
+Новые правила не требуют PR approval: это соответствует явному выбору `solo`.
+После ответа владельца настройки повторно прочитаны GET-only: один owner reviewer,
+Prevent self-review=false, admin bypass=false, одна разрешённая ветка, без
+обязательного второго PR reviewer. Менять/ослаблять remote controls не потребовалось.
 При необходимости остановки сначала оставить environment без signing secret и
 не активировать template. Для отката ТОЛЬКО новых правил: Settings → Rules →
 Rulesets → указанные выше имена → Enforcement status → Disabled → Save changes.
