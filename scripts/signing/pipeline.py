@@ -14,6 +14,7 @@ import zipfile
 OWNED = frozenset({'MasterDesk.exe', 'libmasterdesk.dll', 'dylib_virtual_display.dll'})
 HASH = re.compile(r'^[0-9a-f]{64}$')
 COMMIT = re.compile(r'^[0-9a-f]{40}$')
+REVIEWED_BRANCH = 'codex/signpath-integration-20261109'
 
 
 def sha(path):
@@ -124,7 +125,7 @@ def verify_origin(run, artifact, commit, beta):
         run.get('workflow_id') != 323927768 or run.get('event') != 'workflow_dispatch' or
         run.get('run_attempt') != 1 or
         run.get('conclusion') != 'success' or run.get('status') != 'completed' or
-        run.get('head_sha') != commit or run.get('head_branch') != 'codex/x64-signing-source-20261106'):
+        run.get('head_sha') != commit or run.get('head_branch') != REVIEWED_BRANCH):
         raise ValueError('Untrusted build run')
     if (type(run.get('id')) is not int or artifact.get('workflow_run', {}).get('id') != run['id'] or
         artifact.get('workflow_run', {}).get('head_sha') != commit or artifact.get('expired') is not False or

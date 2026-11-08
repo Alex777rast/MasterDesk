@@ -1,5 +1,10 @@
 # SignPath readiness — 2026-11-08
 
+Historical checkpoint. The 2026-11-09 clean integration supersedes the source/CI
+boundary and pending GitHub setup below; see [current status](INTEGRATION-STATUS.md).
+The legal/provider/positive-signature blockers remain. Old evidence is retained,
+not relabelled as a test of the new integration.
+
 **Unsigned preparation: реализована и проверяется локально. Реальная подпись:
 BLOCKED. Не одобренный, не подписанный и не опубликованный релиз.**
 

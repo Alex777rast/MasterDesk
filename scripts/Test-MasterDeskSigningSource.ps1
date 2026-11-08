@@ -16,7 +16,10 @@ $required = @('Cargo.lock','Cargo.toml','src/core_main.rs','src/platform/windows
     'scripts/Test-DesktopDropWindowsPatch.ps1',
     'scripts/Test-CustomDefaults.ps1','scripts/Test-ServerDefaults.ps1','scripts/Test-DefaultsScope.ps1',
     'docs/signing-x64-preparation.md',
-    'SIGNING_POLICY.md','PRIVACY.md','NOTICE','.github/workflows/masterdesk-windows.yml')
+    'SIGNING_POLICY.md','PRIVACY.md','NOTICE','.github/workflows/masterdesk-windows.yml',
+    '.github/workflows/masterdesk-signing-preflight.yml','.github/CODEOWNERS',
+    'scripts/signing/pipeline.py','scripts/signing/preflight.py','scripts/signing/reserve_beta.py',
+    'scripts/signing/request_state.py','scripts/signing/Read-TrustedSigningArtifact.ps1')
 $missing = @()
 $inputs = @(foreach ($name in $required) {
     $path = Join-Path $root $name

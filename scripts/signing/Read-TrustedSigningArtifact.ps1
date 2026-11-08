@@ -14,7 +14,7 @@ try {
     if($run.repository.full_name -cne 'Alex777rast/MasterDesk' -or $run.head_repository.full_name -cne 'Alex777rast/MasterDesk' -or
        $run.workflow_id -ne 323927768 -or $run.run_attempt -ne 1 -or $run.event -cne 'workflow_dispatch' -or $run.status -cne 'completed' -or
        $run.conclusion -cne 'success' -or $run.head_sha -cne $ExpectedCommit -or
-       $run.head_branch -cne 'codex/x64-signing-source-20261106'){throw 'Untrusted build source'}
+       $run.head_branch -cne 'codex/signpath-integration-20261109'){throw 'Untrusted build source'}
     $list=Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/Alex777rast/MasterDesk/actions/runs/$RunId/artifacts?per_page=100"
     if($list.total_count -gt 100){throw 'Unexpected artifact count; do not accept incomplete pagination'}
     foreach($kind in @('payload','unsigned')){

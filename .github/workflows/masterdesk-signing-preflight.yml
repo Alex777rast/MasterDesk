@@ -1,5 +1,16 @@
 name: MasterDesk signing preflight (no signing)
 on:
+  workflow_call:
+    inputs:
+      build_run_id:
+        required: true
+        type: string
+      build_commit:
+        required: true
+        type: string
+      beta:
+        required: true
+        type: string
   workflow_dispatch:
     inputs:
       build_run_id:
@@ -21,7 +32,7 @@ concurrency:
   cancel-in-progress: false
 jobs:
   preflight:
-    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref == 'refs/heads/codex/x64-signing-source-20261106' }}
+    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref == 'refs/heads/codex/signpath-integration-20261109' }}
     runs-on: windows-2022
     timeout-minutes: 15
     permissions:

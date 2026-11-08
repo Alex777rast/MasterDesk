@@ -116,7 +116,7 @@ class IntegrityTests(unittest.TestCase):
                'head_repository': {'full_name': 'Alex777rast/MasterDesk'},
                'workflow_id': 323927768, 'event': 'workflow_dispatch', 'conclusion': 'success',
                'status': 'completed', 'head_sha': self.commit, 'run_attempt': 1,
-               'head_branch': 'codex/x64-signing-source-20261106', 'id': 123}
+               'head_branch': p.REVIEWED_BRANCH, 'id': 123}
         artifact = {'workflow_run': {'id':123, 'head_sha': self.commit}, 'expired': False,
                     'name': f'MasterDesk-x64-payload-beta-110-{self.commit}', 'digest':'sha256:'+'e'*64}
         return run, artifact

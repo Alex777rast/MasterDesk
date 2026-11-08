@@ -26,7 +26,7 @@ try {
     $r=Read-Api "/repos/$repo"
     $u=Read-Api '/user'
     $default=$r.Data.default_branch
-    $branches=@(foreach($branch in @($default,'codex/x64-signing-source-20261106')|Select-Object -Unique){
+    $branches=@(foreach($branch in @($default,'codex/x64-signing-source-20261106','codex/signpath-integration-20261109')|Select-Object -Unique){
         if(-not $branch){continue}
         $encoded=[Uri]::EscapeDataString($branch)
         $b=Read-Api "/repos/$repo/branches/$encoded"

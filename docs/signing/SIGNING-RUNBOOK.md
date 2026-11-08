@@ -1,5 +1,8 @@
 # Runbook: до и после одобрения
 
+Текущая интеграционная ветка/remote gates и точные действия владельца:
+[INTEGRATION-STATUS.md](INTEGRATION-STATUS.md). Этот runbook не разрешает подпись.
+
 Сейчас разрешена только подготовка. НЕТ команды «подписать сейчас».
 Нельзя включить подписание подстановкой IDs или enabled=true. Никогда не
 передавать токены в чат/артефакты или подавать локальную beta108 как hosted input.
@@ -76,3 +79,26 @@ venv; dependency install log сохранён в evidence, это не runtime-�
 
 Если любой gate FAIL/BLOCKED — не ослаблять его. Остановить именно signing flow,
 сохранить доказательства. Не делать retry с другим файлом под старой beta/version.
+
+## Ежедневные beta и ожидание ручного подтверждения
+
+- В существующем Actions dispatcher выбрать интеграционную ветку и новый номер
+  beta110+; `tooling_only=true` проверяет только инструменты и НЕ резервирует номер.
+- Новый build сначала атомарно создаёт annotated ref
+  `masterdesk-beta-reserved/<N>` с commit/run/date. Глобальная reservation-job
+  concurrency сериализует выделение; весь список releases проверяется постранично.
+  Ref не является релизным тегом и не соответствует version-tag triggers.
+- При ошибке или отмене номер не переиспользовать. Проверить ref/Actions run и
+  выбрать следующий; автоматического удаления reservation нет. Локальные сборки
+  также обязаны сверять реестр, а не только существующие GitHub releases.
+- После успешной сборки повторный dispatch с proof_run_id/proof_source_commit
+  проверяет уже существующие bytes: новый EXE не собирается. Сборка108 не имеет
+  нового build-time manifest и этим путём не принимается.
+- Будущая публичная подпись: policy типа Release, human approval для КАЖДОГО
+  запроса. Payload batch и outer — два запроса, обычно четыре PE signatures.
+  Подтвердить допустимую ежедневную нагрузку у Foundation; unlimited не обещан.
+- Inert template явно ждёт3600s, job80min. Timeout не повод отправить заново:
+  сохранить request ID, проверить статус в SignPath и продолжить тот же запрос.
+  При неизвестном результате POST — STOP/reconcile, не второй POST.
+  `request_state.py` проверяет эту модель без обращения к провайдеру; durable
+  lock/ledger/CAS и provider resume ещё нужно реализовать при активации.

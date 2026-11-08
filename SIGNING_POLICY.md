@@ -47,7 +47,11 @@ These are requirements, not a claim that existing locally built betas already
 meet them. The manual `masterdesk-windows.yml` workflow first verifies clean
 source/submodules and a new beta, builds on GitHub-hosted Windows, and uploads
 the unsigned package, payload and provenance/inventory for review. It has
-read-only repository permissions and no signing secret or publication step.
+read-only build permissions and no signing secret or publication step. Only the
+separate identity-reservation job has contents:write, to atomically create a
+non-release `masterdesk-beta-reserved/<N>` ref. It never updates/deletes refs.
+Failed builds consume their beta. Repository rules must prevent mutation of
+reservation refs. Old/unpublished105..109 are reserved; new builds use110+.
 
 Before signing can be enabled, review the dependency licenses/SBOM, origin
 policies, artifact restrictions, timestamp/chain checks and manual approval.

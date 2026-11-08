@@ -1,5 +1,45 @@
 # Current public source state
 
+## 2026-11-09 clean SignPath integration; signing remains BLOCKED
+
+Owner requested the available technical work after final review. Clean worktree
+branch codex/signpath-integration-20261109 starts at public reviewed726b3ce,
+shared1afc2f9d89e0e462da2cbf080e54f80e8f6984a2. ONLY preparation commits ported:
+0c6d88a/6a68fae/8333e30 (original c1b27d9/98b6e81/4a2bb58). Original dirty root,
+index and shared8449b7e9 retained; no client/Free-Pro source copied or changed.
+
+Integrated unsigned/manual workflow, complete tracked prerequisites, real
+CODEOWNERS paths,110+ gate, build-time all-file manifest, reusable preflight
+from existing dispatcher, atomic non-release beta reservation, inert request
+state model and explicit3600s manual-approval wait. No actual submit implementation
+or signing secret; approvedScope=[] and activation guard always refuses. Durable
+provider submit/resume/repack chain still requires reviewed activation/approval.
+
+Local PASS45 Python tests,7 metadata guards/4 source cases/4 ownership cases,
+13 defaults-scope fixtures,6 signing PS syntax/2 real signature rejections,
+2 workflow actionlint and diff-check. No product build/new beta, no actual
+signature/provider approval, no new GUI/install/update/direct/relay/SmartScreen.
+Prior22 client Rust tests retained, not rerun for signing-only changes. Old
+SBOM/license reports remain historical supporting evidence, not exact candidate
+legal clearance.14 inherited actionlint diagnostics remain outside this path.
+
+Remote exact-scoped setup verified: active branch ruleset26814262 forbids
+deletion/force-push ONLY for this integration branch; active tag ruleset26814264
+forbids update/deletion ONLY masterdesk-beta-reserved/*, no bypass. Environment
+masterdesk-signing26655560539 has owner required reviewer, admin bypassfalse,
+prevent-self-reviewfalse pending second reviewer/solo choice, exactly one allowed
+Branch policy for this integration branch, no secret created. This is NOT
+required PR/codeowner enforcement. No default/release writes; default SHA and
+release metadata unchanged. Setup backup/results under original workspace
+artifacts/signpath-integration-20261109. No unrelated settings/automations touched.
+
+Source-only push and hosted tooling check pending at this checkpoint. Do NOT
+infer full hosted build/preflight/real reservation acceptance from local fixtures.
+Owner steps and independent external blockers: docs/signing/INTEGRATION-STATUS.md.
+
+105..109 remain reserved/immutable; the next actual product identity is110+.
+No signature/release/site/production/VM action is authorized by this preparation.
+
 ## 2026-11-06 unsigned x64 preparation verified; Foundation review pending
 
 The owner confirmed receipt of the Foundation application. This is not provider

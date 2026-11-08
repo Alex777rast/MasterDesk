@@ -5,10 +5,15 @@ on:
   workflow_dispatch:
     inputs:
       beta_number:
-        description: "New builds: minimum 109 (106..108 reserved); artifact-only proof may select 108"
+        description: "New builds: minimum 110 (105..109 reserved); proof requires a new build-time manifest"
         required: true
         type: string
-        default: "109"
+        default: "110"
+      tooling_only:
+        description: "Check signing tooling only; no beta reservation, build, signing or release"
+        required: false
+        type: boolean
+        default: false
       proof_run_id:
         description: "Optional: verify existing successful preparation artifacts only; do not rebuild"
         required: false
@@ -33,8 +38,64 @@ env:
   VCPKG_BINARY_SOURCES: "clear"
 
 jobs:
+  tooling:
+    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref == 'refs/heads/codex/signpath-integration-20261109' }}
+    name: Check inert signing tooling
+    runs-on: windows-2022
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Test integrity, reservations and disabled signing
+        shell: pwsh
+        run: |
+          python -m unittest discover -s scripts/signing -p 'test_*.py' -v
+          if ($LASTEXITCODE) { throw 'Signing unit tests failed' }
+          ./scripts/signing/Test-SigningSafety.ps1 -OutputDirectory artifacts/tooling/safety
+          ./scripts/Test-MasterDeskSigningPreparation.ps1
+          ./scripts/Test-DefaultsScope.ps1
+
+  reserve:
+    needs: tooling
+    if: ${{ !inputs.tooling_only && inputs.proof_run_id == '' }}
+    name: Reserve new beta identity (never reuse after failure)
+    runs-on: windows-2022
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    concurrency:
+      group: masterdesk-global-beta-reservation
+      cancel-in-progress: false
+    outputs:
+      beta: ${{ steps.reservation.outputs.beta }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1
+        with:
+          python-version: '3.12'
+      - name: Atomically create a non-release reservation ref
+        id: reservation
+        shell: pwsh
+        env:
+          REQUESTED_BETA: ${{ inputs.beta_number }}
+          PROOF_SOURCE_COMMIT: ${{ inputs.proof_source_commit }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          if ($env:PROOF_SOURCE_COMMIT) { throw 'Proof requires both proof inputs; no build' }
+          python scripts/signing/reserve_beta.py
+          if ($LASTEXITCODE) { throw 'Beta reservation failed; do not rerun this identity' }
+
   prepare:
-    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref_type == 'branch' && inputs.proof_run_id == '' }}
+    needs: reserve
+    if: ${{ !inputs.tooling_only && inputs.proof_run_id == '' }}
     name: Build unsigned x64 evidence, without publication
     runs-on: windows-2022
     timeout-minutes: 180
@@ -58,14 +119,7 @@ jobs:
           if ($env:PROOF_SOURCE_COMMIT) { throw 'Artifact-only proof needs both proof inputs; no build started' }
           if ($env:REQUESTED_BETA -notmatch '^[1-9][0-9]{0,4}$') { throw 'Invalid beta input' }
           $beta = [int]$env:REQUESTED_BETA
-          if ($beta -lt 109 -or $beta -gt 65535) { throw 'New builds require 109..65535; proof candidates106..108 are reserved' }
-          $headers = @{Authorization="Bearer $env:GITHUB_TOKEN";'User-Agent'='MasterDesk-signing-preparation'}
-          $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/Alex777rast/MasterDesk/releases?per_page=100'
-          foreach ($release in $releases) {
-            if ($release.tag_name -match '^v1\.4\.9-masterdesk\.10-beta\.(\d+)$' -and $beta -le [int]$Matches[1]) {
-              throw 'Beta must be newer than every release; old assets are immutable'
-            }
-          }
+          if ($beta -lt 110 -or $beta -gt 65535) { throw 'New builds require 110..65535; 105..109 are reserved' }
           "MASTERDESK_CANDIDATE_BETA=$beta" >> $env:GITHUB_ENV
           .\scripts\Test-MasterDeskSigningSource.ps1 -OutputPath artifacts/signing/source-gate.json
 
@@ -123,6 +177,10 @@ jobs:
           $env:MASTERDESK_LLVM_BIN = Split-Path (Get-Command clang.exe).Source
           .\scripts\Test-CustomDefaults.ps1 -ClientOnly
           .\scripts\New-MasterDeskSigningInventory.ps1 -BetaNumber ([int]$env:MASTERDESK_CANDIDATE_BETA) -OutputDirectory artifacts/signing/evidence
+          $shared = (git rev-parse HEAD:libs/hbb_common).Trim()
+          if ($LASTEXITCODE) { throw 'Cannot read exact gitlink' }
+          python scripts/signing/pipeline.py manifest --payload flutter/build/windows/x64/runner/Release --manifest artifacts/signing/evidence/payload-manifest.json --commit $env:GITHUB_SHA --submodule $shared --beta $env:MASTERDESK_CANDIDATE_BETA
+          if ($LASTEXITCODE) { throw 'Build-time payload manifest failed' }
 
       - name: Upload unsigned package and source evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -144,7 +202,8 @@ jobs:
           retention-days: 14
 
   verify_existing:
-    if: ${{ github.repository == 'Alex777rast/MasterDesk' && github.ref_type == 'branch' && inputs.proof_run_id != '' }}
+    needs: tooling
+    if: ${{ !inputs.tooling_only && inputs.proof_run_id != '' }}
     name: Verify existing unsigned artifacts without rebuilding
     runs-on: windows-2022
     timeout-minutes: 15
@@ -169,12 +228,13 @@ jobs:
           if ($env:PROOF_RUN_ID -notmatch '^[1-9][0-9]{0,19}$' -or
               $env:PROOF_SOURCE_COMMIT -notmatch '^[0-9a-f]{40}$' -or
               $env:PROOF_BETA -notmatch '^[1-9][0-9]{0,4}$' -or
-              [int]$env:PROOF_BETA -lt 108 -or [int]$env:PROOF_BETA -gt 65535) { throw 'Invalid proof inputs' }
+              [int]$env:PROOF_BETA -lt 110 -or [int]$env:PROOF_BETA -gt 65535) { throw 'Invalid proof inputs' }
           $headers=@{Authorization="Bearer $env:GITHUB_TOKEN";'User-Agent'='MasterDesk-artifact-proof'}
           $run=Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/Alex777rast/MasterDesk/actions/runs/$env:PROOF_RUN_ID"
           if ($run.conclusion -cne 'success' -or $run.workflow_id -ne 323927768 -or
               $run.event -cne 'workflow_dispatch' -or $run.head_sha -cne $env:PROOF_SOURCE_COMMIT -or
-              $run.head_branch -cne 'codex/x64-signing-source-20261106') { throw 'Run is not the successful reviewed preparation source' }
+              $run.head_branch -cne 'codex/signpath-integration-20261109' -or $run.run_attempt -ne 1 -or
+              $run.status -cne 'completed') { throw 'Run is not the successful reviewed preparation source' }
       - name: Download exact build artifacts with enforced archive digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333
         with:
@@ -197,6 +257,18 @@ jobs:
           path: artifacts/proof-result/cli-proof.json
           if-no-files-found: error
           retention-days: 30
+
+  preflight_existing:
+    needs: tooling
+    if: ${{ !inputs.tooling_only && inputs.proof_run_id != '' }}
+    uses: ./.github/workflows/masterdesk-signing-preflight.yml
+    permissions:
+      contents: read
+      actions: read
+    with:
+      build_run_id: ${{ inputs.proof_run_id }}
+      build_commit: ${{ inputs.proof_source_commit }}
+      beta: ${{ inputs.beta_number }}
 
 # A future reviewed payload-first/package-second signing flow needs Foundation
 # approval, verified policies and a separate explicit maintainer decision.
